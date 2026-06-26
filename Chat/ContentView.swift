@@ -1,6 +1,7 @@
 import Foundation
 import FoundationModels
 import Combine
+import SwiftData
 import SwiftUI
 
 #if os(macOS)
@@ -9,11 +10,23 @@ import AppKit
 
 @main
 struct ChatApp: App {
-    @StateObject private var personaStore = PersonaStore()
+    private let modelContainer: ModelContainer
+    @StateObject private var personaStore: PersonaStore
+
+    init() {
+        do {
+            let container = try ModelContainer(for: Persona.self)
+            modelContainer = container
+            _personaStore = StateObject(wrappedValue: PersonaStore(modelContext: container.mainContext))
+        } catch {
+            fatalError("Failed to create model container: \(error.localizedDescription)")
+        }
+    }
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(personaStore: personaStore)
+                .modelContainer(modelContainer)
         }
         .commands {
             PersonaCommands()
@@ -21,62 +34,246 @@ struct ChatApp: App {
 
         Window("Personas", id: "personas") {
             PersonasWindow(store: personaStore)
+                .modelContainer(modelContainer)
         }
     }
 }
 
 struct ContentView: View {
-    @StateObject private var chat = ChatViewModel()
+    @ObservedObject private var personaStore: PersonaStore
+    @StateObject private var chatStore: ChatStore
+
+    init(personaStore: PersonaStore) {
+        self.personaStore = personaStore
+        _chatStore = StateObject(wrappedValue: ChatStore(personaStore: personaStore))
+    }
+
+    var body: some View {
+        NavigationSplitView {
+            ChatSidebar(personaStore: personaStore, chatStore: chatStore)
+                .navigationSplitViewColumnWidth(min: 220, ideal: 280)
+        } detail: {
+            if let chat = chatStore.selectedChat {
+                ChatDetailView(chat: chat)
+            } else {
+                Text("Start a new chat.")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 820, minHeight: 560)
+    }
+}
+
+struct ChatSidebar: View {
+    @ObservedObject var personaStore: PersonaStore
+    @ObservedObject var chatStore: ChatStore
+    @State private var collapsedPersonaIDs: Set<Persona.ID> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            newChatControl
+                .padding(.top, 20)
+                .padding(.horizontal, 20)
+
+            Text("Projects")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.top, 28)
+                .padding(.horizontal, 20)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(personaStore.personas) { persona in
+                        let chats = chatStore.chats(for: persona.id)
+
+                        if !chats.isEmpty {
+                            PersonaProjectSection(
+                                persona: persona,
+                                chats: chats,
+                                selectedChatID: $chatStore.selectedChatID,
+                                isCollapsed: collapsedPersonaIDs.contains(persona.id)
+                            ) {
+                                togglePersona(persona.id)
+                            }
+                        }
+                    }
+                }
+                .padding(.top, 14)
+                .padding(.horizontal, 12)
+            }
+        }
+    }
+
+    private func togglePersona(_ personaID: Persona.ID) {
+        if collapsedPersonaIDs.contains(personaID) {
+            collapsedPersonaIDs.remove(personaID)
+        } else {
+            collapsedPersonaIDs.insert(personaID)
+        }
+    }
+
+    @ViewBuilder
+    private var newChatControl: some View {
+        if personaStore.personas.count > 1 {
+            Menu {
+                ForEach(personaStore.personas) { persona in
+                    Button(persona.displayName) {
+                        chatStore.startChat(with: persona)
+                    }
+                }
+            } label: {
+                NewChatLabel()
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .help("Start a new chat")
+        } else {
+            Button {
+                guard let persona = personaStore.personas.first else { return }
+                chatStore.startChat(with: persona)
+            } label: {
+                NewChatLabel()
+            }
+            .buttonStyle(.plain)
+            .disabled(personaStore.personas.isEmpty)
+            .help("Start a new chat")
+        }
+    }
+}
+
+struct NewChatLabel: View {
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 18, weight: .regular))
+                .frame(width: 24, height: 24)
+
+            Text("New chat")
+                .font(.system(size: 20, weight: .regular))
+
+            Spacer()
+        }
+        .foregroundStyle(.primary)
+        .contentShape(Rectangle())
+    }
+}
+
+struct PersonaProjectSection: View {
+    let persona: Persona
+    let chats: [ChatViewModel]
+    @Binding var selectedChatID: ChatViewModel.ID?
+    let isCollapsed: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: onToggle) {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 17, weight: .regular))
+                        .frame(width: 22, height: 22)
+
+                    Text(persona.displayName)
+                        .font(.system(size: 19, weight: .regular))
+                        .lineLimit(1)
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .rotationEffect(.degrees(isCollapsed ? -90 : 0))
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 12)
+                .frame(height: 42)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if !isCollapsed {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(chats) { chat in
+                        ChatRow(
+                            chat: chat,
+                            isSelected: selectedChatID == chat.id
+                        ) {
+                            selectedChatID = chat.id
+                        }
+                    }
+                }
+                .padding(.bottom, 16)
+            }
+        }
+    }
+}
+
+struct ChatRow: View {
+    @ObservedObject var chat: ChatViewModel
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 0) {
+                Text(chat.title)
+                    .font(.system(size: 18, weight: .regular))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.primary)
+            .padding(.leading, 64)
+            .padding(.trailing, 12)
+            .frame(height: 38)
+            .background(isSelected ? Color.primary.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ChatDetailView: View {
+    @ObservedObject var chat: ChatViewModel
     @FocusState private var composerIsFocused: Bool
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                modelStatus
-                    .padding(.horizontal)
-                    .padding(.top)
+        VStack(spacing: 0) {
+            modelStatus
+                .padding(.horizontal)
+                .padding(.top)
 
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 14) {
-                            ForEach(chat.messages) { message in
-                                MessageBubble(message: message)
-                                    .id(message.id)
-                            }
-
-                            if chat.isResponding {
-                                TypingBubble()
-                                    .id(ChatViewModel.typingIndicatorID)
-                            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 14) {
+                        ForEach(chat.messages) { message in
+                            MessageBubble(message: message)
+                                .id(message.id)
                         }
-                        .padding()
-                    }
-                    .background(Color.secondary.opacity(0.08))
-                    .onChange(of: chat.messages) {
-                        scrollToBottom(with: proxy)
-                    }
-                    .onChange(of: chat.isResponding) {
-                        scrollToBottom(with: proxy)
-                    }
-                }
 
-                composer
-                    .padding()
-                    .background(.bar)
-            }
-            .navigationTitle("Chat")
-            .toolbar {
-                ToolbarItem {
-                    Button {
-                        chat.reset()
-                        composerIsFocused = true
-                    } label: {
-                        Label("New Chat", systemImage: "square.and.pencil")
+                        if chat.isResponding {
+                            TypingBubble()
+                                .id(ChatViewModel.typingIndicatorID)
+                        }
                     }
-                    .help("Start a new chat")
+                    .padding()
+                }
+                .background(Color.secondary.opacity(0.08))
+                .onChange(of: chat.messages) {
+                    scrollToBottom(with: proxy)
+                }
+                .onChange(of: chat.isResponding) {
+                    scrollToBottom(with: proxy)
                 }
             }
+
+            composer
+                .padding()
+                .background(.bar)
         }
+        .navigationTitle(chat.title)
     }
 
     private var modelStatus: some View {
@@ -463,24 +660,26 @@ struct ResizeGrip: View {
 
 @MainActor
 final class PersonaStore: ObservableObject {
-    @Published var personas: [Persona] = [
-        Persona(name: "Default", soul: "You are a concise, very quirky and goofy assistant inside a simple chat app.")
-    ]
+    @Published private(set) var personas: [Persona] = []
     @Published var selectedPersonaID: Persona.ID?
+
+    private let modelContext: ModelContext
 
     var selectedPersona: Persona? {
         guard let selectedPersonaID else { return nil }
         return personas.first { $0.id == selectedPersonaID }
     }
 
-    init() {
-        selectedPersonaID = personas.first?.id
+    init(modelContext: ModelContext) {
+        self.modelContext = modelContext
+        loadPersonas()
     }
 
     func addPersona() {
         let persona = Persona(name: "", soul: "")
-        personas.append(persona)
-        selectedPersonaID = persona.id
+        modelContext.insert(persona)
+        saveChanges()
+        loadPersonas(selecting: persona.id)
     }
 
     func removeSelectedPersona() {
@@ -489,32 +688,84 @@ final class PersonaStore: ObservableObject {
             return
         }
 
-        personas.remove(at: index)
-
-        if personas.isEmpty {
-            self.selectedPersonaID = nil
+        let nextSelection: Persona.ID?
+        if personas.count <= 1 {
+            nextSelection = nil
         } else {
-            self.selectedPersonaID = personas[min(index, personas.count - 1)].id
+            let nextIndex = min(index, personas.count - 2)
+            nextSelection = personas[nextIndex == index ? index + 1 : nextIndex].id
         }
+
+        modelContext.delete(personas[index])
+        saveChanges()
+        loadPersonas(selecting: nextSelection)
     }
 
     func updatePersonaName(id: Persona.ID, name: String) {
-        guard let index = personas.firstIndex(where: { $0.id == id }) else { return }
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
 
-        personas[index].name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        persona.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        saveChanges()
+        objectWillChange.send()
     }
 
     func updatePersonaSoul(id: Persona.ID, soul: String) {
-        guard let index = personas.firstIndex(where: { $0.id == id }) else { return }
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
 
-        personas[index].soul = soul
+        persona.soul = soul
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    private func loadPersonas(selecting selection: Persona.ID? = nil) {
+        let descriptor = FetchDescriptor<Persona>(
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+
+        do {
+            personas = try modelContext.fetch(descriptor)
+        } catch {
+            personas = []
+        }
+
+        if personas.isEmpty {
+            let persona = Persona(name: "Default", soul: "You are a concise, very quirky and goofy assistant inside a simple chat app.")
+            modelContext.insert(persona)
+            saveChanges()
+            personas = [persona]
+        }
+
+        selectedPersonaID = selection.flatMap { selectedID in
+            personas.contains { $0.id == selectedID } ? selectedID : nil
+        } ?? selectedPersonaID.flatMap { selectedID in
+            personas.contains { $0.id == selectedID } ? selectedID : nil
+        } ?? personas.first?.id
+    }
+
+    private func saveChanges() {
+        guard modelContext.hasChanges else { return }
+
+        do {
+            try modelContext.save()
+        } catch {
+            assertionFailure("Failed to save personas: \(error.localizedDescription)")
+        }
     }
 }
 
-struct Persona: Identifiable, Equatable {
-    let id = UUID()
+@Model
+final class Persona: Identifiable {
+    @Attribute(.unique) var id: UUID
     var name: String
     var soul: String
+    var createdAt: Date
+
+    init(id: UUID = UUID(), name: String, soul: String, createdAt: Date = .now) {
+        self.id = id
+        self.name = name
+        self.soul = soul
+        self.createdAt = createdAt
+    }
 
     var displayName: String {
         name.isEmpty ? "Untitled Persona" : name
@@ -522,25 +773,61 @@ struct Persona: Identifiable, Equatable {
 }
 
 @MainActor
-final class ChatViewModel: ObservableObject {
+final class ChatStore: ObservableObject {
+    @Published var chats: [ChatViewModel] = []
+    @Published var selectedChatID: ChatViewModel.ID?
+
+    var selectedChat: ChatViewModel? {
+        guard let selectedChatID else { return nil }
+        return chats.first { $0.id == selectedChatID }
+    }
+
+    init(personaStore: PersonaStore) {
+        if let persona = personaStore.personas.first {
+            startChat(with: persona)
+        }
+    }
+
+    func startChat(with persona: Persona) {
+        let chat = ChatViewModel(persona: persona)
+        chats.insert(chat, at: 0)
+        selectedChatID = chat.id
+    }
+
+    func chats(for personaID: Persona.ID) -> [ChatViewModel] {
+        chats.filter { $0.personaID == personaID }
+    }
+}
+
+@MainActor
+final class ChatViewModel: ObservableObject, Identifiable {
     static let typingIndicatorID = UUID()
 
+    let id = UUID()
+    let personaID: Persona.ID
+    let personaName: String
+
     @Published var draft = ""
-    @Published private(set) var messages: [ChatMessage] = [
-        ChatMessage(role: .assistant, text: "Hi. I am using the on-device Apple Foundation model. What should we talk about?")
-    ]
+    @Published private(set) var title = "New chat"
+    @Published private(set) var messages: [ChatMessage]
     @Published private(set) var isResponding = false
     @Published private(set) var availabilityMessage = ""
     @Published private(set) var canSend = false
 
     private let model = SystemLanguageModel.default
-    private var session = ChatViewModel.makeSession()
+    private var session: LanguageModelSession
 
     var canSubmitDraft: Bool {
         canSend && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    init() {
+    init(persona: Persona) {
+        personaID = persona.id
+        personaName = persona.displayName
+        messages = [
+            ChatMessage(role: .assistant, text: "New chat with \(persona.displayName). What would you like to ask?")
+        ]
+        session = ChatViewModel.makeSession(soul: persona.soul)
         updateAvailability()
     }
 
@@ -549,6 +836,10 @@ final class ChatViewModel: ObservableObject {
 
         guard canSubmitDraft, !prompt.isEmpty else { return }
 
+        if title == "New chat" {
+            title = String(prompt.prefix(48))
+        }
+
         draft = ""
         messages.append(ChatMessage(role: .user, text: prompt))
         isResponding = true
@@ -556,15 +847,6 @@ final class ChatViewModel: ObservableObject {
         Task {
             await respond(to: prompt)
         }
-    }
-
-    func reset() {
-        session = ChatViewModel.makeSession()
-        draft = ""
-        messages = [
-            ChatMessage(role: .assistant, text: "New chat started. What would you like to ask?")
-        ]
-        updateAvailability()
     }
 
     private func respond(to prompt: String) async {
@@ -599,11 +881,14 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    private static func makeSession() -> LanguageModelSession {
-        LanguageModelSession(instructions: """
-        You are a concise, very quirky and goofy assistant inside a simple chat app.
-        Answer, stay conversational, and don't feel the need to ask a follow-up question unless it's natural.
-        """)
+    private static func makeSession(soul: String) -> LanguageModelSession {
+        let trimmedSoul = soul.trimmingCharacters(in: .whitespacesAndNewlines)
+        let instructions = trimmedSoul.isEmpty ? """
+        You are a concise assistant inside a simple chat app.
+        Answer conversationally, and don't feel the need to ask a follow-up question unless it's natural.
+        """ : trimmedSoul
+
+        return LanguageModelSession(instructions: instructions)
     }
 }
 
@@ -619,5 +904,26 @@ enum ChatRole {
 }
 
 #Preview {
-    ContentView()
+    ContentViewPreview()
+}
+
+struct ContentViewPreview: View {
+    private let modelContainer: ModelContainer
+    private let personaStore: PersonaStore
+
+    init() {
+        do {
+            let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+            let container = try ModelContainer(for: Persona.self, configurations: configuration)
+            modelContainer = container
+            personaStore = PersonaStore(modelContext: container.mainContext)
+        } catch {
+            fatalError("Failed to create preview model container: \(error.localizedDescription)")
+        }
+    }
+
+    var body: some View {
+        ContentView(personaStore: personaStore)
+            .modelContainer(modelContainer)
+    }
 }
