@@ -4,20 +4,19 @@ import Combine
 import SwiftData
 import SwiftUI
 
-#if os(macOS)
-import AppKit
-#endif
-
 @main
 struct ChatApp: App {
     private let modelContainer: ModelContainer
     @StateObject private var personaStore: PersonaStore
+    @StateObject private var chatStore: ChatStore
 
     init() {
         do {
-            let container = try ModelContainer(for: Persona.self)
+            let container = try ModelContainer(for: Persona.self, StoredChat.self, StoredChatMessage.self)
+            let personaStore = PersonaStore(modelContext: container.mainContext)
             modelContainer = container
-            _personaStore = StateObject(wrappedValue: PersonaStore(modelContext: container.mainContext))
+            _personaStore = StateObject(wrappedValue: personaStore)
+            _chatStore = StateObject(wrappedValue: ChatStore(personaStore: personaStore, modelContext: container.mainContext))
         } catch {
             fatalError("Failed to create model container: \(error.localizedDescription)")
         }
@@ -25,11 +24,12 @@ struct ChatApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(personaStore: personaStore)
+            ContentView(personaStore: personaStore, chatStore: chatStore)
                 .modelContainer(modelContainer)
         }
         .commands {
             PersonaCommands()
+            DeveloperCommands(chatStore: chatStore)
         }
 
         Window("Personas", id: "personas") {
@@ -41,11 +41,11 @@ struct ChatApp: App {
 
 struct ContentView: View {
     @ObservedObject private var personaStore: PersonaStore
-    @StateObject private var chatStore: ChatStore
+    @ObservedObject private var chatStore: ChatStore
 
-    init(personaStore: PersonaStore) {
+    init(personaStore: PersonaStore, chatStore: ChatStore) {
         self.personaStore = personaStore
-        _chatStore = StateObject(wrappedValue: ChatStore(personaStore: personaStore))
+        self.chatStore = chatStore
     }
 
     var body: some View {
@@ -70,6 +70,9 @@ struct ChatSidebar: View {
     @ObservedObject var personaStore: PersonaStore
     @ObservedObject var chatStore: ChatStore
     @State private var collapsedPersonaIDs: Set<Persona.ID> = []
+    @State private var chatBeingRenamed: ChatViewModel?
+    @State private var renameDraft = ""
+    @State private var renameAlertIsPresented = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -77,8 +80,8 @@ struct ChatSidebar: View {
                 .padding(.top, 20)
                 .padding(.horizontal, 20)
 
-            Text("Projects")
-                .font(.system(size: 18, weight: .medium))
+            Text("Chats")
+                .font(.body.weight(.medium))
                 .foregroundStyle(.secondary)
                 .padding(.top, 28)
                 .padding(.horizontal, 20)
@@ -93,7 +96,8 @@ struct ChatSidebar: View {
                                 persona: persona,
                                 chats: chats,
                                 selectedChatID: $chatStore.selectedChatID,
-                                isCollapsed: collapsedPersonaIDs.contains(persona.id)
+                                isCollapsed: collapsedPersonaIDs.contains(persona.id),
+                                onRenameChat: beginRenaming
                             ) {
                                 togglePersona(persona.id)
                             }
@@ -104,6 +108,20 @@ struct ChatSidebar: View {
                 .padding(.horizontal, 12)
             }
         }
+        .alert("Rename chat", isPresented: $renameAlertIsPresented) {
+            TextField("Chat name", text: $renameDraft)
+
+            Button("Cancel", role: .cancel) { }
+            Button("Rename") {
+                chatBeingRenamed?.rename(to: renameDraft)
+            }
+        }
+    }
+
+    private func beginRenaming(_ chat: ChatViewModel) {
+        chatBeingRenamed = chat
+        renameDraft = chat.title
+        renameAlertIsPresented = true
     }
 
     private func togglePersona(_ personaID: Persona.ID) {
@@ -147,11 +165,11 @@ struct NewChatLabel: View {
     var body: some View {
         HStack(spacing: 14) {
             Image(systemName: "square.and.pencil")
-                .font(.system(size: 18, weight: .regular))
-                .frame(width: 24, height: 24)
+                .font(.body)
+                .frame(width: 20, height: 20)
 
             Text("New chat")
-                .font(.system(size: 20, weight: .regular))
+                .font(.body)
 
             Spacer()
         }
@@ -165,6 +183,7 @@ struct PersonaProjectSection: View {
     let chats: [ChatViewModel]
     @Binding var selectedChatID: ChatViewModel.ID?
     let isCollapsed: Bool
+    let onRenameChat: (ChatViewModel) -> Void
     let onToggle: () -> Void
 
     var body: some View {
@@ -172,22 +191,22 @@ struct PersonaProjectSection: View {
             Button(action: onToggle) {
                 HStack(spacing: 10) {
                     Image(systemName: "folder")
-                        .font(.system(size: 17, weight: .regular))
-                        .frame(width: 22, height: 22)
+                        .font(.body)
+                        .frame(width: 20, height: 20)
 
                     Text(persona.displayName)
-                        .font(.system(size: 19, weight: .regular))
+                        .font(.body)
                         .lineLimit(1)
 
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.caption.weight(.semibold))
                         .rotationEffect(.degrees(isCollapsed ? -90 : 0))
 
                     Spacer(minLength: 0)
                 }
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 12)
-                .frame(height: 42)
+                .frame(height: 32)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -197,7 +216,10 @@ struct PersonaProjectSection: View {
                     ForEach(chats) { chat in
                         ChatRow(
                             chat: chat,
-                            isSelected: selectedChatID == chat.id
+                            isSelected: selectedChatID == chat.id,
+                            onRename: {
+                                onRenameChat(chat)
+                            }
                         ) {
                             selectedChatID = chat.id
                         }
@@ -212,13 +234,14 @@ struct PersonaProjectSection: View {
 struct ChatRow: View {
     @ObservedObject var chat: ChatViewModel
     let isSelected: Bool
+    let onRename: () -> Void
     let onSelect: () -> Void
 
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 0) {
                 Text(chat.title)
-                    .font(.system(size: 18, weight: .regular))
+                    .font(.body)
                     .lineLimit(1)
                     .truncationMode(.tail)
 
@@ -227,17 +250,25 @@ struct ChatRow: View {
             .foregroundStyle(.primary)
             .padding(.leading, 64)
             .padding(.trailing, 12)
-            .frame(height: 38)
+            .frame(height: 30)
             .background(isSelected ? Color.primary.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button("Rename chat") {
+                onRename()
+            }
+        }
     }
 }
 
 struct ChatDetailView: View {
     @ObservedObject var chat: ChatViewModel
     @FocusState private var composerIsFocused: Bool
+    @State private var newestMessageID: ChatMessage.ID?
+    @State private var visibleMessageIDs: Set<ChatMessage.ID> = []
+    @State private var hasUnreadNewMessages = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -246,26 +277,72 @@ struct ChatDetailView: View {
                 .padding(.top)
 
             ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 14) {
-                        ForEach(chat.messages) { message in
-                            MessageBubble(message: message)
-                                .id(message.id)
-                        }
+                ZStack(alignment: .bottom) {
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(chat.messages) { message in
+                                MessageBubble(message: message)
+                                    .id(message.id)
+                                    .onAppear {
+                                        visibleMessageIDs.insert(message.id)
 
-                        if chat.isResponding {
-                            TypingBubble()
-                                .id(ChatViewModel.typingIndicatorID)
+                                        if message.id == chat.messages.last?.id {
+                                            hasUnreadNewMessages = false
+                                        }
+
+                                        if message.id == chat.messages.first?.id {
+                                            chat.loadOlderMessages()
+                                        }
+                                    }
+                                    .onDisappear {
+                                        visibleMessageIDs.remove(message.id)
+                                    }
+                            }
+
+                            if chat.isResponding {
+                                TypingBubble()
+                                    .id(ChatViewModel.typingIndicatorID)
+                            }
                         }
+                        .padding()
                     }
-                    .padding()
+                    .background(Color.secondary.opacity(0.08))
+
+                    if shouldShowMoreMessagesButton {
+                        Button {
+                            hasUnreadNewMessages = false
+                            scrollToBottom(with: proxy)
+                        } label: {
+                            Label(moreMessagesButtonTitle, systemImage: "arrow.down")
+                                .font(.callout.weight(.medium))
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 10)
+                                .background(.regularMaterial, in: Capsule())
+                                .overlay {
+                                    Capsule()
+                                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                                }
+                        }
+                        .buttonStyle(.plain)
+                        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+                        .padding(.bottom, 14)
+                    }
                 }
-                .background(Color.secondary.opacity(0.08))
+                .onAppear {
+                    scrollToBottomAfterLayout(with: proxy)
+                }
+                .onChange(of: chat.id) {
+                    visibleMessageIDs.removeAll()
+                    hasUnreadNewMessages = false
+                    scrollToBottomAfterLayout(with: proxy)
+                }
                 .onChange(of: chat.messages) {
-                    scrollToBottom(with: proxy)
+                    scrollToNewestMessageIfNeeded(with: proxy)
                 }
                 .onChange(of: chat.isResponding) {
-                    scrollToBottom(with: proxy)
+                    if latestMessageIsVisible {
+                        scrollToBottom(with: proxy)
+                    }
                 }
             }
 
@@ -289,6 +366,29 @@ struct ChatDetailView: View {
         }
         .padding(12)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var shouldShowMoreMessagesButton: Bool {
+        hasUnreadNewMessages || isScrolledMoreThanFiveMessagesFromLatest
+    }
+
+    private var moreMessagesButtonTitle: String {
+        hasUnreadNewMessages ? "New messages" : "More messages"
+    }
+
+    private var latestMessageIsVisible: Bool {
+        guard let latestMessageID = chat.messages.last?.id else { return true }
+        return visibleMessageIDs.contains(latestMessageID)
+    }
+
+    private var isScrolledMoreThanFiveMessagesFromLatest: Bool {
+        guard !visibleMessageIDs.isEmpty,
+              chat.messages.count > 5,
+              let newestVisibleIndex = chat.messages.lastIndex(where: { visibleMessageIDs.contains($0.id) }) else {
+            return false
+        }
+
+        return newestVisibleIndex < chat.messages.count - 5
     }
 
     private var composer: some View {
@@ -323,12 +423,41 @@ struct ChatDetailView: View {
         composerIsFocused = true
     }
 
-    private func scrollToBottom(with proxy: ScrollViewProxy) {
+    private func scrollToNewestMessageIfNeeded(with proxy: ScrollViewProxy) {
+        let previousNewestMessageID = newestMessageID
+        let latestMessageID = chat.messages.last?.id
+        defer { newestMessageID = latestMessageID }
+
+        guard latestMessageID != previousNewestMessageID else { return }
+
+        if previousNewestMessageID == nil || previousNewestMessageID.map(visibleMessageIDs.contains) == true {
+            hasUnreadNewMessages = false
+            scrollToBottom(with: proxy)
+        } else {
+            hasUnreadNewMessages = true
+        }
+    }
+
+    private func scrollToBottomAfterLayout(with proxy: ScrollViewProxy) {
+        newestMessageID = chat.messages.last?.id
+        hasUnreadNewMessages = false
+
+        Task { @MainActor in
+            await Task.yield()
+            scrollToBottom(with: proxy, animated: false)
+        }
+    }
+
+    private func scrollToBottom(with proxy: ScrollViewProxy, animated: Bool = true) {
         let target = chat.isResponding ? ChatViewModel.typingIndicatorID : chat.messages.last?.id
 
         guard let target else { return }
 
-        withAnimation(.snappy) {
+        if animated {
+            withAnimation(.snappy) {
+                proxy.scrollTo(target, anchor: .bottom)
+            }
+        } else {
             proxy.scrollTo(target, anchor: .bottom)
         }
     }
@@ -393,268 +522,21 @@ struct PersonaCommands: Commands {
     }
 }
 
-struct PersonasWindow: View {
-    @ObservedObject var store: PersonaStore
+struct DeveloperCommands: Commands {
+    @ObservedObject var chatStore: ChatStore
 
-    var body: some View {
-        NavigationSplitView {
-            PersonaSidebar(store: store)
-                .navigationSplitViewColumnWidth(min: 180, ideal: 220)
-        } detail: {
-            PersonaEditor(store: store)
-                .navigationSplitViewColumnWidth(min: 420, ideal: 560)
-        }
-        .frame(minWidth: 720, minHeight: 480)
-    }
-}
-
-struct PersonaSidebar: View {
-    @ObservedObject var store: PersonaStore
-
-    var body: some View {
-        VStack(spacing: 0) {
-            List(selection: $store.selectedPersonaID) {
-                ForEach(store.personas) { persona in
-                    Text(persona.displayName)
-                        .tag(persona.id)
-                }
+    var body: some Commands {
+        CommandMenu("Developer") {
+            Button("Add 1,000 messages") {
+                chatStore.addFakeMessagesToSelectedChat(count: 1_000)
             }
+            .disabled(chatStore.selectedChat == nil)
 
-            Divider()
-
-            HStack(spacing: 8) {
-                Button {
-                    store.addPersona()
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .help("Add Persona")
-
-                Button {
-                    store.removeSelectedPersona()
-                } label: {
-                    Image(systemName: "minus")
-                }
-                .disabled(store.selectedPersonaID == nil)
-                .help("Remove Persona")
-
-                Spacer()
+            Button("Slow response") {
+                chatStore.addSlowResponseToSelectedChat()
             }
-            .buttonStyle(.borderless)
-            .padding(8)
+            .disabled(chatStore.selectedChat == nil)
         }
-    }
-}
-
-private let minimumSoulEditorHeight: CGFloat = 240
-private let maximumSoulEditorHeight: CGFloat = 720
-
-struct PersonaEditor: View {
-    @ObservedObject var store: PersonaStore
-    @State private var draftSoul = ""
-    @State private var soulEditorHeight: CGFloat = 360
-
-    private var selectedPersona: Persona? {
-        store.selectedPersona
-    }
-
-    private var personaName: Binding<String> {
-        Binding {
-            selectedPersona?.name ?? ""
-        } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaName(id: personaID, name: newValue)
-        }
-    }
-
-    var body: some View {
-        Group {
-            if let selectedPersona {
-                editor(for: selectedPersona)
-            } else {
-                Text("Select or add a persona.")
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .background(Color(red: 253 / 255, green: 253 / 255, blue: 252 / 255))
-        .onAppear(perform: loadSelectedPersona)
-        .onChange(of: store.selectedPersonaID) {
-            loadSelectedPersona()
-        }
-    }
-
-    private func editor(for persona: Persona) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 0) {
-                TextField("Persona name", text: personaName)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 22, weight: .semibold))
-                    .frame(height: 54)
-
-                Text("Soul")
-                    .font(.system(size: 15, weight: .semibold))
-                    .padding(.top, 34)
-                    .padding(.bottom, 12)
-
-                ResizableSoulEditor(text: $draftSoul, height: $soulEditorHeight)
-
-                HStack {
-                    Spacer()
-
-                    Button("Save") {
-                        store.updatePersonaSoul(id: persona.id, soul: draftSoul)
-                    }
-                    .controlSize(.large)
-                    .buttonStyle(.borderedProminent)
-                }
-                .padding(.top, 22)
-            }
-            .frame(maxWidth: 760, maxHeight: .infinity, alignment: .top)
-            .padding(.top, 70)
-            .padding(.bottom, 70)
-            .padding(.horizontal, 48)
-
-            Spacer(minLength: 0)
-        }
-    }
-
-    private func loadSelectedPersona() {
-        guard let selectedPersona else {
-            draftSoul = ""
-            return
-        }
-
-        load(selectedPersona)
-    }
-
-    private func load(_ persona: Persona) {
-        draftSoul = persona.soul
-    }
-}
-
-struct ResizableSoulEditor: View {
-    @Binding var text: String
-    @Binding var height: CGFloat
-    @State private var dragStartHeight: CGFloat?
-
-    var body: some View {
-        SoulTextView(text: $text)
-            .padding(12)
-            .padding(.bottom, 8)
-            .background(.white.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.gray.opacity(0.22), lineWidth: 1)
-            }
-            .overlay(alignment: .bottomTrailing) {
-                ResizeGrip()
-                    .padding(5)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { value in
-                                let startHeight = dragStartHeight ?? height
-                                dragStartHeight = startHeight
-                                height = min(max(startHeight + value.translation.height, minimumSoulEditorHeight), maximumSoulEditorHeight)
-                            }
-                            .onEnded { _ in
-                                dragStartHeight = nil
-                            }
-                    )
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: height)
-    }
-}
-
-#if os(macOS)
-struct SoulTextView: NSViewRepresentable {
-    @Binding var text: String
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
-
-        guard let textView = scrollView.documentView as? NSTextView else {
-            return scrollView
-        }
-
-        textView.delegate = context.coordinator
-        textView.string = text
-        textView.font = .systemFont(ofSize: 15)
-        textView.drawsBackground = false
-        textView.isRichText = false
-        textView.allowsUndo = true
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.textContainerInset = .zero
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: scrollView.contentSize.width, height: .greatestFiniteMagnitude)
-
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
-
-        if textView.string != text {
-            textView.string = text
-        }
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
-    }
-
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        @Binding var text: String
-
-        init(text: Binding<String>) {
-            _text = text
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else { return }
-            text = textView.string
-        }
-    }
-}
-#else
-struct SoulTextView: View {
-    @Binding var text: String
-
-    var body: some View {
-        TextEditor(text: $text)
-            .font(.system(size: 15))
-            .scrollContentBackground(.hidden)
-            .scrollIndicators(.automatic)
-    }
-}
-#endif
-
-struct ResizeGrip: View {
-    var body: some View {
-        Canvas { context, size in
-            let stroke = StrokeStyle(lineWidth: 1.2, lineCap: .round)
-            let color = Color.gray.opacity(0.55)
-
-            for offset in stride(from: 0.0, through: 8.0, by: 4.0) {
-                var path = Path()
-                path.move(to: CGPoint(x: size.width - offset, y: size.height))
-                path.addLine(to: CGPoint(x: size.width, y: size.height - offset))
-                context.stroke(path, with: .color(color), style: stroke)
-            }
-        }
-        .frame(width: 14, height: 14)
-        .contentShape(Rectangle())
-        .help("Resize Soul editor")
     }
 }
 
@@ -772,24 +654,98 @@ final class Persona: Identifiable {
     }
 }
 
+@Model
+final class StoredChat: Identifiable {
+    @Attribute(.unique) var id: UUID
+    var personaID: UUID
+    var personaName: String
+    var personaSoul: String
+    var title: String
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        personaID: UUID,
+        personaName: String,
+        personaSoul: String,
+        title: String = "New chat",
+        createdAt: Date = .now,
+        updatedAt: Date = .now
+    ) {
+        self.id = id
+        self.personaID = personaID
+        self.personaName = personaName
+        self.personaSoul = personaSoul
+        self.title = title
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+@Model
+final class StoredChatMessage: Identifiable {
+    @Attribute(.unique) var id: UUID
+    var chatID: UUID
+    var roleRawValue: String
+    var text: String
+    var createdAt: Date
+
+    init(id: UUID = UUID(), chatID: UUID, role: ChatRole, text: String, createdAt: Date = .now) {
+        self.id = id
+        self.chatID = chatID
+        self.roleRawValue = role.rawValue
+        self.text = text
+        self.createdAt = createdAt
+    }
+
+    var role: ChatRole {
+        ChatRole(rawValue: roleRawValue) ?? .assistant
+    }
+}
+
 @MainActor
 final class ChatStore: ObservableObject {
+    private static let messageBatchSize = 40
+
     @Published var chats: [ChatViewModel] = []
     @Published var selectedChatID: ChatViewModel.ID?
+
+    private let modelContext: ModelContext
 
     var selectedChat: ChatViewModel? {
         guard let selectedChatID else { return nil }
         return chats.first { $0.id == selectedChatID }
     }
 
-    init(personaStore: PersonaStore) {
-        if let persona = personaStore.personas.first {
+    init(personaStore: PersonaStore, modelContext: ModelContext) {
+        self.modelContext = modelContext
+        loadChats()
+
+        if chats.isEmpty, let persona = personaStore.personas.first {
             startChat(with: persona)
+        } else {
+            selectedChatID = chats.first?.id
         }
     }
 
     func startChat(with persona: Persona) {
-        let chat = ChatViewModel(persona: persona)
+        let storedChat = StoredChat(
+            personaID: persona.id,
+            personaName: persona.displayName,
+            personaSoul: persona.soul
+        )
+        modelContext.insert(storedChat)
+
+        let greeting = StoredChatMessage(
+            chatID: storedChat.id,
+            role: .assistant,
+            text: "New chat with \(persona.displayName). What would you like to ask?"
+        )
+        modelContext.insert(greeting)
+        saveChanges()
+
+        let chat = ChatViewModel(storedChat: storedChat, storedMessages: [greeting], modelContext: modelContext)
         chats.insert(chat, at: 0)
         selectedChatID = chat.id
     }
@@ -797,38 +753,160 @@ final class ChatStore: ObservableObject {
     func chats(for personaID: Persona.ID) -> [ChatViewModel] {
         chats.filter { $0.personaID == personaID }
     }
+
+    func addFakeMessagesToSelectedChat(count: Int) {
+        selectedChat?.addFakeMessages(count: count)
+    }
+
+    func addSlowResponseToSelectedChat() {
+        selectedChat?.addSlowResponse()
+    }
+
+    private func loadChats() {
+        let descriptor = FetchDescriptor<StoredChat>(
+            sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
+        )
+
+        do {
+            let storedChats = try modelContext.fetch(descriptor)
+            chats = storedChats.map { storedChat in
+                ChatViewModel(
+                    storedChat: storedChat,
+                    storedMessages: fetchMessages(for: storedChat.id),
+                    modelContext: modelContext
+                )
+            }
+        } catch {
+            chats = []
+        }
+    }
+
+    private func fetchMessages(for chatID: UUID) -> [StoredChatMessage] {
+        var descriptor = FetchDescriptor<StoredChatMessage>(
+            predicate: #Predicate { message in
+                message.chatID == chatID
+            },
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+        descriptor.fetchLimit = ChatStore.messageBatchSize
+
+        do {
+            return try modelContext.fetch(descriptor).reversed()
+        } catch {
+            return []
+        }
+    }
+
+    private func saveChanges() {
+        guard modelContext.hasChanges else { return }
+
+        do {
+            try modelContext.save()
+        } catch {
+            assertionFailure("Failed to save chats: \(error.localizedDescription)")
+        }
+    }
 }
 
 @MainActor
 final class ChatViewModel: ObservableObject, Identifiable {
     static let typingIndicatorID = UUID()
+    private static let messageBatchSize = 40
 
-    let id = UUID()
-    let personaID: Persona.ID
-    let personaName: String
+    var id: UUID { storedChat.id }
+    var personaID: Persona.ID { storedChat.personaID }
+    var personaName: String { storedChat.personaName }
 
     @Published var draft = ""
-    @Published private(set) var title = "New chat"
+    @Published private(set) var title: String
     @Published private(set) var messages: [ChatMessage]
+    @Published private(set) var isLoadingOlderMessages = false
+    @Published private(set) var hasOlderMessages: Bool
     @Published private(set) var isResponding = false
     @Published private(set) var availabilityMessage = ""
     @Published private(set) var canSend = false
 
     private let model = SystemLanguageModel.default
+    private let modelContext: ModelContext
+    private let storedChat: StoredChat
     private var session: LanguageModelSession
 
     var canSubmitDraft: Bool {
         canSend && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    init(persona: Persona) {
-        personaID = persona.id
-        personaName = persona.displayName
-        messages = [
-            ChatMessage(role: .assistant, text: "New chat with \(persona.displayName). What would you like to ask?")
-        ]
-        session = ChatViewModel.makeSession(soul: persona.soul)
+    init(storedChat: StoredChat, storedMessages: [StoredChatMessage], modelContext: ModelContext) {
+        self.storedChat = storedChat
+        self.modelContext = modelContext
+        title = storedChat.title
+        messages = storedMessages.map(ChatMessage.init(storedMessage:))
+        hasOlderMessages = storedMessages.count == ChatViewModel.messageBatchSize
+        session = ChatViewModel.makeSession(soul: storedChat.personaSoul)
         updateAvailability()
+    }
+
+    func loadOlderMessages() {
+        guard hasOlderMessages,
+              !isLoadingOlderMessages,
+              let oldestMessage = messages.first else {
+            return
+        }
+
+        isLoadingOlderMessages = true
+        defer { isLoadingOlderMessages = false }
+
+        let oldestMessageDate = oldestMessage.createdAt
+        var descriptor = FetchDescriptor<StoredChatMessage>(
+            predicate: #Predicate { message in
+                message.chatID == id && message.createdAt < oldestMessageDate
+            },
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+        descriptor.fetchLimit = ChatViewModel.messageBatchSize
+
+        do {
+            let olderMessages = try modelContext.fetch(descriptor).reversed().map(ChatMessage.init(storedMessage:))
+            hasOlderMessages = olderMessages.count == ChatViewModel.messageBatchSize
+            messages.insert(contentsOf: olderMessages, at: 0)
+        } catch {
+            hasOlderMessages = false
+        }
+    }
+
+    func rename(to title: String) {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        updateTitle(trimmedTitle.isEmpty ? "New chat" : trimmedTitle)
+    }
+
+    func addFakeMessages(count: Int) {
+        guard count > 0 else { return }
+
+        let startingIndex = messages.count + 1
+        let storedMessages = (0..<count).map { offset in
+            let messageNumber = startingIndex + offset
+            let role: ChatRole = messageNumber.isMultiple(of: 2) ? .assistant : .user
+            return StoredChatMessage(
+                chatID: id,
+                role: role,
+                text: "Fake message \(messageNumber)",
+                createdAt: Date().addingTimeInterval(TimeInterval(offset) * 0.001)
+            )
+        }
+
+        for storedMessage in storedMessages {
+            modelContext.insert(storedMessage)
+        }
+
+        storedChat.updatedAt = .now
+        saveChanges()
+        messages.append(contentsOf: storedMessages.map(ChatMessage.init(storedMessage:)))
+    }
+
+    func addSlowResponse() {
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            appendMessage(role: .assistant, text: "Slow response")
+        }
     }
 
     func send() {
@@ -837,11 +915,11 @@ final class ChatViewModel: ObservableObject, Identifiable {
         guard canSubmitDraft, !prompt.isEmpty else { return }
 
         if title == "New chat" {
-            title = String(prompt.prefix(48))
+            updateTitle(String(prompt.prefix(48)))
         }
 
         draft = ""
-        messages.append(ChatMessage(role: .user, text: prompt))
+        appendMessage(role: .user, text: prompt)
         isResponding = true
 
         Task {
@@ -852,13 +930,28 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private func respond(to prompt: String) async {
         do {
             let response = try await session.respond(to: prompt)
-            messages.append(ChatMessage(role: .assistant, text: response.content))
+            appendMessage(role: .assistant, text: response.content)
         } catch {
-            messages.append(ChatMessage(role: .assistant, text: "I could not get a response: \(error.localizedDescription)"))
+            appendMessage(role: .assistant, text: "I could not get a response: \(error.localizedDescription)")
         }
 
         isResponding = false
         updateAvailability()
+    }
+
+    private func appendMessage(role: ChatRole, text: String) {
+        let storedMessage = StoredChatMessage(chatID: id, role: role, text: text)
+        modelContext.insert(storedMessage)
+        storedChat.updatedAt = .now
+        saveChanges()
+        messages.append(ChatMessage(storedMessage: storedMessage))
+    }
+
+    private func updateTitle(_ newTitle: String) {
+        title = newTitle
+        storedChat.title = newTitle
+        storedChat.updatedAt = .now
+        saveChanges()
     }
 
     private func updateAvailability() {
@@ -881,6 +974,16 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
     }
 
+    private func saveChanges() {
+        guard modelContext.hasChanges else { return }
+
+        do {
+            try modelContext.save()
+        } catch {
+            assertionFailure("Failed to save chat: \(error.localizedDescription)")
+        }
+    }
+
     private static func makeSession(soul: String) -> LanguageModelSession {
         let trimmedSoul = soul.trimmingCharacters(in: .whitespacesAndNewlines)
         let instructions = trimmedSoul.isEmpty ? """
@@ -893,12 +996,27 @@ final class ChatViewModel: ObservableObject, Identifiable {
 }
 
 struct ChatMessage: Identifiable, Equatable {
-    let id = UUID()
+    let id: UUID
     let role: ChatRole
     let text: String
+    let createdAt: Date
+
+    init(id: UUID = UUID(), role: ChatRole, text: String, createdAt: Date = .now) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.createdAt = createdAt
+    }
+
+    init(storedMessage: StoredChatMessage) {
+        id = storedMessage.id
+        role = storedMessage.role
+        text = storedMessage.text
+        createdAt = storedMessage.createdAt
+    }
 }
 
-enum ChatRole {
+enum ChatRole: String {
     case user
     case assistant
 }
@@ -910,20 +1028,23 @@ enum ChatRole {
 struct ContentViewPreview: View {
     private let modelContainer: ModelContainer
     private let personaStore: PersonaStore
+    private let chatStore: ChatStore
 
     init() {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
-            let container = try ModelContainer(for: Persona.self, configurations: configuration)
+            let container = try ModelContainer(for: Persona.self, StoredChat.self, StoredChatMessage.self, configurations: configuration)
+            let personaStore = PersonaStore(modelContext: container.mainContext)
             modelContainer = container
-            personaStore = PersonaStore(modelContext: container.mainContext)
+            self.personaStore = personaStore
+            chatStore = ChatStore(personaStore: personaStore, modelContext: container.mainContext)
         } catch {
             fatalError("Failed to create preview model container: \(error.localizedDescription)")
         }
     }
 
     var body: some View {
-        ContentView(personaStore: personaStore)
+        ContentView(personaStore: personaStore, chatStore: chatStore)
             .modelContainer(modelContainer)
     }
 }
