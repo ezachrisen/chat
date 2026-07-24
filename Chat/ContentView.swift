@@ -8,15 +8,35 @@ import SwiftUI
 struct ChatApp: App {
     private let modelContainer: ModelContainer
     @StateObject private var personaStore: PersonaStore
+    @StateObject private var localModelStore: LocalModelStore
     @StateObject private var chatStore: ChatStore
+    @StateObject private var heartbeatScheduler: HeartbeatScheduler
 
     init() {
         do {
-            let container = try ModelContainer(for: Persona.self, StoredChat.self, StoredChatMessage.self)
+            let container = try ModelContainer(
+                for: Persona.self,
+                PersonaHeartbeat.self,
+                HeartbeatRun.self,
+                LocalModel.self,
+                StoredChat.self,
+                StoredGroupChatParticipant.self,
+                StoredChatMessage.self
+            )
             let personaStore = PersonaStore(modelContext: container.mainContext)
+            let localModelStore = LocalModelStore(modelContext: container.mainContext)
+            let chatStore = ChatStore(
+                personaStore: personaStore,
+                localModelStore: localModelStore,
+                modelContext: container.mainContext
+            )
+            let heartbeatScheduler = HeartbeatScheduler(personaStore: personaStore, chatStore: chatStore)
             modelContainer = container
             _personaStore = StateObject(wrappedValue: personaStore)
-            _chatStore = StateObject(wrappedValue: ChatStore(personaStore: personaStore, modelContext: container.mainContext))
+            _localModelStore = StateObject(wrappedValue: localModelStore)
+            _chatStore = StateObject(wrappedValue: chatStore)
+            _heartbeatScheduler = StateObject(wrappedValue: heartbeatScheduler)
+            heartbeatScheduler.start()
         } catch {
             fatalError("Failed to create model container: \(error.localizedDescription)")
         }
@@ -29,13 +49,29 @@ struct ChatApp: App {
         }
         .commands {
             PersonaCommands()
+            HeartbeatCommands()
             DeveloperCommands(chatStore: chatStore)
         }
 
         Window("Personas", id: "personas") {
-            PersonasWindow(store: personaStore)
+            PersonasWindow(store: personaStore, localModelStore: localModelStore, chatStore: chatStore)
                 .modelContainer(modelContainer)
         }
+
+        Window("Heartbeats", id: "heartbeats") {
+            HeartbeatsView(
+                personaStore: personaStore,
+                chatStore: chatStore,
+                heartbeatScheduler: heartbeatScheduler
+            )
+                .modelContainer(modelContainer)
+        }
+
+#if os(macOS)
+        Settings {
+            ModelPreferencesView(store: localModelStore)
+        }
+#endif
     }
 }
 
@@ -70,6 +106,7 @@ struct ChatSidebar: View {
     @ObservedObject var personaStore: PersonaStore
     @ObservedObject var chatStore: ChatStore
     @State private var collapsedPersonaIDs: Set<Persona.ID> = []
+    @State private var groupChatsAreCollapsed = false
     @State private var chatBeingRenamed: ChatViewModel?
     @State private var renameDraft = ""
     @State private var renameAlertIsPresented = false
@@ -88,6 +125,17 @@ struct ChatSidebar: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    if !chatStore.groupChats.isEmpty {
+                        GroupChatSection(
+                            chats: chatStore.groupChats,
+                            selectedChatID: $chatStore.selectedChatID,
+                            isCollapsed: groupChatsAreCollapsed,
+                            onRenameChat: beginRenaming
+                        ) {
+                            groupChatsAreCollapsed.toggle()
+                        }
+                    }
+
                     ForEach(personaStore.personas) { persona in
                         let chats = chatStore.chats(for: persona.id)
 
@@ -134,30 +182,28 @@ struct ChatSidebar: View {
 
     @ViewBuilder
     private var newChatControl: some View {
-        if personaStore.personas.count > 1 {
-            Menu {
+        Menu {
+            Button {
+                chatStore.startGroupChat()
+            } label: {
+                Label("Group chat", systemImage: "person.2")
+            }
+
+            if !personaStore.personas.isEmpty {
+                Divider()
+
                 ForEach(personaStore.personas) { persona in
                     Button(persona.displayName) {
                         chatStore.startChat(with: persona)
                     }
                 }
-            } label: {
-                NewChatLabel()
             }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .help("Start a new chat")
-        } else {
-            Button {
-                guard let persona = personaStore.personas.first else { return }
-                chatStore.startChat(with: persona)
-            } label: {
-                NewChatLabel()
-            }
-            .buttonStyle(.plain)
-            .disabled(personaStore.personas.isEmpty)
-            .help("Start a new chat")
+        } label: {
+            NewChatLabel()
         }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .help("Start a new chat")
     }
 }
 
@@ -197,6 +243,57 @@ struct PersonaProjectSection: View {
                     Text(persona.displayName)
                         .font(.body)
                         .lineLimit(1)
+
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .rotationEffect(.degrees(isCollapsed ? -90 : 0))
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 12)
+                .frame(height: 32)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if !isCollapsed {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(chats) { chat in
+                        ChatRow(
+                            chat: chat,
+                            isSelected: selectedChatID == chat.id,
+                            onRename: {
+                                onRenameChat(chat)
+                            }
+                        ) {
+                            selectedChatID = chat.id
+                        }
+                    }
+                }
+                .padding(.bottom, 16)
+            }
+        }
+    }
+}
+
+struct GroupChatSection: View {
+    let chats: [ChatViewModel]
+    @Binding var selectedChatID: ChatViewModel.ID?
+    let isCollapsed: Bool
+    let onRenameChat: (ChatViewModel) -> Void
+    let onToggle: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: onToggle) {
+                HStack(spacing: 10) {
+                    Image(systemName: "person.2")
+                        .font(.body)
+                        .frame(width: 20, height: 20)
+
+                    Text("Group chats")
+                        .font(.body.weight(.medium))
 
                     Image(systemName: "chevron.down")
                         .font(.caption.weight(.semibold))
@@ -276,10 +373,20 @@ struct ChatDetailView: View {
                 .padding(.horizontal)
                 .padding(.top)
 
+            if chat.isGroupChat {
+                GroupChatConfigurationView(chat: chat)
+                    .padding(.horizontal)
+                    .padding(.top, 10)
+            }
+
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottom) {
                     ScrollView {
                         LazyVStack(spacing: 14) {
+                            if chat.isGroupChat, chat.messages.isEmpty {
+                                GroupChatEmptyState(mentions: chat.availablePersonaMentions)
+                            }
+
                             ForEach(chat.messages) { message in
                                 MessageBubble(message: message)
                                     .id(message.id)
@@ -300,7 +407,7 @@ struct ChatDetailView: View {
                             }
 
                             if chat.isResponding {
-                                TypingBubble()
+                                TypingBubble(personaName: chat.respondingPersonaName)
                                     .id(ChatViewModel.typingIndicatorID)
                             }
                         }
@@ -355,8 +462,12 @@ struct ChatDetailView: View {
 
     private var modelStatus: some View {
         HStack(spacing: 10) {
-            Image(systemName: chat.canSend ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(chat.canSend ? .green : .orange)
+            Image(
+                systemName: chat.isGroupChat
+                    ? "person.2.fill"
+                    : chat.canSend ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+            )
+            .foregroundStyle(chat.isGroupChat ? Color.accentColor : chat.canSend ? .green : .orange)
 
             Text(chat.availabilityMessage)
                 .font(.callout)
@@ -393,7 +504,7 @@ struct ChatDetailView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 10) {
-            TextField("Message", text: $chat.draft, axis: .vertical)
+            TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...5)
                 .padding(12)
@@ -479,9 +590,16 @@ struct MessageBubble: View {
     }
 
     private var bubble: some View {
-        Text(message.text)
-            .textSelection(.enabled)
-            .font(.body)
+        VStack(alignment: .leading, spacing: 5) {
+            if message.role == .assistant, let authorName = message.authorName {
+                Text(authorName)
+                    .font(.body.weight(.bold))
+            }
+
+            Text(message.text)
+                .textSelection(.enabled)
+                .font(.body)
+        }
             .foregroundStyle(message.role == .user ? .white : .primary)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -491,13 +609,15 @@ struct MessageBubble: View {
 }
 
 struct TypingBubble: View {
+    let personaName: String?
+
     var body: some View {
         HStack {
             HStack(spacing: 6) {
                 ProgressView()
                     .controlSize(.small)
 
-                Text("Thinking")
+                Text(personaName.map { "\($0) is thinking" } ?? "Thinking")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -507,6 +627,95 @@ struct TypingBubble: View {
 
             Spacer(minLength: 40)
         }
+    }
+}
+
+struct GroupChatConfigurationView: View {
+    @ObservedObject var chat: ChatViewModel
+    @State private var instructionsAreExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Label("Participants", systemImage: "person.2")
+                    .font(.callout.weight(.medium))
+
+                if chat.groupParticipantMentions.isEmpty {
+                    Text("Add one with an @mention")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(chat.groupParticipantMentions, id: \.self) { mention in
+                                Text(mention)
+                                    .font(.caption.weight(.medium))
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                            }
+                        }
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            DisclosureGroup("Group instructions", isExpanded: $instructionsAreExpanded) {
+                VStack(alignment: .leading, spacing: 6) {
+                    TextEditor(text: groupInstructions)
+                        .font(.body)
+                        .frame(minHeight: 72, maxHeight: 120)
+                        .padding(6)
+                        .scrollContentBackground(.hidden)
+                        .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                    Text("These instructions are sent with each persona's individual instructions.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 8)
+            }
+            .font(.callout.weight(.medium))
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var groupInstructions: Binding<String> {
+        Binding(
+            get: { chat.groupSystemInstructions },
+            set: { chat.updateGroupSystemInstructions($0) }
+        )
+    }
+}
+
+struct GroupChatEmptyState: View {
+    let mentions: [String]
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "person.2")
+                .font(.system(size: 28))
+                .foregroundStyle(.secondary)
+
+            Text("Start the discussion")
+                .font(.headline)
+
+            Text(emptyStateDescription)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: 420)
+        .padding(.vertical, 56)
+    }
+
+    private var emptyStateDescription: String {
+        guard !mentions.isEmpty else {
+            return "Create a persona, then mention them in your first message."
+        }
+        return "Mention personas in your first message, such as \(mentions.prefix(2).joined(separator: " and "))."
     }
 }
 
@@ -543,6 +752,8 @@ struct DeveloperCommands: Commands {
 @MainActor
 final class PersonaStore: ObservableObject {
     @Published private(set) var personas: [Persona] = []
+    @Published private(set) var heartbeats: [PersonaHeartbeat] = []
+    @Published private(set) var heartbeatRuns: [HeartbeatRun] = []
     @Published var selectedPersonaID: Persona.ID?
 
     private let modelContext: ModelContext
@@ -555,6 +766,8 @@ final class PersonaStore: ObservableObject {
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
         loadPersonas()
+        loadHeartbeats()
+        loadHeartbeatRuns()
     }
 
     func addPersona() {
@@ -578,6 +791,11 @@ final class PersonaStore: ObservableObject {
             nextSelection = personas[nextIndex == index ? index + 1 : nextIndex].id
         }
 
+        let heartbeatsToDelete = heartbeats.filter { $0.personaID == selectedPersonaID }
+        for heartbeat in heartbeatsToDelete {
+            modelContext.delete(heartbeat)
+        }
+        heartbeats.removeAll { $0.personaID == selectedPersonaID }
         modelContext.delete(personas[index])
         saveChanges()
         loadPersonas(selecting: nextSelection)
@@ -597,6 +815,255 @@ final class PersonaStore: ObservableObject {
         persona.soul = soul
         saveChanges()
         objectWillChange.send()
+    }
+
+    func updatePersonaMemory(id: Persona.ID, memory: String) {
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
+
+        persona.memory = memory
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func appendPersonaMemoryEntries(id: Persona.ID, entries: [String]) {
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
+
+        let newEntries = entries
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !newEntries.isEmpty else { return }
+
+        let existingMemory = (persona.memory ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let appendedMemory = newEntries.joined(separator: "\n\n")
+        persona.memory = existingMemory.isEmpty
+            ? appendedMemory
+            : "\(existingMemory)\n\n\(appendedMemory)"
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updatePersonaModelIdentifier(id: Persona.ID, modelIdentifier: String) {
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
+
+        persona.modelIdentifier = modelIdentifier
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func persona(for id: Persona.ID) -> Persona? {
+        personas.first { $0.id == id }
+    }
+
+    func heartbeats(for personaID: Persona.ID) -> [PersonaHeartbeat] {
+        heartbeats.filter { $0.personaID == personaID }
+    }
+
+    func addHeartbeat(to personaID: Persona.ID) {
+        let heartbeat = PersonaHeartbeat(personaID: personaID)
+        modelContext.insert(heartbeat)
+        heartbeats.append(heartbeat)
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func removeHeartbeat(_ heartbeat: PersonaHeartbeat) {
+        modelContext.delete(heartbeat)
+        heartbeats.removeAll { $0.id == heartbeat.id }
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatInstruction(_ heartbeat: PersonaHeartbeat, instruction: String) {
+        heartbeat.instruction = instruction
+        heartbeat.lastError = nil
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatInterval(_ heartbeat: PersonaHeartbeat, minutes: Int) {
+        heartbeat.intervalMinutes = min(max(minutes, 1), 10_080)
+        if heartbeat.isEnabled {
+            heartbeat.nextRunAt = Date().addingTimeInterval(TimeInterval(heartbeat.intervalMinutes * 60))
+        }
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatEnabled(_ heartbeat: PersonaHeartbeat, isEnabled: Bool) {
+        heartbeat.isEnabled = isEnabled
+        heartbeat.nextRunAt = isEnabled
+            ? Date().addingTimeInterval(TimeInterval(heartbeat.normalizedIntervalMinutes * 60))
+            : nil
+        heartbeat.lastError = nil
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatDestination(
+        _ heartbeat: PersonaHeartbeat,
+        targetKind: HeartbeatTargetKind,
+        targetChatID: UUID?
+    ) {
+        heartbeat.targetKindRawValue = targetKind.rawValue
+        heartbeat.targetChatID = targetKind == .groupChat ? targetChatID : nil
+        heartbeat.lastError = nil
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatModelIdentifier(
+        _ heartbeat: PersonaHeartbeat,
+        modelIdentifier: String?
+    ) {
+        heartbeat.modelIdentifier = modelIdentifier
+        heartbeat.lastError = nil
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func claimNextDueHeartbeat(at date: Date) -> PersonaHeartbeat? {
+        let dueHeartbeats = heartbeats
+            .filter { heartbeat in
+                heartbeat.isEnabled && (heartbeat.nextRunAt ?? .distantFuture) <= date
+            }
+            .sorted { lhs, rhs in
+                let lhsNextRunAt = lhs.nextRunAt ?? .distantFuture
+                let rhsNextRunAt = rhs.nextRunAt ?? .distantFuture
+                if lhsNextRunAt != rhsNextRunAt {
+                    return lhsNextRunAt < rhsNextRunAt
+                }
+
+                let lhsLastRunAt = lhs.lastRunAt ?? .distantPast
+                let rhsLastRunAt = rhs.lastRunAt ?? .distantPast
+                if lhsLastRunAt != rhsLastRunAt {
+                    return lhsLastRunAt < rhsLastRunAt
+                }
+
+                if lhs.createdAt != rhs.createdAt {
+                    return lhs.createdAt < rhs.createdAt
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+
+        guard let claimedHeartbeat = dueHeartbeats.first else { return nil }
+
+        claimedHeartbeat.lastRunAt = date
+        claimedHeartbeat.nextRunAt = date.addingTimeInterval(
+            TimeInterval(claimedHeartbeat.normalizedIntervalMinutes * 60)
+        )
+        claimedHeartbeat.lastError = nil
+
+        for heartbeat in dueHeartbeats.dropFirst() {
+            deferHeartbeatByInterval(heartbeat, from: date)
+        }
+        saveChanges()
+        objectWillChange.send()
+        return claimedHeartbeat
+    }
+
+    func deferDueHeartbeatsForOverlap(at date: Date) {
+        let dueHeartbeats = heartbeats.filter { heartbeat in
+            heartbeat.isEnabled && (heartbeat.nextRunAt ?? .distantFuture) <= date
+        }
+        guard !dueHeartbeats.isEmpty else { return }
+
+        for heartbeat in dueHeartbeats {
+            deferHeartbeatByInterval(heartbeat, from: date)
+        }
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func deferHeartbeatForOverlap(id: PersonaHeartbeat.ID, at date: Date) {
+        guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
+            return
+        }
+
+        deferHeartbeatByInterval(heartbeat, from: date)
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func skipHeartbeat(id: PersonaHeartbeat.ID, at date: Date) {
+        guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
+            return
+        }
+
+        let scheduledDate = max(heartbeat.nextRunAt ?? date, date)
+        heartbeat.nextRunAt = scheduledDate.addingTimeInterval(
+            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
+        )
+        heartbeat.lastError = nil
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func claimHeartbeatForImmediateRun(
+        id: PersonaHeartbeat.ID,
+        at date: Date
+    ) -> PersonaHeartbeat? {
+        guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
+            return nil
+        }
+
+        heartbeat.lastRunAt = date
+        heartbeat.nextRunAt = date.addingTimeInterval(
+            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
+        )
+        heartbeat.lastError = nil
+        saveChanges()
+        objectWillChange.send()
+        return heartbeat
+    }
+
+    func rescheduleHeartbeatAfterTimeout(id: PersonaHeartbeat.ID, at date: Date) {
+        guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
+            return
+        }
+
+        heartbeat.nextRunAt = date.addingTimeInterval(
+            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
+        )
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func recordHeartbeatCompletion(
+        heartbeatID: PersonaHeartbeat.ID,
+        personaID: Persona.ID,
+        report: HeartbeatExecutionReport
+    ) {
+        if let heartbeat = heartbeats.first(where: { $0.id == heartbeatID }) {
+            heartbeat.lastCompletedAt = report.completedAt
+            heartbeat.lastError = report.errorMessage
+            if heartbeat.isEnabled, let retryDelay = report.retryDelay {
+                heartbeat.nextRunAt = report.completedAt.addingTimeInterval(retryDelay)
+            }
+        }
+
+        let run = HeartbeatRun(
+            heartbeatID: heartbeatID,
+            personaID: personaID,
+            personaName: report.personaName,
+            instruction: report.instruction,
+            destination: report.destination,
+            startedAt: report.startedAt,
+            completedAt: report.completedAt,
+            modelInput: report.modelInput,
+            modelOutput: report.modelOutput,
+            actionSummary: report.actionSummary,
+            errorMessage: report.errorMessage
+        )
+        modelContext.insert(run)
+        heartbeatRuns.insert(run, at: 0)
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    private func deferHeartbeatByInterval(_ heartbeat: PersonaHeartbeat, from date: Date) {
+        heartbeat.nextRunAt = date.addingTimeInterval(
+            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
+        )
     }
 
     private func loadPersonas(selecting selection: Persona.ID? = nil) {
@@ -624,6 +1091,45 @@ final class PersonaStore: ObservableObject {
         } ?? personas.first?.id
     }
 
+    private func loadHeartbeats() {
+        let descriptor = FetchDescriptor<PersonaHeartbeat>(
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+
+        do {
+            heartbeats = try modelContext.fetch(descriptor)
+        } catch {
+            heartbeats = []
+        }
+
+        let now = Date()
+        for heartbeat in heartbeats where heartbeat.isEnabled && heartbeat.nextRunAt == nil {
+            heartbeat.nextRunAt = now.addingTimeInterval(
+                TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
+            )
+        }
+        saveChanges()
+    }
+
+    private func loadHeartbeatRuns() {
+        let descriptor = FetchDescriptor<HeartbeatRun>(
+            sortBy: [SortDescriptor(\.completedAt, order: .reverse)]
+        )
+
+        do {
+            heartbeatRuns = try modelContext.fetch(descriptor)
+        } catch {
+            heartbeatRuns = []
+        }
+
+        for heartbeat in heartbeats where heartbeat.lastCompletedAt == nil {
+            heartbeat.lastCompletedAt = heartbeatRuns.first {
+                $0.heartbeatID == heartbeat.id
+            }?.completedAt
+        }
+        saveChanges()
+    }
+
     private func saveChanges() {
         guard modelContext.hasChanges else { return }
 
@@ -640,17 +1146,36 @@ final class Persona: Identifiable {
     @Attribute(.unique) var id: UUID
     var name: String
     var soul: String
+    var memory: String?
+    var modelIdentifier: String?
     var createdAt: Date
 
-    init(id: UUID = UUID(), name: String, soul: String, createdAt: Date = .now) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        soul: String,
+        memory: String? = nil,
+        modelIdentifier: String? = nil,
+        createdAt: Date = .now
+    ) {
         self.id = id
         self.name = name
         self.soul = soul
+        self.memory = memory
+        self.modelIdentifier = modelIdentifier
         self.createdAt = createdAt
     }
 
     var displayName: String {
         name.isEmpty ? "Untitled Persona" : name
+    }
+
+    var selectedModelIdentifier: String {
+        modelIdentifier ?? ChatModelIdentifier.appleFoundation
+    }
+
+    var memoryText: String {
+        memory ?? ""
     }
 }
 
@@ -660,6 +1185,9 @@ final class StoredChat: Identifiable {
     var personaID: UUID
     var personaName: String
     var personaSoul: String
+    var personaModelIdentifier: String?
+    var kindRawValue: String?
+    var groupSystemInstructions: String?
     var title: String
     var createdAt: Date
     var updatedAt: Date
@@ -669,6 +1197,9 @@ final class StoredChat: Identifiable {
         personaID: UUID,
         personaName: String,
         personaSoul: String,
+        personaModelIdentifier: String? = nil,
+        kind: ChatKind = .direct,
+        groupSystemInstructions: String? = nil,
         title: String = "New chat",
         createdAt: Date = .now,
         updatedAt: Date = .now
@@ -677,9 +1208,16 @@ final class StoredChat: Identifiable {
         self.personaID = personaID
         self.personaName = personaName
         self.personaSoul = personaSoul
+        self.personaModelIdentifier = personaModelIdentifier
+        kindRawValue = kind.rawValue
+        self.groupSystemInstructions = groupSystemInstructions
         self.title = title
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    var kind: ChatKind {
+        ChatKind(rawValue: kindRawValue ?? "") ?? .direct
     }
 }
 
@@ -689,13 +1227,25 @@ final class StoredChatMessage: Identifiable {
     var chatID: UUID
     var roleRawValue: String
     var text: String
+    var authorPersonaID: UUID?
+    var authorName: String?
     var createdAt: Date
 
-    init(id: UUID = UUID(), chatID: UUID, role: ChatRole, text: String, createdAt: Date = .now) {
+    init(
+        id: UUID = UUID(),
+        chatID: UUID,
+        role: ChatRole,
+        text: String,
+        authorPersonaID: UUID? = nil,
+        authorName: String? = nil,
+        createdAt: Date = .now
+    ) {
         self.id = id
         self.chatID = chatID
         self.roleRawValue = role.rawValue
         self.text = text
+        self.authorPersonaID = authorPersonaID
+        self.authorName = authorName
         self.createdAt = createdAt
     }
 
@@ -712,14 +1262,18 @@ final class ChatStore: ObservableObject {
     @Published var selectedChatID: ChatViewModel.ID?
 
     private let modelContext: ModelContext
+    private let personaStore: PersonaStore
+    private let localModelStore: LocalModelStore
 
     var selectedChat: ChatViewModel? {
         guard let selectedChatID else { return nil }
         return chats.first { $0.id == selectedChatID }
     }
 
-    init(personaStore: PersonaStore, modelContext: ModelContext) {
+    init(personaStore: PersonaStore, localModelStore: LocalModelStore, modelContext: ModelContext) {
         self.modelContext = modelContext
+        self.personaStore = personaStore
+        self.localModelStore = localModelStore
         loadChats()
 
         if chats.isEmpty, let persona = personaStore.personas.first {
@@ -730,28 +1284,71 @@ final class ChatStore: ObservableObject {
     }
 
     func startChat(with persona: Persona) {
+        let chat = makeDirectChat(with: persona)
+        selectedChatID = chat.id
+    }
+
+    private func makeDirectChat(with persona: Persona) -> ChatViewModel {
         let storedChat = StoredChat(
             personaID: persona.id,
             personaName: persona.displayName,
-            personaSoul: persona.soul
+            personaSoul: persona.soul,
+            personaModelIdentifier: persona.selectedModelIdentifier
         )
         modelContext.insert(storedChat)
 
         let greeting = StoredChatMessage(
             chatID: storedChat.id,
             role: .assistant,
-            text: "New chat with \(persona.displayName). What would you like to ask?"
+            text: "New chat with \(persona.displayName). What would you like to ask?",
+            authorPersonaID: persona.id,
+            authorName: persona.displayName
         )
         modelContext.insert(greeting)
         saveChanges()
 
-        let chat = ChatViewModel(storedChat: storedChat, storedMessages: [greeting], modelContext: modelContext)
+        let chat = ChatViewModel(
+            storedChat: storedChat,
+            storedMessages: [greeting],
+            storedGroupParticipants: [],
+            personaStore: personaStore,
+            localModelStore: localModelStore,
+            modelContext: modelContext
+        )
+        chats.insert(chat, at: 0)
+        return chat
+    }
+
+    func startGroupChat() {
+        let storedChat = StoredChat(
+            personaID: UUID(),
+            personaName: "Group chat",
+            personaSoul: "",
+            kind: .group,
+            groupSystemInstructions: "",
+            title: "Untitled chat"
+        )
+        modelContext.insert(storedChat)
+        saveChanges()
+
+        let chat = ChatViewModel(
+            storedChat: storedChat,
+            storedMessages: [],
+            storedGroupParticipants: [],
+            personaStore: personaStore,
+            localModelStore: localModelStore,
+            modelContext: modelContext
+        )
         chats.insert(chat, at: 0)
         selectedChatID = chat.id
     }
 
     func chats(for personaID: Persona.ID) -> [ChatViewModel] {
-        chats.filter { $0.personaID == personaID }
+        chats.filter { !$0.isGroupChat && $0.personaID == personaID }
+    }
+
+    var groupChats: [ChatViewModel] {
+        chats.filter(\.isGroupChat)
     }
 
     func addFakeMessagesToSelectedChat(count: Int) {
@@ -760,6 +1357,168 @@ final class ChatStore: ObservableObject {
 
     func addSlowResponseToSelectedChat() {
         selectedChat?.addSlowResponse()
+    }
+
+    func executeHeartbeat(
+        _ heartbeat: PersonaHeartbeat,
+        onModelInput: ((String) -> Void)? = nil,
+        onModelResponseAccepted: (() -> Void)? = nil
+    ) async -> HeartbeatExecutionReport {
+        let startedAt = Date()
+        let fallbackPersonaName = "Deleted persona"
+        let instruction = heartbeat.instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if Task.isCancelled {
+            return failedHeartbeatReport(
+                personaName: personaStore.persona(for: heartbeat.personaID)?.displayName ?? fallbackPersonaName,
+                instruction: instruction,
+                destination: heartbeatDestinationDescription(for: heartbeat),
+                startedAt: startedAt,
+                error: HeartbeatModelFailure(
+                    modelInput: "",
+                    modelOutput: nil,
+                    message: "Aborted by user.",
+                    wasAborted: true
+                )
+            )
+        }
+
+        guard let persona = personaStore.persona(for: heartbeat.personaID) else {
+            return failedHeartbeatReport(
+                personaName: fallbackPersonaName,
+                instruction: instruction,
+                destination: heartbeatDestinationDescription(for: heartbeat),
+                startedAt: startedAt,
+                error: HeartbeatExecutionError.personaMissing
+            )
+        }
+
+        guard !instruction.isEmpty else {
+            return failedHeartbeatReport(
+                personaName: persona.displayName,
+                instruction: instruction,
+                destination: heartbeatDestinationDescription(for: heartbeat),
+                startedAt: startedAt,
+                error: HeartbeatExecutionError.emptyInstruction
+            )
+        }
+
+        let targetChat: ChatViewModel
+        switch heartbeat.targetKind {
+        case .privateChat:
+            targetChat = chats
+                .filter { !$0.isGroupChat && $0.personaID == persona.id }
+                .max { $0.updatedAt < $1.updatedAt }
+                ?? makeDirectChat(with: persona)
+        case .groupChat:
+            guard let targetChatID = heartbeat.targetChatID,
+                  let groupChat = chats.first(where: { $0.id == targetChatID && $0.isGroupChat }) else {
+                return failedHeartbeatReport(
+                    personaName: persona.displayName,
+                    instruction: instruction,
+                    destination: heartbeatDestinationDescription(for: heartbeat),
+                    startedAt: startedAt,
+                    error: HeartbeatExecutionError.targetMissing
+                )
+            }
+            targetChat = groupChat
+        }
+
+        let destination = targetChat.heartbeatDestinationDescription
+        let modelIdentifier = heartbeat.modelIdentifier ?? persona.selectedModelIdentifier
+        do {
+            let exchange = try await targetChat.executeHeartbeat(
+                as: persona,
+                instruction: instruction,
+                modelIdentifier: modelIdentifier,
+                lastCompletedAt: heartbeat.lastCompletedAt,
+                referenceDate: startedAt,
+                onModelInput: onModelInput,
+                onModelResponseAccepted: onModelResponseAccepted
+            )
+            return HeartbeatExecutionReport(
+                personaName: persona.displayName,
+                instruction: instruction,
+                destination: destination,
+                startedAt: startedAt,
+                completedAt: .now,
+                modelInput: exchange.modelInput,
+                modelOutput: exchange.modelOutput,
+                actionSummary: exchange.actionSummary,
+                errorMessage: nil,
+                retryDelay: nil
+            )
+        } catch let error as HeartbeatModelFailure {
+            return failedHeartbeatReport(
+                personaName: persona.displayName,
+                instruction: instruction,
+                destination: destination,
+                startedAt: startedAt,
+                modelInput: error.modelInput,
+                modelOutput: error.modelOutput,
+                error: error
+            )
+        } catch {
+            return failedHeartbeatReport(
+                personaName: persona.displayName,
+                instruction: instruction,
+                destination: destination,
+                startedAt: startedAt,
+                error: error
+            )
+        }
+    }
+
+    func heartbeatDestinationDescription(for heartbeat: PersonaHeartbeat) -> String {
+        switch heartbeat.targetKind {
+        case .privateChat:
+            guard let chat = chats
+                .filter({ !$0.isGroupChat && $0.personaID == heartbeat.personaID })
+                .max(by: { $0.updatedAt < $1.updatedAt }) else {
+                return "New private chat"
+            }
+            return chat.heartbeatDestinationDescription
+        case .groupChat:
+            guard let targetChatID = heartbeat.targetChatID,
+                  let chat = chats.first(where: { $0.id == targetChatID && $0.isGroupChat }) else {
+                return "Missing group chat"
+            }
+            return chat.heartbeatDestinationDescription
+        }
+    }
+
+    private func failedHeartbeatReport(
+        personaName: String,
+        instruction: String,
+        destination: String,
+        startedAt: Date,
+        modelInput: String = "",
+        modelOutput: String? = nil,
+        error: Error
+    ) -> HeartbeatExecutionReport {
+        let wasAborted = (error as? HeartbeatModelFailure)?.wasAborted == true
+        let retryDelay = (error as? HeartbeatExecutionError)?.retryDelay
+        let actionSummary: String
+        if wasAborted {
+            actionSummary = "Run was aborted. No chat message was posted."
+        } else if retryDelay != nil {
+            actionSummary = "No chat message was posted. Scheduled a retry in 1 minute."
+        } else {
+            actionSummary = "No chat message was posted."
+        }
+
+        return HeartbeatExecutionReport(
+            personaName: personaName,
+            instruction: instruction,
+            destination: destination,
+            startedAt: startedAt,
+            completedAt: Date(),
+            modelInput: modelInput,
+            modelOutput: modelOutput,
+            actionSummary: actionSummary,
+            errorMessage: wasAborted ? "Aborted by user." : error.localizedDescription,
+            retryDelay: retryDelay
+        )
     }
 
     private func loadChats() {
@@ -773,11 +1532,29 @@ final class ChatStore: ObservableObject {
                 ChatViewModel(
                     storedChat: storedChat,
                     storedMessages: fetchMessages(for: storedChat.id),
+                    storedGroupParticipants: fetchGroupParticipants(for: storedChat.id),
+                    personaStore: personaStore,
+                    localModelStore: localModelStore,
                     modelContext: modelContext
                 )
             }
         } catch {
             chats = []
+        }
+    }
+
+    private func fetchGroupParticipants(for chatID: UUID) -> [StoredGroupChatParticipant] {
+        let descriptor = FetchDescriptor<StoredGroupChatParticipant>(
+            predicate: #Predicate { participant in
+                participant.chatID == chatID
+            },
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+
+        do {
+            return try modelContext.fetch(descriptor)
+        } catch {
+            return []
         }
     }
 
@@ -816,33 +1593,78 @@ final class ChatViewModel: ObservableObject, Identifiable {
     var id: UUID { storedChat.id }
     var personaID: Persona.ID { storedChat.personaID }
     var personaName: String { storedChat.personaName }
+    var isGroupChat: Bool { storedChat.kind == .group }
+    var updatedAt: Date { storedChat.updatedAt }
+    var heartbeatDestinationDescription: String {
+        "\(isGroupChat ? "Group chat" : "Private chat") “\(title)”"
+    }
 
     @Published var draft = ""
     @Published private(set) var title: String
     @Published private(set) var messages: [ChatMessage]
+    @Published private(set) var groupParticipants: [StoredGroupChatParticipant]
+    @Published private(set) var groupSystemInstructions: String
     @Published private(set) var isLoadingOlderMessages = false
     @Published private(set) var hasOlderMessages: Bool
     @Published private(set) var isResponding = false
+    @Published private(set) var respondingPersonaName: String?
     @Published private(set) var availabilityMessage = ""
     @Published private(set) var canSend = false
 
     private let model = SystemLanguageModel.default
     private let modelContext: ModelContext
     private let storedChat: StoredChat
-    private var session: LanguageModelSession
+    private let personaStore: PersonaStore
+    private let localModelStore: LocalModelStore
+    private let backend: ChatBackend
 
     var canSubmitDraft: Bool {
         canSend && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    init(storedChat: StoredChat, storedMessages: [StoredChatMessage], modelContext: ModelContext) {
+    init(
+        storedChat: StoredChat,
+        storedMessages: [StoredChatMessage],
+        storedGroupParticipants: [StoredGroupChatParticipant],
+        personaStore: PersonaStore,
+        localModelStore: LocalModelStore,
+        modelContext: ModelContext
+    ) {
         self.storedChat = storedChat
+        self.personaStore = personaStore
+        self.localModelStore = localModelStore
         self.modelContext = modelContext
         title = storedChat.title
-        messages = storedMessages.map(ChatMessage.init(storedMessage:))
+        let fallbackAssistantName = storedChat.kind == .direct ? storedChat.personaName : nil
+        messages = storedMessages.map {
+            ChatMessage(storedMessage: $0, fallbackAssistantName: fallbackAssistantName)
+        }
+        groupParticipants = storedGroupParticipants
+        groupSystemInstructions = storedChat.groupSystemInstructions ?? ""
+        respondingPersonaName = nil
         hasOlderMessages = storedMessages.count == ChatViewModel.messageBatchSize
-        session = ChatViewModel.makeSession(soul: storedChat.personaSoul)
+        backend = localModelStore.backend(for: storedChat.personaModelIdentifier)
         updateAvailability()
+    }
+
+    var groupParticipantMentions: [String] {
+        groupParticipants.map(\.mention)
+    }
+
+    var availablePersonaMentions: [String] {
+        var mentions = groupParticipantMentions
+        mentions.append(contentsOf: personaStore.personas.map(\.mention))
+        return Array(Set(mentions)).sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }
+    }
+
+    var composerPlaceholder: String {
+        guard isGroupChat, groupParticipants.isEmpty else { return "Message" }
+        guard let firstMention = availablePersonaMentions.first else {
+            return "Message"
+        }
+        return "Message \(firstMention) to add them"
     }
 
     func loadOlderMessages() {
@@ -865,7 +1687,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         descriptor.fetchLimit = ChatViewModel.messageBatchSize
 
         do {
-            let olderMessages = try modelContext.fetch(descriptor).reversed().map(ChatMessage.init(storedMessage:))
+            let fallbackAssistantName = isGroupChat ? nil : storedChat.personaName
+            let olderMessages = try modelContext.fetch(descriptor).reversed().map {
+                ChatMessage(storedMessage: $0, fallbackAssistantName: fallbackAssistantName)
+            }
             hasOlderMessages = olderMessages.count == ChatViewModel.messageBatchSize
             messages.insert(contentsOf: olderMessages, at: 0)
         } catch {
@@ -875,7 +1700,16 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     func rename(to title: String) {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        updateTitle(trimmedTitle.isEmpty ? "New chat" : trimmedTitle)
+        let fallbackTitle = isGroupChat ? "Untitled chat" : "New chat"
+        updateTitle(trimmedTitle.isEmpty ? fallbackTitle : trimmedTitle)
+    }
+
+    func updateGroupSystemInstructions(_ instructions: String) {
+        guard isGroupChat else { return }
+        groupSystemInstructions = instructions
+        storedChat.groupSystemInstructions = instructions
+        storedChat.updatedAt = .now
+        saveChanges()
     }
 
     func addFakeMessages(count: Int) {
@@ -889,6 +1723,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 chatID: id,
                 role: role,
                 text: "Fake message \(messageNumber)",
+                authorPersonaID: role == .assistant ? groupParticipants.first?.personaID ?? personaID : nil,
+                authorName: role == .assistant ? groupParticipants.first?.personaName ?? personaName : nil,
                 createdAt: Date().addingTimeInterval(TimeInterval(offset) * 0.001)
             )
         }
@@ -899,13 +1735,21 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
         storedChat.updatedAt = .now
         saveChanges()
-        messages.append(contentsOf: storedMessages.map(ChatMessage.init(storedMessage:)))
+        messages.append(contentsOf: storedMessages.map {
+            ChatMessage(storedMessage: $0, fallbackAssistantName: isGroupChat ? nil : personaName)
+        })
     }
 
     func addSlowResponse() {
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(5))
-            appendMessage(role: .assistant, text: "Slow response")
+            let participant = groupParticipants.first
+            appendMessage(
+                role: .assistant,
+                text: "Slow response",
+                authorPersonaID: participant?.personaID ?? (isGroupChat ? nil : personaID),
+                authorName: participant?.personaName ?? (isGroupChat ? nil : personaName)
+            )
         }
     }
 
@@ -913,6 +1757,37 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard canSubmitDraft, !prompt.isEmpty else { return }
+
+        if isGroupChat {
+            let mentionedHandles = PersonaMention.handles(in: prompt)
+            addMentionedPersonas(matching: mentionedHandles)
+
+            guard !groupParticipants.isEmpty else {
+                availabilityMessage = availablePersonaMentions.isEmpty
+                    ? "Create a persona before starting this group discussion."
+                    : "Mention a persona, such as \(availablePersonaMentions[0]), to add them."
+                return
+            }
+
+            let directlyMentionedPersonaIDs = Set(
+                groupParticipants
+                    .filter { mentionedHandles.contains(PersonaMention.handle(for: $0.personaName).lowercased()) }
+                    .map(\.personaID)
+            )
+
+            if title == "Untitled chat" {
+                updateTitle(String(prompt.prefix(48)))
+            }
+
+            draft = ""
+            appendMessage(role: .user, text: prompt)
+            isResponding = true
+
+            Task {
+                await respondAsGroup(directlyMentionedPersonaIDs: directlyMentionedPersonaIDs)
+            }
+            return
+        }
 
         if title == "New chat" {
             updateTitle(String(prompt.prefix(48)))
@@ -923,24 +1798,506 @@ final class ChatViewModel: ObservableObject, Identifiable {
         isResponding = true
 
         Task {
-            await respond(to: prompt)
+            await respond()
         }
     }
 
-    private func respond(to prompt: String) async {
+    func executeHeartbeat(
+        as persona: Persona,
+        instruction: String,
+        modelIdentifier: String,
+        lastCompletedAt: Date?,
+        referenceDate: Date,
+        onModelInput: ((String) -> Void)? = nil,
+        onModelResponseAccepted: (() -> Void)? = nil
+    ) async throws -> HeartbeatModelExchange {
+        if Task.isCancelled {
+            throw HeartbeatModelFailure(
+                modelInput: "",
+                modelOutput: nil,
+                message: "Aborted by user.",
+                wasAborted: true
+            )
+        }
+
+        guard !isResponding else {
+            throw HeartbeatExecutionError.chatBusy
+        }
+
+        if isGroupChat {
+            addGroupParticipantIfNeeded(persona)
+        }
+
+        isResponding = true
+        respondingPersonaName = persona.displayName
+        defer {
+            respondingPersonaName = nil
+            isResponding = false
+            updateAvailability()
+        }
+
+        let systemInstructions = heartbeatSystemInstructions(for: persona)
+        let conversationPrompt = heartbeatConversationPrompt(
+            personaName: persona.displayName,
+            instruction: instruction,
+            lastCompletedAt: lastCompletedAt,
+            referenceDate: referenceDate
+        )
+        let modelInput = """
+        SYSTEM
+        \(systemInstructions)
+
+        USER
+        \(conversationPrompt)
+        """
+        onModelInput?(modelInput)
+
+        let response: String
         do {
-            let response = try await session.respond(to: prompt)
-            appendMessage(role: .assistant, text: response.content)
+            switch localModelStore.backend(for: modelIdentifier) {
+            case .appleFoundation:
+                let session = LanguageModelSession(instructions: systemInstructions)
+                response = try await session.respond(to: conversationPrompt).content
+            case .openAICompatible(let configuration):
+                response = try await OpenAICompatibleClient(configuration: configuration).respond(
+                    systemPrompt: systemInstructions,
+                    prompt: conversationPrompt
+                )
+            case .missingLocalModel:
+                throw OpenAICompatibleError.server(
+                    statusCode: 0,
+                    message: "The selected local model is no longer configured."
+                )
+            }
+            try Task.checkCancellation()
         } catch {
-            appendMessage(role: .assistant, text: "I could not get a response: \(error.localizedDescription)")
+            let wasAborted = Task.isCancelled || error is CancellationError
+            throw HeartbeatModelFailure(
+                modelInput: modelInput,
+                modelOutput: nil,
+                message: wasAborted ? "Aborted by user." : error.localizedDescription,
+                wasAborted: wasAborted
+            )
+        }
+        onModelResponseAccepted?()
+
+        let parsedResponse = PersonaMemoryHarness.parse(response)
+        personaStore.appendPersonaMemoryEntries(
+            id: persona.id,
+            entries: parsedResponse.memoryEntries
+        )
+
+        let visibleText = parsedResponse.visibleText
+        let passed = ChatViewModel.isPassResponse(visibleText)
+        let posted = !visibleText.isEmpty && !passed
+        if posted {
+            appendMessage(
+                role: .assistant,
+                text: visibleText,
+                authorPersonaID: persona.id,
+                authorName: persona.displayName
+            )
+        }
+
+        var actions: [String] = []
+        if posted {
+            actions.append("Posted to \(heartbeatDestinationDescription).")
+        } else if passed {
+            actions.append("The model passed, so no chat message was posted.")
+        } else {
+            actions.append("The model returned no visible text, so no chat message was posted.")
+        }
+
+        let memoryCount = parsedResponse.memoryEntries.count
+        if memoryCount > 0 {
+            actions.append("Appended \(memoryCount) memory \(memoryCount == 1 ? "entry" : "entries").")
+        }
+
+        return HeartbeatModelExchange(
+            modelInput: modelInput,
+            modelOutput: response,
+            actionSummary: actions.joined(separator: " ")
+        )
+    }
+
+    private func respond() async {
+        do {
+            let systemInstructions = ChatViewModel.personaSystemInstructions(
+                personaName: storedChat.personaName,
+                soul: storedChat.personaSoul,
+                memory: currentMemory(for: storedChat.personaID)
+            )
+            let response: String
+            switch backend {
+            case .appleFoundation:
+                let session = LanguageModelSession(instructions: systemInstructions)
+                response = try await session.respond(to: directConversationPrompt()).content
+            case .openAICompatible(let configuration):
+                response = try await OpenAICompatibleClient(configuration: configuration).respond(
+                    systemPrompt: systemInstructions,
+                    messages: allStoredMessages().map {
+                        ChatMessage(storedMessage: $0, fallbackAssistantName: storedChat.personaName)
+                    }
+                )
+            case .missingLocalModel:
+                throw OpenAICompatibleError.server(
+                    statusCode: 0,
+                    message: "This chat's local model is no longer configured. Choose a configured model for the persona and start a new chat."
+                )
+            }
+            let parsedResponse = PersonaMemoryHarness.parse(response)
+            personaStore.appendPersonaMemoryEntries(
+                id: storedChat.personaID,
+                entries: parsedResponse.memoryEntries
+            )
+            if !parsedResponse.visibleText.isEmpty {
+                appendMessage(
+                    role: .assistant,
+                    text: parsedResponse.visibleText,
+                    authorPersonaID: personaID,
+                    authorName: personaName
+                )
+            }
+        } catch {
+            appendMessage(
+                role: .assistant,
+                text: "I could not get a response: \(error.localizedDescription)",
+                authorPersonaID: personaID,
+                authorName: personaName
+            )
         }
 
         isResponding = false
         updateAvailability()
     }
 
-    private func appendMessage(role: ChatRole, text: String) {
-        let storedMessage = StoredChatMessage(chatID: id, role: role, text: text)
+    private func addMentionedPersonas(matching mentionedHandles: Set<String>) {
+        let existingPersonaIDs = Set(groupParticipants.map(\.personaID))
+        let newPersonas = personaStore.personas.filter { persona in
+            !existingPersonaIDs.contains(persona.id)
+                && mentionedHandles.contains(PersonaMention.handle(for: persona.displayName).lowercased())
+        }
+
+        guard !newPersonas.isEmpty else { return }
+
+        for persona in newPersonas {
+            let participant = StoredGroupChatParticipant(chatID: id, persona: persona)
+            modelContext.insert(participant)
+            groupParticipants.append(participant)
+        }
+
+        storedChat.updatedAt = .now
+        saveChanges()
+        updateAvailability()
+    }
+
+    private func addGroupParticipantIfNeeded(_ persona: Persona) {
+        guard isGroupChat,
+              !groupParticipants.contains(where: { $0.personaID == persona.id }) else {
+            return
+        }
+
+        let participant = StoredGroupChatParticipant(chatID: id, persona: persona)
+        modelContext.insert(participant)
+        groupParticipants.append(participant)
+        storedChat.updatedAt = .now
+        saveChanges()
+        updateAvailability()
+    }
+
+    private func respondAsGroup(directlyMentionedPersonaIDs: Set<UUID>) async {
+        let orderedParticipants = groupParticipants.sorted { left, right in
+            let leftWasMentioned = directlyMentionedPersonaIDs.contains(left.personaID)
+            let rightWasMentioned = directlyMentionedPersonaIDs.contains(right.personaID)
+            if leftWasMentioned != rightWasMentioned {
+                return leftWasMentioned
+            }
+            return left.createdAt < right.createdAt
+        }
+
+        for participant in orderedParticipants {
+            guard !Task.isCancelled else { break }
+            respondingPersonaName = participant.personaName
+
+            do {
+                let response = try await groupResponse(
+                    from: participant,
+                    wasDirectlyMentioned: directlyMentionedPersonaIDs.contains(participant.personaID)
+                )
+                let parsedResponse = PersonaMemoryHarness.parse(response)
+                personaStore.appendPersonaMemoryEntries(
+                    id: participant.personaID,
+                    entries: parsedResponse.memoryEntries
+                )
+                let trimmedResponse = parsedResponse.visibleText
+                if !trimmedResponse.isEmpty, !ChatViewModel.isPassResponse(trimmedResponse) {
+                    appendMessage(
+                        role: .assistant,
+                        text: trimmedResponse,
+                        authorPersonaID: participant.personaID,
+                        authorName: participant.personaName
+                    )
+                }
+            } catch {
+                appendMessage(
+                    role: .assistant,
+                    text: "I could not get a response: \(error.localizedDescription)",
+                    authorPersonaID: participant.personaID,
+                    authorName: participant.personaName
+                )
+            }
+        }
+
+        respondingPersonaName = nil
+        isResponding = false
+        updateAvailability()
+    }
+
+    private func groupResponse(
+        from participant: StoredGroupChatParticipant,
+        wasDirectlyMentioned: Bool
+    ) async throws -> String {
+        let systemInstructions = groupSystemPrompt(for: participant)
+        let conversationPrompt = groupConversationPrompt(
+            for: participant,
+            wasDirectlyMentioned: wasDirectlyMentioned
+        )
+
+        switch localModelStore.backend(for: participant.personaModelIdentifier) {
+        case .appleFoundation:
+            let session = LanguageModelSession(instructions: systemInstructions)
+            return try await session.respond(to: conversationPrompt).content
+        case .openAICompatible(let configuration):
+            return try await OpenAICompatibleClient(configuration: configuration).respond(
+                systemPrompt: systemInstructions,
+                prompt: conversationPrompt
+            )
+        case .missingLocalModel:
+            throw OpenAICompatibleError.server(
+                statusCode: 0,
+                message: "This persona's local model is no longer configured."
+            )
+        }
+    }
+
+    private func groupSystemPrompt(for participant: StoredGroupChatParticipant) -> String {
+        let individualInstructions = ChatViewModel.instructions(for: participant.personaSoul)
+        let memoryInstructions = PersonaMemoryHarness.instructionSection(
+            memory: currentMemory(for: participant.personaID)
+        )
+        let trimmedGroupInstructions = groupSystemInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        let groupInstructions = trimmedGroupInstructions.isEmpty
+            ? "Let the discussion develop naturally. Be concise and avoid repeating points already made."
+            : trimmedGroupInstructions
+
+        return """
+        You are \(participant.personaName), a participant in an open group discussion.
+
+        Individual persona instructions:
+        \(individualInstructions)
+
+        \(memoryInstructions)
+
+        Group chat system instructions:
+        \(groupInstructions)
+
+        Discussion behavior:
+        - You see the complete conversation between the user and every persona in the group.
+        - Messages labeled with another persona's name were written by that persona, not by you.
+        - You may respond to the user or to another persona when it adds something natural to the discussion.
+        - A direct @mention gives that comment extra emphasis, but it does not prevent other personas from replying.
+        - Do not prefix your reply with your name; the interface adds it for you.
+        - If you have nothing useful to add, reply with exactly [[PASS]].
+        """
+    }
+
+    private func groupConversationPrompt(
+        for participant: StoredGroupChatParticipant,
+        wasDirectlyMentioned: Bool
+    ) -> String {
+        let transcript = allStoredMessages().map { message in
+            let speaker = message.role == .user ? "User" : message.authorName ?? "Persona"
+            return "\(speaker): \(message.text)"
+        }.joined(separator: "\n\n")
+
+        let emphasis = wasDirectlyMentioned
+            ? "The latest user message directly mentions you. Treat it with extra emphasis and usually respond."
+            : "The latest user message does not directly mention you. You may still respond if it feels natural and useful."
+
+        return """
+        Here is the complete group conversation so far:
+
+        \(transcript)
+
+        \(emphasis)
+        Continue the discussion as \(participant.personaName), or return [[PASS]] if you would only repeat what has already been said.
+        """
+    }
+
+    private func directConversationPrompt() -> String {
+        """
+        Here is the complete private conversation so far:
+
+        \(storedConversationTranscript())
+
+        Reply to the latest user message as \(storedChat.personaName).
+        """
+    }
+
+    private func heartbeatSystemInstructions(for persona: Persona) -> String {
+        let personaInstructions = ChatViewModel.personaSystemInstructions(
+            personaName: persona.displayName,
+            soul: persona.soul,
+            memory: persona.memoryText
+        )
+
+        guard isGroupChat else {
+            return """
+            \(personaInstructions)
+
+            You are running a scheduled heartbeat for your private chat.
+            Follow the heartbeat instruction using the conversation as context.
+            If there is nothing worth posting, reply with exactly [[PASS]].
+            You may still append memory even when you pass.
+            """
+        }
+
+        let trimmedGroupInstructions = groupSystemInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        let groupInstructions = trimmedGroupInstructions.isEmpty
+            ? "Let the discussion develop naturally. Be concise and avoid repeating points already made."
+            : trimmedGroupInstructions
+
+        return """
+        \(personaInstructions)
+
+        Group chat system instructions:
+        \(groupInstructions)
+
+        You are running a scheduled heartbeat for this group discussion.
+        You see the complete conversation between the user and every persona in the group.
+        Messages labeled with another persona's name were written by that persona, not by you.
+        Follow the heartbeat instruction and post only when it adds something natural or useful.
+        Do not prefix your reply with your name; the interface adds it for you.
+        If there is nothing worth posting, reply with exactly [[PASS]].
+        You may still append memory even when you pass.
+        """
+    }
+
+    private func heartbeatConversationPrompt(
+        personaName: String,
+        instruction: String,
+        lastCompletedAt: Date?,
+        referenceDate: Date
+    ) -> String {
+        let messages = allStoredMessages()
+        let unansweredMessageCount = Self.unansweredMessageCount(in: messages)
+        let lastCompletionDescription: String
+        if let lastCompletedAt {
+            lastCompletionDescription = "\(Self.compactElapsedTime(from: lastCompletedAt, to: referenceDate)) ago"
+        } else {
+            lastCompletionDescription = "never"
+        }
+
+        return """
+        Here is the complete \(isGroupChat ? "group" : "private") conversation so far:
+        Message ages are relative to the start of this heartbeat run.
+
+        \(heartbeatConversationTranscript(messages: messages, relativeTo: referenceDate))
+
+        Time since this heartbeat last completed: \(lastCompletionDescription).
+        Number of unanswered messages in this chat: \(unansweredMessageCount).
+
+        Scheduled heartbeat instruction:
+        \(instruction)
+
+        Decide whether to post as \(personaName). Return [[PASS]] if no message should be posted.
+        """
+    }
+
+    private func heartbeatConversationTranscript(
+        messages: [StoredChatMessage],
+        relativeTo referenceDate: Date
+    ) -> String {
+        guard !messages.isEmpty else { return "(No messages yet.)" }
+
+        return messages.map { message in
+            let speaker = message.role == .user
+                ? "User"
+                : message.authorName ?? (isGroupChat ? "Persona" : storedChat.personaName)
+            let age = Self.compactElapsedTime(from: message.createdAt, to: referenceDate)
+            return "[\(age) ago] \(speaker): \(message.text)"
+        }.joined(separator: "\n\n")
+    }
+
+    private static func unansweredMessageCount(in messages: [StoredChatMessage]) -> Int {
+        var count = 0
+        for message in messages.reversed() {
+            guard message.role != .user else { break }
+            count += 1
+        }
+        return count
+    }
+
+    private func storedConversationTranscript() -> String {
+        allStoredMessages().map { message in
+            let speaker = message.role == .user
+                ? "User"
+                : message.authorName ?? (isGroupChat ? "Persona" : storedChat.personaName)
+            return "\(speaker): \(message.text)"
+        }.joined(separator: "\n\n")
+    }
+
+    private func currentMemory(for personaID: Persona.ID) -> String {
+        personaStore.persona(for: personaID)?.memoryText ?? ""
+    }
+
+    private func allStoredMessages() -> [StoredChatMessage] {
+        let descriptor = FetchDescriptor<StoredChatMessage>(
+            predicate: #Predicate { message in
+                message.chatID == id
+            },
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    private static func compactElapsedTime(from date: Date, to referenceDate: Date) -> String {
+        let seconds = max(0, Int(referenceDate.timeIntervalSince(date)))
+        switch seconds {
+        case 0..<60:
+            return "\(seconds)s"
+        case 60..<3_600:
+            return "\(seconds / 60)m"
+        case 3_600..<86_400:
+            return "\(seconds / 3_600)h"
+        case 86_400..<604_800:
+            return "\(seconds / 86_400)d"
+        case 604_800..<2_592_000:
+            return "\(seconds / 604_800)w"
+        case 2_592_000..<31_536_000:
+            return "\(seconds / 2_592_000)mo"
+        default:
+            return "\(seconds / 31_536_000)y"
+        }
+    }
+
+    private static func isPassResponse(_ response: String) -> Bool {
+        ["[[pass]]", "[pass]", "pass"].contains(response.lowercased())
+    }
+
+    private func appendMessage(
+        role: ChatRole,
+        text: String,
+        authorPersonaID: UUID? = nil,
+        authorName: String? = nil
+    ) {
+        let storedMessage = StoredChatMessage(
+            chatID: id,
+            role: role,
+            text: text,
+            authorPersonaID: authorPersonaID,
+            authorName: authorName
+        )
         modelContext.insert(storedMessage)
         storedChat.updatedAt = .now
         saveChanges()
@@ -955,6 +2312,42 @@ final class ChatViewModel: ObservableObject, Identifiable {
     }
 
     private func updateAvailability() {
+        if isGroupChat {
+            canSend = !personaStore.personas.isEmpty || !groupParticipants.isEmpty
+
+            if groupParticipants.isEmpty {
+                if let firstMention = availablePersonaMentions.first {
+                    availabilityMessage = "Mention \(firstMention) to add a persona to the discussion."
+                } else {
+                    availabilityMessage = "Create a persona before starting this group discussion."
+                }
+            } else {
+                let count = groupParticipants.count
+                availabilityMessage = count == 1
+                    ? "1 persona is in this discussion."
+                    : "\(count) personas are in this discussion."
+            }
+            return
+        }
+
+        switch backend {
+        case .openAICompatible(let configuration):
+            if let validationError = configuration.validationError {
+                canSend = false
+                availabilityMessage = "\(configuration.name): \(validationError)"
+            } else {
+                canSend = true
+                availabilityMessage = "\(configuration.name) is ready."
+            }
+            return
+        case .missingLocalModel:
+            canSend = false
+            availabilityMessage = "This chat's local model is no longer configured."
+            return
+        case .appleFoundation:
+            break
+        }
+
         switch model.availability {
         case .available:
             canSend = true
@@ -984,14 +2377,27 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
     }
 
-    private static func makeSession(soul: String) -> LanguageModelSession {
+    private static func instructions(for soul: String) -> String {
         let trimmedSoul = soul.trimmingCharacters(in: .whitespacesAndNewlines)
-        let instructions = trimmedSoul.isEmpty ? """
+        return trimmedSoul.isEmpty ? """
         You are a concise assistant inside a simple chat app.
         Answer conversationally, and don't feel the need to ask a follow-up question unless it's natural.
         """ : trimmedSoul
+    }
 
-        return LanguageModelSession(instructions: instructions)
+    private static func personaSystemInstructions(
+        personaName: String,
+        soul: String,
+        memory: String
+    ) -> String {
+        """
+        Your persona name is \(personaName).
+
+        Individual persona instructions:
+        \(instructions(for: soul))
+
+        \(PersonaMemoryHarness.instructionSection(memory: memory))
+        """
     }
 }
 
@@ -999,19 +2405,32 @@ struct ChatMessage: Identifiable, Equatable {
     let id: UUID
     let role: ChatRole
     let text: String
+    let authorPersonaID: UUID?
+    let authorName: String?
     let createdAt: Date
 
-    init(id: UUID = UUID(), role: ChatRole, text: String, createdAt: Date = .now) {
+    init(
+        id: UUID = UUID(),
+        role: ChatRole,
+        text: String,
+        authorPersonaID: UUID? = nil,
+        authorName: String? = nil,
+        createdAt: Date = .now
+    ) {
         self.id = id
         self.role = role
         self.text = text
+        self.authorPersonaID = authorPersonaID
+        self.authorName = authorName
         self.createdAt = createdAt
     }
 
-    init(storedMessage: StoredChatMessage) {
+    init(storedMessage: StoredChatMessage, fallbackAssistantName: String? = nil) {
         id = storedMessage.id
         role = storedMessage.role
         text = storedMessage.text
+        authorPersonaID = storedMessage.authorPersonaID
+        authorName = storedMessage.authorName ?? (storedMessage.role == .assistant ? fallbackAssistantName : nil)
         createdAt = storedMessage.createdAt
     }
 }
@@ -1033,11 +2452,21 @@ struct ContentViewPreview: View {
     init() {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
-            let container = try ModelContainer(for: Persona.self, StoredChat.self, StoredChatMessage.self, configurations: configuration)
+            let container = try ModelContainer(
+                for: Persona.self,
+                PersonaHeartbeat.self,
+                HeartbeatRun.self,
+                LocalModel.self,
+                StoredChat.self,
+                StoredGroupChatParticipant.self,
+                StoredChatMessage.self,
+                configurations: configuration
+            )
             let personaStore = PersonaStore(modelContext: container.mainContext)
+            let localModelStore = LocalModelStore(modelContext: container.mainContext)
             modelContainer = container
             self.personaStore = personaStore
-            chatStore = ChatStore(personaStore: personaStore, modelContext: container.mainContext)
+            chatStore = ChatStore(personaStore: personaStore, localModelStore: localModelStore, modelContext: container.mainContext)
         } catch {
             fatalError("Failed to create preview model container: \(error.localizedDescription)")
         }

@@ -6,13 +6,15 @@ import AppKit
 
 struct PersonasWindow: View {
     @ObservedObject var store: PersonaStore
+    @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var chatStore: ChatStore
 
     var body: some View {
         NavigationSplitView {
             PersonaSidebar(store: store)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } detail: {
-            PersonaEditor(store: store)
+            PersonaEditor(store: store, localModelStore: localModelStore, chatStore: chatStore)
                 .navigationSplitViewColumnWidth(min: 420, ideal: 560)
         }
         .frame(minWidth: 720, minHeight: 480)
@@ -62,6 +64,8 @@ private let maximumSoulEditorHeight: CGFloat = 720
 
 struct PersonaEditor: View {
     @ObservedObject var store: PersonaStore
+    @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var chatStore: ChatStore
     @State private var draftSoul = ""
     @State private var soulEditorHeight: CGFloat = 360
 
@@ -75,6 +79,24 @@ struct PersonaEditor: View {
         } set: { newValue in
             guard let personaID = selectedPersona?.id else { return }
             store.updatePersonaName(id: personaID, name: newValue)
+        }
+    }
+
+    private var personaModel: Binding<String> {
+        Binding {
+            selectedPersona?.selectedModelIdentifier ?? ChatModelIdentifier.appleFoundation
+        } set: { newValue in
+            guard let personaID = selectedPersona?.id else { return }
+            store.updatePersonaModelIdentifier(id: personaID, modelIdentifier: newValue)
+        }
+    }
+
+    private var personaMemory: Binding<String> {
+        Binding {
+            selectedPersona?.memoryText ?? ""
+        } set: { newValue in
+            guard let personaID = selectedPersona?.id else { return }
+            store.updatePersonaMemory(id: personaID, memory: newValue)
         }
     }
 
@@ -98,34 +120,116 @@ struct PersonaEditor: View {
 
     private func editor(for persona: Persona) -> some View {
         HStack {
-            VStack(alignment: .leading, spacing: 0) {
-                TextField("Persona name", text: personaName)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 22, weight: .semibold))
-                    .frame(height: 54)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    TextField("Persona name", text: personaName)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 22, weight: .semibold))
+                        .frame(height: 54)
 
-                Text("Soul")
-                    .font(.system(size: 15, weight: .semibold))
-                    .padding(.top, 34)
+                    Picker("Model", selection: personaModel) {
+                        Text("Apple Foundation Model")
+                            .tag(ChatModelIdentifier.appleFoundation)
+
+                        ForEach(localModelStore.localModels) { model in
+                            Text(model.displayName)
+                                .tag(ChatModelIdentifier.localModelID(model.id))
+                        }
+
+                        if !isSelectedModelConfigured(persona.selectedModelIdentifier) {
+                            Text("Missing local model")
+                                .tag(persona.selectedModelIdentifier)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .padding(.top, 12)
+
+                    Text("Configure local models in Settings, then choose one for this persona.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+
+                    Text("Soul")
+                        .font(.system(size: 15, weight: .semibold))
+                        .padding(.top, 28)
+                        .padding(.bottom, 12)
+
+                    ResizableSoulEditor(text: $draftSoul, height: $soulEditorHeight)
+
+                    HStack {
+                        Spacer()
+
+                        Button("Save soul") {
+                            store.updatePersonaSoul(id: persona.id, soul: draftSoul)
+                        }
+                        .controlSize(.large)
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .padding(.top, 18)
+
+                    Text("Memory")
+                        .font(.system(size: 15, weight: .semibold))
+                        .padding(.top, 32)
+                        .padding(.bottom, 6)
+
+                    Text("You can edit memory directly. The persona can append new entries, but it cannot change existing text.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 10)
+
+                    PersonaMemoryEditor(text: personaMemory)
+
+                    Text("Memory saves automatically.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 6)
+
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Heartbeats")
+                                .font(.system(size: 15, weight: .semibold))
+
+                            Text("Run recurring persona instructions while Chat is open.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Button {
+                            store.addHeartbeat(to: persona.id)
+                        } label: {
+                            Label("Add heartbeat", systemImage: "plus")
+                        }
+                    }
+                    .padding(.top, 32)
                     .padding(.bottom, 12)
 
-                ResizableSoulEditor(text: $draftSoul, height: $soulEditorHeight)
+                    VStack(spacing: 12) {
+                        ForEach(store.heartbeats(for: persona.id)) { heartbeat in
+                            PersonaHeartbeatEditor(
+                                heartbeat: heartbeat,
+                                store: store,
+                                localModelStore: localModelStore,
+                                chatStore: chatStore
+                            )
+                        }
 
-                HStack {
-                    Spacer()
-
-                    Button("Save") {
-                        store.updatePersonaSoul(id: persona.id, soul: draftSoul)
+                        if store.heartbeats(for: persona.id).isEmpty {
+                            Text("No heartbeats configured.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 8)
+                        }
                     }
-                    .controlSize(.large)
-                    .buttonStyle(.borderedProminent)
                 }
-                .padding(.top, 22)
+                .frame(maxWidth: 760, alignment: .top)
+                .padding(.top, 54)
+                .padding(.bottom, 70)
+                .padding(.horizontal, 48)
             }
-            .frame(maxWidth: 760, maxHeight: .infinity, alignment: .top)
-            .padding(.top, 70)
-            .padding(.bottom, 70)
-            .padding(.horizontal, 48)
+            .frame(maxWidth: 856, maxHeight: .infinity, alignment: .top)
 
             Spacer(minLength: 0)
         }
@@ -142,6 +246,205 @@ struct PersonaEditor: View {
 
     private func load(_ persona: Persona) {
         draftSoul = persona.soul
+    }
+
+    private func isSelectedModelConfigured(_ identifier: String) -> Bool {
+        identifier == ChatModelIdentifier.appleFoundation || localModelStore.localModels.contains {
+            ChatModelIdentifier.localModelID($0.id) == identifier
+        }
+    }
+}
+
+struct PersonaMemoryEditor: View {
+    @Binding var text: String
+
+    var body: some View {
+        SoulTextView(text: $text)
+            .padding(12)
+            .background(.white.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.gray.opacity(0.22), lineWidth: 1)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 170)
+    }
+}
+
+struct PersonaHeartbeatEditor: View {
+    let heartbeat: PersonaHeartbeat
+    @ObservedObject var store: PersonaStore
+    @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var chatStore: ChatStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Toggle("Enabled", isOn: isEnabled)
+                    .toggleStyle(.switch)
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    store.removeHeartbeat(heartbeat)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Remove heartbeat")
+            }
+
+            TextEditor(text: instruction)
+                .font(.body)
+                .frame(minHeight: 68, maxHeight: 100)
+                .padding(6)
+                .scrollContentBackground(.hidden)
+                .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+            Picker("Model", selection: modelIdentifier) {
+                Text("Persona default (\(personaDefaultModelName))")
+                    .tag("")
+
+                Section("Override") {
+                    Text("Apple Foundation Model")
+                        .tag(ChatModelIdentifier.appleFoundation)
+
+                    ForEach(localModelStore.localModels) { model in
+                        Text(model.displayName)
+                            .tag(ChatModelIdentifier.localModelID(model.id))
+                    }
+                }
+
+                if let selectedIdentifier = heartbeat.modelIdentifier,
+                   !isModelConfigured(selectedIdentifier) {
+                    Text("Missing local model")
+                        .tag(selectedIdentifier)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(maxWidth: 360)
+
+            HStack(spacing: 18) {
+                Stepper(value: intervalMinutes, in: 1...10_080) {
+                    Text("Every \(heartbeat.normalizedIntervalMinutes) minutes")
+                        .monospacedDigit()
+                }
+
+                Picker("Post to", selection: destination) {
+                    Text("Private chat")
+                        .tag("private")
+
+                    if !chatStore.groupChats.isEmpty {
+                        Section("Group chats") {
+                            ForEach(chatStore.groupChats) { chat in
+                                Text(chat.title)
+                                    .tag("group.\(chat.id.uuidString)")
+                            }
+                        }
+                    }
+
+                    if heartbeat.targetKind == .groupChat,
+                       let targetChatID = heartbeat.targetChatID,
+                       !chatStore.groupChats.contains(where: { $0.id == targetChatID }) {
+                        Text("Missing group chat")
+                            .tag("group.\(targetChatID.uuidString)")
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 260)
+            }
+
+            if let lastError = heartbeat.lastError {
+                Label(lastError, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if let lastCompletedAt = heartbeat.lastCompletedAt {
+                Text("Last completed \(lastCompletedAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("The persona may post a reply, append memory, or pass.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.38), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var instruction: Binding<String> {
+        Binding(
+            get: { heartbeat.instruction },
+            set: { store.updateHeartbeatInstruction(heartbeat, instruction: $0) }
+        )
+    }
+
+    private var intervalMinutes: Binding<Int> {
+        Binding(
+            get: { heartbeat.normalizedIntervalMinutes },
+            set: { store.updateHeartbeatInterval(heartbeat, minutes: $0) }
+        )
+    }
+
+    private var isEnabled: Binding<Bool> {
+        Binding(
+            get: { heartbeat.isEnabled },
+            set: { store.updateHeartbeatEnabled(heartbeat, isEnabled: $0) }
+        )
+    }
+
+    private var modelIdentifier: Binding<String> {
+        Binding(
+            get: { heartbeat.modelIdentifier ?? "" },
+            set: {
+                store.updateHeartbeatModelIdentifier(
+                    heartbeat,
+                    modelIdentifier: $0.isEmpty ? nil : $0
+                )
+            }
+        )
+    }
+
+    private var personaDefaultModelName: String {
+        guard let persona = store.persona(for: heartbeat.personaID) else {
+            return "Missing persona"
+        }
+        return localModelStore.displayName(for: persona.selectedModelIdentifier)
+    }
+
+    private func isModelConfigured(_ identifier: String) -> Bool {
+        identifier == ChatModelIdentifier.appleFoundation || localModelStore.localModels.contains {
+            ChatModelIdentifier.localModelID($0.id) == identifier
+        }
+    }
+
+    private var destination: Binding<String> {
+        Binding {
+            guard heartbeat.targetKind == .groupChat,
+                  let targetChatID = heartbeat.targetChatID else {
+                return "private"
+            }
+            return "group.\(targetChatID.uuidString)"
+        } set: { newValue in
+            guard newValue.hasPrefix("group."),
+                  let targetChatID = UUID(uuidString: String(newValue.dropFirst("group.".count))) else {
+                store.updateHeartbeatDestination(
+                    heartbeat,
+                    targetKind: .privateChat,
+                    targetChatID: nil
+                )
+                return
+            }
+            store.updateHeartbeatDestination(
+                heartbeat,
+                targetKind: .groupChat,
+                targetChatID: targetChatID
+            )
+        }
     }
 }
 
