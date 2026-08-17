@@ -8,6 +8,7 @@ import AppKit
 struct PersonasPreferencesView: View {
     @ObservedObject var store: PersonaStore
     @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var chatStore: ChatStore
     @State private var isPresentingEditor = false
 
@@ -100,6 +101,7 @@ struct PersonasPreferencesView: View {
                 PersonaEditor(
                     store: store,
                     localModelStore: localModelStore,
+                    textToSpeechToolStore: textToSpeechToolStore,
                     chatStore: chatStore
                 )
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -117,6 +119,7 @@ private let maximumPersonaTextEditorHeight: CGFloat = 720
 struct PersonaEditor: View {
     @ObservedObject var store: PersonaStore
     @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var chatStore: ChatStore
     @State private var draftSoul = ""
     @State private var soulEditorHeight: CGFloat = 360
@@ -142,6 +145,42 @@ struct PersonaEditor: View {
         } set: { newValue in
             guard let personaID = selectedPersona?.id else { return }
             store.updatePersonaModelIdentifier(id: personaID, modelIdentifier: newValue)
+        }
+    }
+
+    private var voiceTriggerPhrasesText: Binding<String> {
+        Binding {
+            selectedPersona?.voiceTriggerPhrase ?? ""
+        } set: { newValue in
+            guard let personaID = selectedPersona?.id else { return }
+            store.updatePersonaVoiceTriggerPhrases(id: personaID, phrasesText: newValue)
+        }
+    }
+
+    private var textToSpeechToolID: Binding<TextToSpeechTool.ID?> {
+        Binding {
+            selectedPersona?.textToSpeechToolID
+        } set: { newValue in
+            guard let personaID = selectedPersona?.id else { return }
+            store.updatePersonaTextToSpeechTool(id: personaID, toolID: newValue)
+        }
+    }
+
+    private var textToSpeechVoiceName: Binding<String> {
+        Binding {
+            selectedPersona?.textToSpeechVoiceName ?? ""
+        } set: { newValue in
+            guard let personaID = selectedPersona?.id else { return }
+            store.updatePersonaTextToSpeechVoiceName(id: personaID, voiceName: newValue)
+        }
+    }
+
+    private var textToSpeechVoiceModel: Binding<String> {
+        Binding {
+            selectedPersona?.textToSpeechVoiceModel ?? ""
+        } set: { newValue in
+            guard let personaID = selectedPersona?.id else { return }
+            store.updatePersonaTextToSpeechVoiceModel(id: personaID, voiceModel: newValue)
         }
     }
 
@@ -256,6 +295,92 @@ struct PersonaEditor: View {
                             }
                         }
                         .padding(14)
+                    }
+                    .openUICard()
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    OpenUISectionHeader(
+                        title: "Voice",
+                        description: "Configure voice input and text-to-speech output for this persona."
+                    )
+
+                    VStack(spacing: 0) {
+                        OpenUISettingsRow(
+                            title: "Key phrases",
+                            description: "Enter one phrase per line. Voice mode ignores speech until it hears one."
+                        ) {
+                            ZStack(alignment: .topLeading) {
+                                TextEditor(text: voiceTriggerPhrasesText)
+                                    .font(.system(size: 14))
+                                    .scrollContentBackground(.hidden)
+                                    .padding(6)
+
+                                if voiceTriggerPhrasesText.wrappedValue.isEmpty {
+                                    Text("Hey \(persona.displayName)\nWake up \(persona.displayName)")
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 10)
+                                        .allowsHitTesting(false)
+                                }
+                            }
+                            .frame(height: 82)
+                            .background(OpenUITheme.surface, in: RoundedRectangle(cornerRadius: 10))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(OpenUITheme.border, lineWidth: 1)
+                            }
+                            .frame(width: 320)
+                        }
+
+                        OpenUIDivider()
+
+                        OpenUISettingsRow(
+                            title: "Voice tool",
+                            description: "Choose a tool configured in Text to Speech preferences."
+                        ) {
+                            Picker("Voice tool", selection: textToSpeechToolID) {
+                                Text("None")
+                                    .tag(nil as TextToSpeechTool.ID?)
+
+                                ForEach(textToSpeechToolStore.tools) { tool in
+                                    Text(tool.displayName)
+                                        .tag(tool.id as TextToSpeechTool.ID?)
+                                }
+
+                                if let selectedToolID = persona.textToSpeechToolID,
+                                   !textToSpeechToolStore.tools.contains(where: { $0.id == selectedToolID }) {
+                                    Text("Missing tool")
+                                        .tag(selectedToolID as TextToSpeechTool.ID?)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(width: 320)
+                        }
+
+                        OpenUIDivider()
+
+                        OpenUISettingsRow(
+                            title: "Voice name",
+                            description: "Free-form voice identifier passed to the selected tool."
+                        ) {
+                            TextField("Voice name", text: textToSpeechVoiceName)
+                                .openUIInput()
+                                .frame(width: 320)
+                        }
+
+                        OpenUIDivider()
+
+                        OpenUISettingsRow(
+                            title: "Voice model",
+                            description: "Free-form model identifier passed to the selected tool."
+                        ) {
+                            TextField("Voice model", text: textToSpeechVoiceModel)
+                                .openUIInput()
+                                .frame(width: 320)
+                        }
                     }
                     .openUICard()
                 }
@@ -745,6 +870,7 @@ private struct PersonasPreferencesViewPreview: View {
     private let modelContainer: ModelContainer
     private let personaStore: PersonaStore
     private let localModelStore: LocalModelStore
+    private let textToSpeechToolStore: TextToSpeechToolStore
     private let chatStore: ChatStore
 
     init() {
@@ -755,6 +881,7 @@ private struct PersonasPreferencesViewPreview: View {
                 PersonaHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
+                TextToSpeechTool.self,
                 StoredChat.self,
                 StoredGroupChatParticipant.self,
                 StoredChatMessage.self,
@@ -767,6 +894,12 @@ private struct PersonasPreferencesViewPreview: View {
                 modelID: "qwen3-8b"
             )
             context.insert(localModel)
+            context.insert(
+                TextToSpeechTool(
+                    name: "Studio Voice",
+                    path: "/usr/local/bin/studio-voice"
+                )
+            )
 
             for name in ["Joe", "Maya", "Rowan", "Sam"] {
                 context.insert(
@@ -781,9 +914,11 @@ private struct PersonasPreferencesViewPreview: View {
 
             let personaStore = PersonaStore(modelContext: context)
             let localModelStore = LocalModelStore(modelContext: context)
+            let textToSpeechToolStore = TextToSpeechToolStore(modelContext: context)
             modelContainer = container
             self.personaStore = personaStore
             self.localModelStore = localModelStore
+            self.textToSpeechToolStore = textToSpeechToolStore
             chatStore = ChatStore(
                 personaStore: personaStore,
                 localModelStore: localModelStore,
@@ -798,6 +933,7 @@ private struct PersonasPreferencesViewPreview: View {
         PersonasPreferencesView(
             store: personaStore,
             localModelStore: localModelStore,
+            textToSpeechToolStore: textToSpeechToolStore,
             chatStore: chatStore
         )
         .modelContainer(modelContainer)

@@ -9,6 +9,7 @@ struct ChatApp: App {
     private let modelContainer: ModelContainer
     @StateObject private var personaStore: PersonaStore
     @StateObject private var localModelStore: LocalModelStore
+    @StateObject private var textToSpeechToolStore: TextToSpeechToolStore
     @StateObject private var chatStore: ChatStore
     @StateObject private var heartbeatScheduler: HeartbeatScheduler
     @StateObject private var preferencesNavigation: PreferencesNavigation
@@ -20,12 +21,14 @@ struct ChatApp: App {
                 PersonaHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
+                TextToSpeechTool.self,
                 StoredChat.self,
                 StoredGroupChatParticipant.self,
                 StoredChatMessage.self
             )
             let personaStore = PersonaStore(modelContext: container.mainContext)
             let localModelStore = LocalModelStore(modelContext: container.mainContext)
+            let textToSpeechToolStore = TextToSpeechToolStore(modelContext: container.mainContext)
             let chatStore = ChatStore(
                 personaStore: personaStore,
                 localModelStore: localModelStore,
@@ -36,6 +39,7 @@ struct ChatApp: App {
             modelContainer = container
             _personaStore = StateObject(wrappedValue: personaStore)
             _localModelStore = StateObject(wrappedValue: localModelStore)
+            _textToSpeechToolStore = StateObject(wrappedValue: textToSpeechToolStore)
             _chatStore = StateObject(wrappedValue: chatStore)
             _heartbeatScheduler = StateObject(wrappedValue: heartbeatScheduler)
             _preferencesNavigation = StateObject(wrappedValue: preferencesNavigation)
@@ -47,7 +51,11 @@ struct ChatApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(personaStore: personaStore, chatStore: chatStore)
+            ContentView(
+                personaStore: personaStore,
+                textToSpeechToolStore: textToSpeechToolStore,
+                chatStore: chatStore
+            )
                 .modelContainer(modelContainer)
         }
         .commands {
@@ -72,6 +80,7 @@ struct ChatApp: App {
             PreferencesView(
                 personaStore: personaStore,
                 localModelStore: localModelStore,
+                textToSpeechToolStore: textToSpeechToolStore,
                 chatStore: chatStore,
                 navigation: preferencesNavigation
             )
@@ -83,10 +92,16 @@ struct ChatApp: App {
 
 struct ContentView: View {
     @ObservedObject private var personaStore: PersonaStore
+    @ObservedObject private var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject private var chatStore: ChatStore
 
-    init(personaStore: PersonaStore, chatStore: ChatStore) {
+    init(
+        personaStore: PersonaStore,
+        textToSpeechToolStore: TextToSpeechToolStore,
+        chatStore: ChatStore
+    ) {
         self.personaStore = personaStore
+        self.textToSpeechToolStore = textToSpeechToolStore
         self.chatStore = chatStore
     }
 
@@ -96,7 +111,11 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 220, ideal: 280)
         } detail: {
             if let chat = chatStore.selectedChat {
-                ChatDetailView(chat: chat)
+                ChatDetailView(
+                    chat: chat,
+                    personaStore: personaStore,
+                    textToSpeechToolStore: textToSpeechToolStore
+                )
             } else {
                 Text("Start a new chat.")
                     .font(.system(size: 15))
@@ -151,7 +170,10 @@ struct ChatSidebar: View {
                                 chats: chats,
                                 selectedChatID: $chatStore.selectedChatID,
                                 isCollapsed: collapsedPersonaIDs.contains(persona.id),
-                                onRenameChat: beginRenaming
+                                onRenameChat: beginRenaming,
+                                onNewChat: {
+                                    startChat(with: persona)
+                                }
                             ) {
                                 togglePersona(persona.id)
                             }
@@ -186,6 +208,11 @@ struct ChatSidebar: View {
         }
     }
 
+    private func startChat(with persona: Persona) {
+        collapsedPersonaIDs.remove(persona.id)
+        chatStore.startChat(with: persona)
+    }
+
     @ViewBuilder
     private var newChatControl: some View {
         Menu {
@@ -200,7 +227,7 @@ struct ChatSidebar: View {
 
                 ForEach(personaStore.personas) { persona in
                     Button(persona.displayName) {
-                        chatStore.startChat(with: persona)
+                        startChat(with: persona)
                     }
                 }
             }
@@ -236,32 +263,57 @@ struct PersonaProjectSection: View {
     @Binding var selectedChatID: ChatViewModel.ID?
     let isCollapsed: Bool
     let onRenameChat: (ChatViewModel) -> Void
+    let onNewChat: () -> Void
     let onToggle: () -> Void
+    @State private var isHoveringHeader = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: onToggle) {
-                HStack(spacing: 10) {
-                    Image(systemName: "folder")
-                        .font(.body)
-                        .frame(width: 20, height: 20)
+            ZStack(alignment: .trailing) {
+                Button(action: onToggle) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "folder")
+                            .font(.body)
+                            .frame(width: 20, height: 20)
 
-                    Text(persona.displayName)
-                        .font(.body)
-                        .lineLimit(1)
+                        Text(persona.displayName)
+                            .font(.body)
+                            .lineLimit(1)
 
-                    Image(systemName: "chevron.down")
-                        .font(.caption.weight(.semibold))
-                        .rotationEffect(.degrees(isCollapsed ? -90 : 0))
+                        Image(systemName: "chevron.down")
+                            .font(.caption.weight(.semibold))
+                            .rotationEffect(.degrees(isCollapsed ? -90 : 0))
 
-                    Spacer(minLength: 0)
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(.primary)
+                    .padding(.leading, 12)
+                    .padding(.trailing, 40)
+                    .frame(height: 32)
+                    .contentShape(Rectangle())
                 }
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 12)
-                .frame(height: 32)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+
+                if isHoveringHeader {
+                    Button(action: onNewChat) {
+                        Image(systemName: "plus")
+                            .font(.body.weight(.medium))
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 6)
+                    .help("New chat with \(persona.displayName)")
+                    .transition(.opacity)
+                }
             }
-            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+            .onHover { isHovering in
+                withAnimation(.easeInOut(duration: 0.12)) {
+                    isHoveringHeader = isHovering
+                }
+            }
 
             if !isCollapsed {
                 VStack(alignment: .leading, spacing: 0) {
@@ -351,7 +403,7 @@ struct ChatRow: View {
                 Spacer(minLength: 0)
             }
             .foregroundStyle(.primary)
-            .padding(.leading, 64)
+            .padding(.leading, 12)
             .padding(.trailing, 12)
             .frame(height: 30)
             .background(isSelected ? Color.primary.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
@@ -367,11 +419,23 @@ struct ChatRow: View {
 }
 
 struct ChatDetailView: View {
+    private static let voiceGenerationIndicatorID = UUID()
+
     @ObservedObject var chat: ChatViewModel
+    @ObservedObject var personaStore: PersonaStore
+    @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
+    @StateObject private var voiceInput = VoiceInputService()
+    @StateObject private var voicePlayback = TextToSpeechPlaybackService()
     @FocusState private var composerIsFocused: Bool
     @State private var newestMessageID: ChatMessage.ID?
     @State private var visibleMessageIDs: Set<ChatMessage.ID> = []
     @State private var hasUnreadNewMessages = false
+    @State private var voiceDraftPrefix = ""
+    @State private var voiceSendIsPending = false
+    @State private var readRepliesOnlyIsEnabled = false
+    @State private var automaticReplyReadingStartedAt: Date?
+    @State private var voiceObservedMessageIDs: Set<ChatMessage.ID> = []
+    @State private var voiceErrorMessage: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -394,7 +458,26 @@ struct ChatDetailView: View {
                             }
 
                             ForEach(chat.messages) { message in
-                                MessageBubble(message: message)
+                                MessageBubble(
+                                    message: message,
+                                    audioChunkIndexes: voicePlayback
+                                        .generatedAudioChunkIndexesByMessageID[message.id] ?? [],
+                                    playingAudioChunkIndex: voicePlayback.playingMessageID == message.id
+                                        ? voicePlayback.playingChunkIndex
+                                        : nil,
+                                    playbackCurrentTime: voicePlayback.playingMessageID == message.id
+                                        ? voicePlayback.playbackCurrentTime
+                                        : 0,
+                                    playbackDuration: voicePlayback.playingMessageID == message.id
+                                        ? voicePlayback.playbackDuration
+                                        : 0,
+                                    onToggleAudio: { chunkIndex in
+                                        toggleAudio(for: message, chunkIndex: chunkIndex)
+                                    },
+                                    onSeekAudio: { time in
+                                        voicePlayback.seekPlayback(to: time)
+                                    }
+                                )
                                     .id(message.id)
                                     .onAppear {
                                         visibleMessageIDs.insert(message.id)
@@ -410,6 +493,13 @@ struct ChatDetailView: View {
                                     .onDisappear {
                                         visibleMessageIDs.remove(message.id)
                                     }
+                            }
+
+                            if voicePlayback.isGenerating {
+                                VoiceGenerationIndicator {
+                                    voicePlayback.cancelGeneration()
+                                }
+                                .id(Self.voiceGenerationIndicatorID)
                             }
 
                             if chat.isResponding {
@@ -442,18 +532,32 @@ struct ChatDetailView: View {
                     }
                 }
                 .onAppear {
+                    voiceObservedMessageIDs = Set(chat.messages.map(\.id))
                     scrollToBottomAfterLayout(with: proxy)
                 }
                 .onChange(of: chat.id) {
+                    stopVoiceModes()
+                    voicePlayback.clearGeneratedAudio()
+                    voiceSendIsPending = false
+                    voiceDraftPrefix = chat.draft
+                    voiceObservedMessageIDs = Set(chat.messages.map(\.id))
                     visibleMessageIDs.removeAll()
                     hasUnreadNewMessages = false
                     scrollToBottomAfterLayout(with: proxy)
                 }
                 .onChange(of: chat.messages) {
+                    speakNewAssistantMessagesIfNeeded()
                     scrollToNewestMessageIfNeeded(with: proxy)
                 }
                 .onChange(of: chat.isResponding) {
+                    submitPendingVoiceDraftIfPossible()
+
                     if latestMessageIsVisible {
+                        scrollToBottom(with: proxy)
+                    }
+                }
+                .onChange(of: voicePlayback.isGenerating) {
+                    if voicePlayback.isGenerating, latestMessageIsVisible {
                         scrollToBottom(with: proxy)
                     }
                 }
@@ -464,6 +568,28 @@ struct ChatDetailView: View {
                 .background(.bar)
         }
         .navigationTitle(chat.title)
+        .onDisappear {
+            stopVoiceModes()
+            voicePlayback.clearGeneratedAudio()
+        }
+        .onChange(of: voiceTriggerPhrases) {
+            guard voiceInput.isActive else { return }
+
+            if voiceTriggerPhrases.isEmpty {
+                stopVoiceModes()
+            } else {
+                voiceInput.updateTriggerPhrases(voiceTriggerPhrases)
+                voiceDraftPrefix = chat.draft
+                voiceSendIsPending = false
+            }
+        }
+        .alert("Voice error", isPresented: voiceErrorIsPresented) {
+            Button("OK") {
+                voiceErrorMessage = nil
+            }
+        } message: {
+            Text(voiceErrorMessage ?? "Voice input could not be started.")
+        }
     }
 
     private var modelStatus: some View {
@@ -510,17 +636,27 @@ struct ChatDetailView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 10) {
-            TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...5)
-                .padding(12)
-                .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-                .focused($composerIsFocused)
-                .submitLabel(.send)
-                .onSubmit {
-                    submitDraft()
+            HStack(alignment: .bottom, spacing: 4) {
+                TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...5)
+                    .padding(.leading, 12)
+                    .padding(.vertical, 12)
+                    .focused($composerIsFocused)
+                    .submitLabel(.send)
+                    .onSubmit {
+                        submitDraft()
+                    }
+                    .disabled(!chat.canSend || chat.isResponding || voiceInput.isActive)
+
+                HStack(spacing: 2) {
+                    replyReadingModeButton
+                    voiceModeButton
                 }
-                .disabled(!chat.canSend || chat.isResponding)
+                .padding(.trailing, 6)
+                .padding(.bottom, 4)
+            }
+            .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
 
             Button {
                 submitDraft()
@@ -530,9 +666,318 @@ struct ChatDetailView: View {
                     .frame(width: 40, height: 40)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!chat.canSubmitDraft)
+            .disabled(!chat.canSubmitDraft || voiceInput.isActive)
             .help("Send message")
         }
+    }
+
+    private var voiceModeButton: some View {
+        Button {
+            toggleVoiceMode()
+        } label: {
+            Group {
+                if voiceInput.state == .requestingPermission || voiceInput.state == .preparing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(voiceInput.isActive ? Color.red : Color.secondary)
+                }
+            }
+            .frame(width: 32, height: 32)
+            .background {
+                if voiceInput.isActive {
+                    Circle()
+                        .fill(Color.red.opacity(0.12))
+                }
+            }
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!voiceInput.isActive && (!chat.canSend || !voiceModeIsConfigured))
+        .help(voiceModeHelpText)
+        .accessibilityLabel(voiceModeAccessibilityLabel)
+    }
+
+    private var replyReadingModeButton: some View {
+        Button {
+            toggleReplyReadingMode()
+        } label: {
+            Image(systemName: readRepliesOnlyIsEnabled ? "speaker.wave.2.fill" : "speaker.wave.2")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(readRepliesOnlyIsEnabled ? Color.accentColor : Color.secondary)
+                .frame(width: 32, height: 32)
+                .background {
+                    if readRepliesOnlyIsEnabled {
+                        Circle()
+                            .fill(Color.accentColor.opacity(0.12))
+                    }
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(
+            !readRepliesOnlyIsEnabled
+                && (!chat.canSend || !replyReadingIsConfigured)
+        )
+        .help(replyReadingModeHelpText)
+        .accessibilityLabel(
+            readRepliesOnlyIsEnabled
+                ? "Turn off reading replies"
+                : "Turn on reading replies without dictation"
+        )
+    }
+
+    private var replyReadingModeHelpText: String {
+        if readRepliesOnlyIsEnabled {
+            return "Reading replies; click to turn off"
+        }
+        if !replyReadingIsConfigured {
+            return "Configure a voice tool, voice name, and model for this persona"
+        }
+        return voiceInput.isActive
+            ? "Switch to reading replies without dictation"
+            : "Read replies without dictation"
+    }
+
+    private var voiceModeHelpText: String {
+        switch voiceInput.state {
+        case .idle:
+            if voiceTriggerPhrases.isEmpty {
+                return chat.isGroupChat
+                    ? "Set a Voice phrase for a persona in this chat"
+                    : "Set a phrase in this persona's Voice settings"
+            }
+            if !replyReadingIsConfigured {
+                return "Configure a voice tool, voice name, and model for this persona"
+            }
+            return readRepliesOnlyIsEnabled
+                ? "Switch to complete voice mode; \(waitingForVoicePhraseHelp.lowercased())"
+                : "Start complete voice mode; \(waitingForVoicePhraseHelp.lowercased())"
+        case .requestingPermission:
+            return "Requesting voice input permission"
+        case .preparing:
+            return "Preparing voice input"
+        case .listening:
+            return voiceInput.isTranscribing
+                ? "Transcribing; pause for 3 seconds to send"
+                : "\(waitingForVoicePhraseHelp); click to stop"
+        }
+    }
+
+    private var voiceModeAccessibilityLabel: String {
+        if voiceInput.state == .listening {
+            return voiceInput.isTranscribing
+                ? "Stop voice mode; transcribing message"
+                : "Stop voice mode; \(waitingForVoicePhraseHelp.lowercased())"
+        }
+        return "Turn on complete voice mode"
+    }
+
+    private var waitingForVoicePhraseHelp: String {
+        if voiceTriggerPhrases.count == 1, let phrase = voiceTriggerPhrases.first {
+            return "Listening for “\(phrase)”"
+        }
+        return "Listening for any configured persona phrase"
+    }
+
+    private var voicePersonaIDs: Set<Persona.ID> {
+        chat.isGroupChat
+            ? Set(chat.groupParticipants.map(\.personaID))
+            : [chat.personaID]
+    }
+
+    private var voiceTriggerPhrases: [String] {
+        var normalizedPhrases = Set<String>()
+        return personaStore.personas
+            .filter { voicePersonaIDs.contains($0.id) }
+            .flatMap(\.voiceTriggerPhrases)
+            .filter { phrase in
+                let normalizedPhrase = phrase.folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: .current
+                )
+                .lowercased(with: .current)
+                return normalizedPhrases.insert(normalizedPhrase).inserted
+            }
+    }
+
+    private var voiceModeIsConfigured: Bool {
+        !voiceTriggerPhrases.isEmpty && replyReadingIsConfigured
+    }
+
+    private var replyReadingIsConfigured: Bool {
+        personaStore.personas
+            .filter { voicePersonaIDs.contains($0.id) }
+            .contains { textToSpeechToolStore.playbackConfiguration(for: $0) != nil }
+    }
+
+    private var automaticReplyReadingIsEnabled: Bool {
+        voiceInput.isActive || readRepliesOnlyIsEnabled
+    }
+
+    private var voiceErrorIsPresented: Binding<Bool> {
+        Binding(
+            get: { voiceErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented {
+                    voiceErrorMessage = nil
+                }
+            }
+        )
+    }
+
+    private func toggleVoiceMode() {
+        if voiceInput.isActive {
+            stopVoiceModes()
+            voiceSendIsPending = false
+            voiceDraftPrefix = chat.draft
+            composerIsFocused = true
+            return
+        }
+
+        let wasReadingRepliesOnly = readRepliesOnlyIsEnabled
+        beginTrackingAutomaticRepliesIfNeeded()
+        readRepliesOnlyIsEnabled = false
+        voiceDraftPrefix = chat.draft
+        voiceSendIsPending = false
+        voiceErrorMessage = nil
+        composerIsFocused = false
+
+        Task { @MainActor in
+            do {
+                try await voiceInput.start(triggerPhrases: voiceTriggerPhrases) { transcript in
+                    chat.draft = draftByAppendingVoiceTranscript(transcript)
+                } onUtterance: {
+                    finishVoiceUtterance()
+                } onError: { error in
+                    handleVoiceInputFailure(
+                        error,
+                        restoreReplyReadingMode: wasReadingRepliesOnly
+                    )
+                }
+            } catch {
+                handleVoiceInputFailure(
+                    error,
+                    restoreReplyReadingMode: wasReadingRepliesOnly
+                )
+            }
+        }
+    }
+
+    private func toggleReplyReadingMode() {
+        if readRepliesOnlyIsEnabled {
+            stopVoiceModes()
+            composerIsFocused = true
+            return
+        }
+
+        beginTrackingAutomaticRepliesIfNeeded()
+        voiceInput.stop()
+        voiceSendIsPending = false
+        voiceDraftPrefix = chat.draft
+        readRepliesOnlyIsEnabled = true
+        voiceErrorMessage = nil
+        composerIsFocused = true
+    }
+
+    private func beginTrackingAutomaticRepliesIfNeeded() {
+        guard automaticReplyReadingStartedAt == nil else { return }
+        automaticReplyReadingStartedAt = .now
+        voiceObservedMessageIDs = Set(chat.messages.map(\.id))
+    }
+
+    private func handleVoiceInputFailure(
+        _ error: Error,
+        restoreReplyReadingMode: Bool
+    ) {
+        voiceInput.stop()
+        if restoreReplyReadingMode {
+            readRepliesOnlyIsEnabled = true
+            beginTrackingAutomaticRepliesIfNeeded()
+        } else {
+            stopVoiceModes()
+        }
+        voiceErrorMessage = error.localizedDescription
+        composerIsFocused = true
+    }
+
+    private func draftByAppendingVoiceTranscript(_ transcript: String) -> String {
+        guard !voiceDraftPrefix.isEmpty else { return transcript }
+        guard voiceDraftPrefix.last?.isWhitespace != true else {
+            return voiceDraftPrefix + transcript
+        }
+        return voiceDraftPrefix + " " + transcript
+    }
+
+    private func finishVoiceUtterance() {
+        guard chat.canSubmitDraft else {
+            voiceSendIsPending = true
+            voiceDraftPrefix = chat.draft
+            return
+        }
+
+        voiceSendIsPending = false
+        chat.send()
+        voiceDraftPrefix = chat.draft
+    }
+
+    private func submitPendingVoiceDraftIfPossible() {
+        guard voiceSendIsPending, chat.canSubmitDraft else { return }
+
+        voiceSendIsPending = false
+        chat.send()
+        voiceDraftPrefix = chat.draft
+    }
+
+    private func speakNewAssistantMessagesIfNeeded() {
+        let newMessages = chat.messages.filter { !voiceObservedMessageIDs.contains($0.id) }
+        voiceObservedMessageIDs.formUnion(newMessages.map(\.id))
+
+        guard automaticReplyReadingIsEnabled,
+              let automaticReplyReadingStartedAt else { return }
+
+        for message in newMessages
+        where message.role == .assistant && message.createdAt >= automaticReplyReadingStartedAt {
+            guard let personaID = message.authorPersonaID ?? (chat.isGroupChat ? nil : chat.personaID),
+                  let persona = personaStore.persona(for: personaID),
+                  let configuration = textToSpeechToolStore.playbackConfiguration(for: persona) else {
+                continue
+            }
+
+            let personaName = persona.displayName
+            voicePlayback.enqueue(
+                messageID: message.id,
+                text: message.text,
+                configuration: configuration
+            ) { error in
+                voiceErrorMessage = "Could not play \(personaName)'s response. \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func replayAudio(for message: ChatMessage, chunkIndex: Int) {
+        voicePlayback.replay(messageID: message.id, chunkIndex: chunkIndex) { error in
+            let author = message.authorName.map { "\($0)'s" } ?? "the"
+            voiceErrorMessage = "Could not replay part \(chunkIndex + 1) of \(author) response. \(error.localizedDescription)"
+        }
+    }
+
+    private func toggleAudio(for message: ChatMessage, chunkIndex: Int) {
+        if voicePlayback.playingMessageID == message.id,
+           voicePlayback.playingChunkIndex == chunkIndex {
+            voicePlayback.stopPlayback()
+        } else {
+            replayAudio(for: message, chunkIndex: chunkIndex)
+        }
+    }
+
+    private func stopVoiceModes() {
+        voiceInput.stop()
+        readRepliesOnlyIsEnabled = false
+        voicePlayback.stop()
+        automaticReplyReadingStartedAt = nil
     }
 
     private func submitDraft() {
@@ -566,7 +1011,14 @@ struct ChatDetailView: View {
     }
 
     private func scrollToBottom(with proxy: ScrollViewProxy, animated: Bool = true) {
-        let target = chat.isResponding ? ChatViewModel.typingIndicatorID : chat.messages.last?.id
+        let target: UUID?
+        if chat.isResponding {
+            target = ChatViewModel.typingIndicatorID
+        } else if voicePlayback.isGenerating {
+            target = Self.voiceGenerationIndicatorID
+        } else {
+            target = chat.messages.last?.id
+        }
 
         guard let target else { return }
 
@@ -582,15 +1034,70 @@ struct ChatDetailView: View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    let audioChunkIndexes: [Int]
+    let playingAudioChunkIndex: Int?
+    let playbackCurrentTime: TimeInterval
+    let playbackDuration: TimeInterval
+    let onToggleAudio: (Int) -> Void
+    let onSeekAudio: (TimeInterval) -> Void
 
+    @ViewBuilder
     var body: some View {
-        HStack {
-            if message.role == .assistant {
-                bubble
+        if message.role == .assistant {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .bottom, spacing: 6) {
+                    bubble
+
+                    audioControls
+
+                    Spacer(minLength: 40)
+                }
+
+                if playingAudioChunkIndex != nil {
+                    AudioPlaybackTimeline(
+                        currentTime: playbackCurrentTime,
+                        duration: playbackDuration,
+                        onSeek: onSeekAudio
+                    )
+                    .frame(maxWidth: 340)
+                }
+            }
+        } else {
+            HStack(alignment: .bottom, spacing: 6) {
                 Spacer(minLength: 40)
-            } else {
-                Spacer(minLength: 40)
                 bubble
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var audioControls: some View {
+        if !audioChunkIndexes.isEmpty {
+            VStack(spacing: 4) {
+                ForEach(audioChunkIndexes, id: \.self) { chunkIndex in
+                    let isPlaying = playingAudioChunkIndex == chunkIndex
+                    Button {
+                        onToggleAudio(chunkIndex)
+                    } label: {
+                        ZStack(alignment: .bottomTrailing) {
+                            Image(systemName: isPlaying ? "speaker.wave.2.fill" : "speaker.wave.2")
+                                .font(.system(size: 12, weight: .semibold))
+
+                            if audioChunkIndexes.count > 1 {
+                                Text("\(chunkIndex + 1)")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .offset(x: 3, y: 3)
+                            }
+                        }
+                        .foregroundStyle(isPlaying ? Color.accentColor : Color.secondary)
+                        .frame(width: 26, height: 26)
+                        .background(Color.secondary.opacity(0.10), in: Circle())
+                        .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(isPlaying ? "Stop audio" : "Replay audio part \(chunkIndex + 1)")
+                    .accessibilityLabel(isPlaying ? "Stop audio" : "Replay audio part \(chunkIndex + 1)")
+                }
             }
         }
     }
@@ -614,6 +1121,54 @@ struct MessageBubble: View {
     }
 }
 
+struct AudioPlaybackTimeline: View {
+    let currentTime: TimeInterval
+    let duration: TimeInterval
+    let onSeek: (TimeInterval) -> Void
+
+    private var safeDuration: TimeInterval {
+        guard duration.isFinite, duration > 0 else { return 0.01 }
+        return duration
+    }
+
+    private var safeCurrentTime: TimeInterval {
+        guard currentTime.isFinite else { return 0 }
+        return min(max(currentTime, 0), safeDuration)
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(formattedTime(safeCurrentTime))
+                .frame(minWidth: 30, alignment: .trailing)
+
+            Slider(
+                value: Binding(
+                    get: { safeCurrentTime },
+                    set: onSeek
+                ),
+                in: 0...safeDuration
+            )
+            .controlSize(.small)
+            .accessibilityLabel("Audio playback position")
+            .accessibilityValue("\(formattedTime(safeCurrentTime)) of \(formattedTime(duration))")
+
+            Text(formattedTime(duration))
+                .frame(minWidth: 30, alignment: .leading)
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Color.secondary.opacity(0.10), in: Capsule())
+    }
+
+    private func formattedTime(_ time: TimeInterval) -> String {
+        guard time.isFinite, time > 0 else { return "0:00" }
+        let wholeSeconds = Int(time.rounded(.down))
+        return String(format: "%d:%02d", wholeSeconds / 60, wholeSeconds % 60)
+    }
+}
+
 struct TypingBubble: View {
     let personaName: String?
 
@@ -630,6 +1185,37 @@ struct TypingBubble: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+
+            Spacer(minLength: 40)
+        }
+    }
+}
+
+struct VoiceGenerationIndicator: View {
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack {
+            Button(action: onCancel) {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+
+                    Text("Generating audio…")
+                        .font(.callout)
+
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+            .help("Cancel remaining audio generation")
+            .accessibilityLabel("Cancel audio generation")
 
             Spacer(minLength: 40)
         }
@@ -831,6 +1417,38 @@ final class PersonaStore: ObservableObject {
         guard let persona = personas.first(where: { $0.id == id }) else { return }
 
         persona.memory = memory
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updatePersonaVoiceTriggerPhrases(id: Persona.ID, phrasesText: String) {
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
+
+        persona.voiceTriggerPhrase = phrasesText
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updatePersonaTextToSpeechTool(id: Persona.ID, toolID: TextToSpeechTool.ID?) {
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
+
+        persona.textToSpeechToolID = toolID
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updatePersonaTextToSpeechVoiceName(id: Persona.ID, voiceName: String) {
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
+
+        persona.textToSpeechVoiceName = voiceName
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updatePersonaTextToSpeechVoiceModel(id: Persona.ID, voiceModel: String) {
+        guard let persona = personas.first(where: { $0.id == id }) else { return }
+
+        persona.textToSpeechVoiceModel = voiceModel
         saveChanges()
         objectWillChange.send()
     }
@@ -1158,6 +1776,10 @@ final class Persona: Identifiable {
     var soul: String
     var memory: String?
     var modelIdentifier: String?
+    var voiceTriggerPhrase: String?
+    var textToSpeechToolID: UUID?
+    var textToSpeechVoiceName: String?
+    var textToSpeechVoiceModel: String?
     var createdAt: Date
 
     init(
@@ -1166,6 +1788,10 @@ final class Persona: Identifiable {
         soul: String,
         memory: String? = nil,
         modelIdentifier: String? = nil,
+        voiceTriggerPhrase: String? = nil,
+        textToSpeechToolID: UUID? = nil,
+        textToSpeechVoiceName: String? = nil,
+        textToSpeechVoiceModel: String? = nil,
         createdAt: Date = .now
     ) {
         self.id = id
@@ -1173,6 +1799,10 @@ final class Persona: Identifiable {
         self.soul = soul
         self.memory = memory
         self.modelIdentifier = modelIdentifier
+        self.voiceTriggerPhrase = voiceTriggerPhrase
+        self.textToSpeechToolID = textToSpeechToolID
+        self.textToSpeechVoiceName = textToSpeechVoiceName
+        self.textToSpeechVoiceModel = textToSpeechVoiceModel
         self.createdAt = createdAt
     }
 
@@ -1186,6 +1816,23 @@ final class Persona: Identifiable {
 
     var memoryText: String {
         memory ?? ""
+    }
+
+    var voiceTriggerPhrases: [String] {
+        var normalizedPhrases = Set<String>()
+        return (voiceTriggerPhrase ?? "")
+            .split(whereSeparator: { $0.isNewline })
+            .compactMap { line in
+                let phrase = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !phrase.isEmpty else { return nil }
+                let normalizedPhrase = phrase.folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: .current
+                )
+                .lowercased(with: .current)
+                guard normalizedPhrases.insert(normalizedPhrase).inserted else { return nil }
+                return phrase
+            }
     }
 }
 
@@ -1934,7 +2581,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         do {
             let systemInstructions = ChatViewModel.personaSystemInstructions(
                 personaName: storedChat.personaName,
-                soul: storedChat.personaSoul,
+                soul: currentSoul(
+                    for: storedChat.personaID,
+                    fallback: storedChat.personaSoul
+                ),
                 memory: currentMemory(for: storedChat.personaID)
             )
             let response: String
@@ -2091,7 +2741,12 @@ final class ChatViewModel: ObservableObject, Identifiable {
     }
 
     private func groupSystemPrompt(for participant: StoredGroupChatParticipant) -> String {
-        let individualInstructions = ChatViewModel.instructions(for: participant.personaSoul)
+        let individualInstructions = ChatViewModel.instructions(
+            for: currentSoul(
+                for: participant.personaID,
+                fallback: participant.personaSoul
+            )
+        )
         let memoryInstructions = PersonaMemoryHarness.instructionSection(
             memory: currentMemory(for: participant.personaID)
         )
@@ -2259,6 +2914,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     private func currentMemory(for personaID: Persona.ID) -> String {
         personaStore.persona(for: personaID)?.memoryText ?? ""
+    }
+
+    private func currentSoul(for personaID: Persona.ID, fallback: String) -> String {
+        personaStore.persona(for: personaID)?.soul ?? fallback
     }
 
     private func allStoredMessages() -> [StoredChatMessage] {
@@ -2457,6 +3116,7 @@ enum ChatRole: String {
 struct ContentViewPreview: View {
     private let modelContainer: ModelContainer
     private let personaStore: PersonaStore
+    private let textToSpeechToolStore: TextToSpeechToolStore
     private let chatStore: ChatStore
 
     init() {
@@ -2467,6 +3127,7 @@ struct ContentViewPreview: View {
                 PersonaHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
+                TextToSpeechTool.self,
                 StoredChat.self,
                 StoredGroupChatParticipant.self,
                 StoredChatMessage.self,
@@ -2474,8 +3135,10 @@ struct ContentViewPreview: View {
             )
             let personaStore = PersonaStore(modelContext: container.mainContext)
             let localModelStore = LocalModelStore(modelContext: container.mainContext)
+            let textToSpeechToolStore = TextToSpeechToolStore(modelContext: container.mainContext)
             modelContainer = container
             self.personaStore = personaStore
+            self.textToSpeechToolStore = textToSpeechToolStore
             chatStore = ChatStore(personaStore: personaStore, localModelStore: localModelStore, modelContext: container.mainContext)
         } catch {
             fatalError("Failed to create preview model container: \(error.localizedDescription)")
@@ -2483,7 +3146,11 @@ struct ContentViewPreview: View {
     }
 
     var body: some View {
-        ContentView(personaStore: personaStore, chatStore: chatStore)
+        ContentView(
+            personaStore: personaStore,
+            textToSpeechToolStore: textToSpeechToolStore,
+            chatStore: chatStore
+        )
             .modelContainer(modelContainer)
     }
 }

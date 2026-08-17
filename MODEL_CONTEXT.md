@@ -2,7 +2,7 @@
 
 This document describes the context the chat harness sends to a model for normal replies and scheduled heartbeats. Keep it updated whenever persistence, prompt construction, memory handling, message loading, or orchestration changes.
 
-Implementation snapshot: July 23, 2026.
+Implementation snapshot: August 16, 2026.
 
 Primary implementation:
 
@@ -19,13 +19,16 @@ A persona has:
 - Individual instructions, stored as `soul`
 - Persistent memory
 - A selected model
+- Optional text-to-speech settings: a configured tool, voice name, and voice model
 - Zero or more heartbeat schedules
 
-Direct chats snapshot the persona ID, name, individual instructions, and model selection when the chat is created. Ordinary replies in that chat continue using the snapshot.
+Text-to-speech settings are live persona configuration and are not included in model prompts. While voice mode is active, each visible assistant response is sent to the responding persona's selected command-line tool using its configured voice name and voice model, then the generated WAV file is played.
 
-Group chats snapshot the same fields when a persona first joins through an `@mention` or heartbeat. Ordinary group replies continue using the participant snapshot.
+Direct chats snapshot the persona ID, name, individual instructions, and model selection when the chat is created. Ordinary replies continue using the snapshotted name and model selection, but read the persona's current individual instructions immediately before generation. The instruction snapshot is retained as a fallback if the persona is later deleted.
 
-Memory is different: it is live persona state. Normal direct replies, normal group replies, and heartbeats read the persona's current memory immediately before generation. Memory edits and model-appended entries therefore apply across existing chats.
+Group chats snapshot the same fields when a persona first joins through an `@mention` or heartbeat. Ordinary group replies continue using the participant's snapshotted name and model selection, but read the persona's current individual instructions immediately before generation. The participant's instruction snapshot is retained as a fallback if the persona is later deleted.
+
+Individual instructions and memory are live persona state. Normal direct replies, normal group replies, and heartbeats read the persona's current instructions and memory immediately before generation. Edits and model-appended memory entries therefore apply across existing chats on the next turn.
 
 Heartbeats also execute with the persona's current name, instructions, and memory rather than a chat snapshot. A heartbeat uses its own model override when one is set; otherwise it uses the persona's current model selection.
 
@@ -145,7 +148,7 @@ Every persisted user and assistant message is included. Author IDs and names are
 
 The harness extracts case-insensitive tokens matching `@[letters, numbers, or underscore]`. A persona's mention is its display name with non-alphanumeric characters removed; `Product Critic` becomes `@ProductCritic`.
 
-Newly mentioned personas are snapshotted and added before the user message is persisted. The `@mention` remains in the stored message and model transcript.
+Newly mentioned personas are snapshotted and added before the user message is persisted. The snapshot supplies the participant's name and model selection and serves as a fallback for individual instructions if the persona is later deleted. The `@mention` remains in the stored message and model transcript.
 
 Every stored participant is offered a response on each user turn:
 
@@ -176,7 +179,7 @@ Each participant receives:
 You are <persona name>, a participant in an open group discussion.
 
 Individual persona instructions:
-<snapshotted individual instructions or default>
+<current individual instructions or default>
 
 <current memory and append-only memory rules>
 
@@ -372,7 +375,7 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 
 7. **Heartbeat history has no retention limit.** Each completed attempt stores the full model input and raw output. Long conversations and frequent schedules can make the SwiftData store grow quickly.
 
-8. **Ordinary turns and heartbeat turns use different snapshot rules.** Existing chats use snapshotted names, instructions, and model choices for normal replies, while heartbeats use current persona configuration plus an optional per-heartbeat model override. A heartbeat post can therefore behave differently from the persona's next ordinary reply in the same chat.
+8. **Ordinary turns and heartbeat turns use different name and model snapshot rules.** Existing chats use snapshotted names and model choices for normal replies, while heartbeats use current persona configuration plus an optional per-heartbeat model override. Both paths use current individual instructions and memory, but a heartbeat post can still differ from the persona's next ordinary reply in the same chat because of its name or model.
 
 9. **Group turns remain asymmetric.** Later personas see earlier replies from the same turn; earlier personas cannot react to later replies until another user turn or heartbeat.
 

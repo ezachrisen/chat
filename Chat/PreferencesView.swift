@@ -9,6 +9,7 @@ import AppKit
 enum PreferencesSection: String, CaseIterable, Identifiable {
     case personas
     case models
+    case textToSpeech
 
     var id: Self { self }
 
@@ -18,6 +19,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return "Personas"
         case .models:
             return "Models"
+        case .textToSpeech:
+            return "Text to Speech"
         }
     }
 
@@ -27,6 +30,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return "person.2"
         case .models:
             return "cpu"
+        case .textToSpeech:
+            return "waveform"
         }
     }
 }
@@ -59,6 +64,7 @@ enum OpenUITheme {
 struct PreferencesView: View {
     @ObservedObject var personaStore: PersonaStore
     @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var navigation: PreferencesNavigation
 
@@ -72,10 +78,13 @@ struct PreferencesView: View {
                     PersonasPreferencesView(
                         store: personaStore,
                         localModelStore: localModelStore,
+                        textToSpeechToolStore: textToSpeechToolStore,
                         chatStore: chatStore
                     )
                 case .models:
                     ModelPreferencesView(store: localModelStore)
+                case .textToSpeech:
+                    TextToSpeechPreferencesView(store: textToSpeechToolStore)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -440,6 +449,141 @@ struct ModelPreferencesView: View {
     }
 }
 
+struct TextToSpeechPreferencesView: View {
+    @ObservedObject var store: TextToSpeechToolStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 32) {
+                HStack(alignment: .top, spacing: 24) {
+                    OpenUIPageHeader(
+                        title: "Text to Speech",
+                        description: "Configure command-line tools that can turn text into speech."
+                    )
+
+                    Spacer()
+
+                    Button {
+                        store.addTool()
+                    } label: {
+                        Label("Add tool", systemImage: "plus")
+                    }
+                    .buttonStyle(OpenUIPrimaryButtonStyle())
+                }
+
+                if store.tools.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 26, weight: .regular))
+                            .foregroundStyle(OpenUITheme.accent)
+
+                        Text("No text-to-speech tools")
+                            .font(.system(size: 15, weight: .semibold))
+
+                        Text("Add a command-line tool to make it available for text-to-speech features.")
+                            .font(.system(size: 13))
+                            .foregroundStyle(OpenUITheme.foregroundMuted)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 420)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 48)
+                    .openUICard()
+                } else {
+                    VStack(spacing: 16) {
+                        ForEach(store.tools) { tool in
+                            TextToSpeechToolEditor(tool: tool, store: store)
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: 800, alignment: .leading)
+            .padding(.horizontal, 40)
+            .padding(.vertical, 36)
+        }
+        .background(OpenUITheme.background)
+    }
+}
+
+private struct TextToSpeechToolEditor: View {
+    let tool: TextToSpeechTool
+    @ObservedObject var store: TextToSpeechToolStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(OpenUITheme.accent)
+                    .frame(width: 34, height: 34)
+                    .background(OpenUITheme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(tool.displayName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(OpenUITheme.foreground)
+
+                    Text(tool.path.isEmpty ? "Enter a CLI path to finish setup" : tool.path)
+                        .font(.system(size: 12))
+                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    store.remove(tool)
+                } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+                .buttonStyle(OpenUIDangerButtonStyle())
+            }
+            .padding(16)
+
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Name",
+                description: "The name used to identify this text-to-speech tool."
+            ) {
+                TextField("Text-to-speech tool", text: name)
+                    .openUIInput()
+                    .frame(width: 330)
+            }
+
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "CLI path",
+                description: "Absolute path to the command-line executable."
+            ) {
+                TextField("/path/to/text-to-speech-cli", text: path)
+                    .openUIInput()
+                    .frame(width: 330)
+#if os(iOS)
+                    .textInputAutocapitalization(.never)
+#endif
+            }
+        }
+        .openUICard()
+    }
+
+    private var name: Binding<String> {
+        Binding(
+            get: { tool.name },
+            set: { store.updateName(for: tool, to: $0) }
+        )
+    }
+
+    private var path: Binding<String> {
+        Binding(
+            get: { tool.path },
+            set: { store.updatePath(for: tool, to: $0) }
+        )
+    }
+}
+
 private struct LocalModelEditor: View {
     let model: LocalModel
     @ObservedObject var store: LocalModelStore
@@ -662,6 +806,7 @@ private struct PreferencesViewPreview: View {
     private let modelContainer: ModelContainer
     private let personaStore: PersonaStore
     private let localModelStore: LocalModelStore
+    private let textToSpeechToolStore: TextToSpeechToolStore
     private let chatStore: ChatStore
     private let navigation = PreferencesNavigation()
 
@@ -673,6 +818,7 @@ private struct PreferencesViewPreview: View {
                 PersonaHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
+                TextToSpeechTool.self,
                 StoredChat.self,
                 StoredGroupChatParticipant.self,
                 StoredChatMessage.self,
@@ -699,9 +845,11 @@ private struct PreferencesViewPreview: View {
 
             let personaStore = PersonaStore(modelContext: context)
             let localModelStore = LocalModelStore(modelContext: context)
+            let textToSpeechToolStore = TextToSpeechToolStore(modelContext: context)
             modelContainer = container
             self.personaStore = personaStore
             self.localModelStore = localModelStore
+            self.textToSpeechToolStore = textToSpeechToolStore
             chatStore = ChatStore(
                 personaStore: personaStore,
                 localModelStore: localModelStore,
@@ -716,6 +864,7 @@ private struct PreferencesViewPreview: View {
         PreferencesView(
             personaStore: personaStore,
             localModelStore: localModelStore,
+            textToSpeechToolStore: textToSpeechToolStore,
             chatStore: chatStore,
             navigation: navigation
         )

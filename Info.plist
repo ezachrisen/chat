@@ -23,5 +23,9 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Chat uses the microphone to transcribe your voice into a message.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Chat uses Apple speech recognition to turn your voice into message text.</string>
 </dict>
 </plist>
