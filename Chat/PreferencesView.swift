@@ -1,39 +1,442 @@
+import Combine
 import SwiftUI
+import SwiftData
+
+#if os(macOS)
+import AppKit
+#endif
+
+enum PreferencesSection: String, CaseIterable, Identifiable {
+    case personas
+    case models
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .personas:
+            return "Personas"
+        case .models:
+            return "Models"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .personas:
+            return "person.2"
+        case .models:
+            return "cpu"
+        }
+    }
+}
+
+@MainActor
+final class PreferencesNavigation: ObservableObject {
+    @Published var selection: PreferencesSection = .personas
+}
+
+enum OpenUITheme {
+    static let background = Color(red: 1, green: 1, blue: 1)
+    static let foreground = Color(red: 26 / 255, green: 28 / 255, blue: 31 / 255)
+    static let foregroundMuted = Color(red: 107 / 255, green: 114 / 255, blue: 128 / 255)
+    static let foregroundSubtle = Color(red: 156 / 255, green: 163 / 255, blue: 175 / 255)
+    static let accent = Color(red: 51 / 255, green: 156 / 255, blue: 1)
+    static let accentSoft = accent.opacity(0.15)
+    static let surface = Color.white
+    static let sidebar = Color(red: 247 / 255, green: 247 / 255, blue: 248 / 255)
+    static let surfaceActive = Color(red: 236 / 255, green: 236 / 255, blue: 236 / 255)
+    static let surfaceMuted = Color(red: 243 / 255, green: 244 / 255, blue: 246 / 255)
+    static let border = Color(red: 229 / 255, green: 231 / 255, blue: 235 / 255)
+    static let borderSubtle = Color(red: 239 / 255, green: 239 / 255, blue: 239 / 255)
+    static let primary = foreground
+    static let danger = Color(red: 225 / 255, green: 29 / 255, blue: 72 / 255)
+    static let warningBackground = Color(red: 254 / 255, green: 243 / 255, blue: 226 / 255)
+    static let warningForeground = Color(red: 146 / 255, green: 64 / 255, blue: 14 / 255)
+    static let warningBorder = Color(red: 245 / 255, green: 217 / 255, blue: 168 / 255)
+}
+
+struct PreferencesView: View {
+    @ObservedObject var personaStore: PersonaStore
+    @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var chatStore: ChatStore
+    @ObservedObject var navigation: PreferencesNavigation
+
+    var body: some View {
+        HStack(spacing: 0) {
+            OpenUIPreferencesSidebar(selection: $navigation.selection)
+
+            Group {
+                switch navigation.selection {
+                case .personas:
+                    PersonasPreferencesView(
+                        store: personaStore,
+                        localModelStore: localModelStore,
+                        chatStore: chatStore
+                    )
+                case .models:
+                    ModelPreferencesView(store: localModelStore)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(OpenUITheme.background)
+        }
+        .tint(OpenUITheme.accent)
+        .foregroundStyle(OpenUITheme.foreground)
+        .frame(
+            minWidth: 940,
+            idealWidth: 1_080,
+            maxWidth: .infinity,
+            minHeight: 640,
+            idealHeight: 760,
+            maxHeight: .infinity
+        )
+        .preferredColorScheme(.light)
+#if os(macOS)
+        .background(
+            PreferencesWindowConfigurator()
+                .frame(width: 0, height: 0)
+        )
+#endif
+    }
+}
+
+#if os(macOS)
+private struct PreferencesWindowConfigurator: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        NSView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let window = nsView.window,
+                  context.coordinator.configuredWindow !== window else {
+                return
+            }
+
+            context.coordinator.configuredWindow = window
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.styleMask.insert(.resizable)
+            window.minSize = NSSize(width: 940, height: 640)
+
+            guard let visibleFrame = (window.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame else {
+                return
+            }
+
+            let size = NSSize(
+                width: floor(visibleFrame.width * 2 / 3),
+                height: floor(visibleFrame.height * 2 / 3)
+            )
+            let origin = NSPoint(
+                x: visibleFrame.midX - size.width / 2,
+                y: visibleFrame.midY - size.height / 2
+            )
+            window.setFrame(NSRect(origin: origin, size: size), display: true)
+        }
+    }
+
+    final class Coordinator {
+        weak var configuredWindow: NSWindow?
+    }
+}
+#endif
+
+private struct OpenUIPreferencesSidebar: View {
+    @Binding var selection: PreferencesSection
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Chat")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(OpenUITheme.foreground)
+                .padding(.horizontal, 12)
+
+            Text("SETTINGS")
+                .font(.system(size: 11, weight: .medium))
+                .tracking(0.4)
+                .foregroundStyle(OpenUITheme.foregroundSubtle)
+                .padding(.top, 28)
+                .padding(.bottom, 8)
+                .padding(.horizontal, 12)
+
+            VStack(spacing: 4) {
+                ForEach(PreferencesSection.allCases) { section in
+                    Button {
+                        selection = section
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: section.systemImage)
+                                .font(.system(size: 16, weight: .regular))
+                                .frame(width: 20)
+
+                            Text(section.title)
+                                .font(.system(size: 14, weight: selection == section ? .medium : .regular))
+
+                            Spacer(minLength: 0)
+                        }
+                        .foregroundStyle(OpenUITheme.foreground)
+                        .padding(.horizontal, 12)
+                        .frame(height: 36)
+                        .contentShape(Rectangle())
+                        .background(
+                            selection == section ? OpenUITheme.surfaceActive : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 10)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(selection == section ? .isSelected : [])
+                }
+            }
+
+            Spacer()
+
+            Text("Local-first conversations")
+                .font(.system(size: 12))
+                .foregroundStyle(OpenUITheme.foregroundSubtle)
+                .padding(.horizontal, 12)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 24)
+        .frame(width: 224)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .background(OpenUITheme.sidebar)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(OpenUITheme.borderSubtle)
+                .frame(width: 1)
+        }
+    }
+}
+
+struct OpenUIPageHeader: View {
+    let title: String
+    let description: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(OpenUITheme.foreground)
+
+            Text(description)
+                .font(.system(size: 13))
+                .foregroundStyle(OpenUITheme.foregroundMuted)
+        }
+    }
+}
+
+struct OpenUISectionHeader: View {
+    let title: String
+    var description: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(OpenUITheme.foreground)
+
+            if let description {
+                Text(description)
+                    .font(.system(size: 13))
+                    .foregroundStyle(OpenUITheme.foregroundMuted)
+            }
+        }
+    }
+}
+
+struct OpenUISettingsRow<Control: View>: View {
+    let title: String
+    let description: String
+    @ViewBuilder let control: () -> Control
+
+    init(
+        title: String,
+        description: String,
+        @ViewBuilder control: @escaping () -> Control
+    ) {
+        self.title = title
+        self.description = description
+        self.control = control
+    }
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 20) {
+                labels
+                    .frame(width: 240, alignment: .leading)
+
+                Spacer(minLength: 0)
+
+                control()
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                labels
+
+                control()
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(minHeight: 52)
+    }
+
+    private var labels: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(OpenUITheme.foreground)
+
+            Text(description)
+                .font(.system(size: 13))
+                .foregroundStyle(OpenUITheme.foregroundMuted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+struct OpenUIDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(OpenUITheme.borderSubtle)
+            .frame(height: 1)
+    }
+}
+
+struct OpenUICardModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .background(OpenUITheme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(OpenUITheme.border, lineWidth: 1)
+            }
+    }
+}
+
+extension View {
+    func openUICard() -> some View {
+        modifier(OpenUICardModifier())
+    }
+
+    func openUIInput() -> some View {
+        self
+            .textFieldStyle(.plain)
+            .font(.system(size: 14))
+            .padding(.horizontal, 11)
+            .frame(height: 34)
+            .background(OpenUITheme.surface, in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(OpenUITheme.border, lineWidth: 1)
+            }
+    }
+}
+
+struct OpenUIPrimaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, 16)
+            .frame(height: 34)
+            .background(OpenUITheme.primary, in: Capsule())
+            .opacity(configuration.isPressed ? 0.76 : 1)
+    }
+}
+
+struct OpenUISecondaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(OpenUITheme.foreground)
+            .padding(.horizontal, 14)
+            .frame(height: 34)
+            .background(OpenUITheme.surface, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(OpenUITheme.border, lineWidth: 1)
+            }
+            .opacity(configuration.isPressed ? 0.68 : 1)
+    }
+}
+
+struct OpenUIDangerButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(OpenUITheme.danger)
+            .padding(.horizontal, 12)
+            .frame(height: 32)
+            .background(OpenUITheme.surface, in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(OpenUITheme.border, lineWidth: 1)
+            }
+            .opacity(configuration.isPressed ? 0.68 : 1)
+    }
+}
 
 struct ModelPreferencesView: View {
     @ObservedObject var store: LocalModelStore
 
     var body: some View {
-        Form {
-            Section {
-                Text("Add each local model server you want to use. The server must provide OpenAI-compatible models and chat completions APIs.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Local models") {
-                if store.localModels.isEmpty {
-                    ContentUnavailableView(
-                        "No local models",
-                        systemImage: "desktopcomputer",
-                        description: Text("Add a model served by tools such as LM Studio, Ollama, or llama.cpp.")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 32) {
+                HStack(alignment: .top, spacing: 24) {
+                    OpenUIPageHeader(
+                        title: "Models",
+                        description: "Configure local servers that expose OpenAI-compatible models and chat completions APIs."
                     )
+
+                    Spacer()
+
+                    Button {
+                        store.addLocalModel()
+                    } label: {
+                        Label("Add model", systemImage: "plus")
+                    }
+                    .buttonStyle(OpenUIPrimaryButtonStyle())
+                }
+
+                if store.localModels.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "desktopcomputer")
+                            .font(.system(size: 26, weight: .regular))
+                            .foregroundStyle(OpenUITheme.accent)
+
+                        Text("No local models")
+                            .font(.system(size: 15, weight: .semibold))
+
+                        Text("Add a model served by LM Studio, Ollama, llama.cpp, or another OpenAI-compatible server.")
+                            .font(.system(size: 13))
+                            .foregroundStyle(OpenUITheme.foregroundMuted)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 420)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 48)
+                    .openUICard()
                 } else {
-                    ForEach(store.localModels) { model in
-                        LocalModelEditor(model: model, store: store)
+                    VStack(spacing: 16) {
+                        ForEach(store.localModels) { model in
+                            LocalModelEditor(model: model, store: store)
+                        }
                     }
                 }
-
-                Button {
-                    store.addLocalModel()
-                } label: {
-                    Label("Add local model", systemImage: "plus")
-                }
             }
+            .frame(maxWidth: 800, alignment: .leading)
+            .padding(.horizontal, 40)
+            .padding(.vertical, 36)
         }
-        .formStyle(.grouped)
-        .frame(minWidth: 560, minHeight: 360)
-        .navigationTitle("Models")
+        .background(OpenUITheme.background)
     }
 }
 
@@ -47,85 +450,147 @@ private struct LocalModelEditor: View {
     @State private var discoveryVersion = UUID()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                TextField("Display name", text: name)
-                    .textFieldStyle(.roundedBorder)
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: "cpu")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(OpenUITheme.accent)
+                    .frame(width: 34, height: 34)
+                    .background(OpenUITheme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.displayName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(OpenUITheme.foreground)
+
+                    Text(model.modelID.isEmpty ? "Choose a server model to finish setup" : model.modelID)
+                        .font(.system(size: 12))
+                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .lineLimit(1)
+                }
 
                 Spacer()
 
                 Button(role: .destructive) {
                     store.remove(model)
                 } label: {
-                    Image(systemName: "trash")
+                    Label("Remove", systemImage: "trash")
                 }
-                .buttonStyle(.borderless)
-                .help("Remove local model")
+                .buttonStyle(OpenUIDangerButtonStyle())
+            }
+            .padding(16)
+
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Display name",
+                description: "The name shown in persona model menus."
+            ) {
+                TextField("Local model", text: name)
+                    .openUIInput()
+                    .frame(width: 330)
             }
 
-            TextField("Server URL", text: endpoint)
-                .textFieldStyle(.roundedBorder)
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Server URL",
+                description: "Base URL for the OpenAI-compatible API."
+            ) {
+                TextField("http://127.0.0.1:1234/v1", text: endpoint)
+                    .openUIInput()
+                    .frame(width: 330)
 #if os(iOS)
-                .textInputAutocapitalization(.never)
-                .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
 #endif
+            }
 
-            SecureField("Bearer token (optional)", text: $bearerToken)
-                .textFieldStyle(.roundedBorder)
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Bearer token",
+                description: "Optional credential stored in the system keychain."
+            ) {
+                SecureField("Optional", text: $bearerToken)
+                    .openUIInput()
+                    .frame(width: 330)
 #if os(iOS)
-                .textInputAutocapitalization(.never)
+                    .textInputAutocapitalization(.never)
 #endif
-                .onChange(of: bearerToken) {
-                    store.updateBearerToken(for: model, to: bearerToken)
-                    resetDiscoveredModels()
-                }
+                    .onChange(of: bearerToken) {
+                        store.updateBearerToken(for: model, to: bearerToken)
+                        resetDiscoveredModels()
+                    }
+            }
 
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Picker("Model", selection: modelID) {
-                    if model.modelID.isEmpty {
-                        Text("Choose a model")
-                            .tag("")
-                    } else if !availableModelIDs.contains(model.modelID) {
-                        Text(model.modelID)
-                            .tag(model.modelID)
-                    }
+            OpenUIDivider()
 
-                    ForEach(availableModelIDs, id: \.self) { modelID in
-                        Text(modelID)
-                            .tag(modelID)
-                    }
-                }
-                .pickerStyle(.menu)
-                .disabled(availableModelIDs.isEmpty)
+            OpenUISettingsRow(
+                title: "Server model",
+                description: "Loaded from the server's models API."
+            ) {
+                HStack(spacing: 8) {
+                    Picker("Model", selection: modelID) {
+                        if model.modelID.isEmpty {
+                            Text("Choose a model")
+                                .tag("")
+                        } else if !availableModelIDs.contains(model.modelID) {
+                            Text(model.modelID)
+                                .tag(model.modelID)
+                        }
 
-                Button {
-                    Task {
-                        await loadModels()
+                        ForEach(availableModelIDs, id: \.self) { modelID in
+                            Text(modelID)
+                                .tag(modelID)
+                        }
                     }
-                } label: {
-                    if isLoadingModels {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 270)
+                    .disabled(availableModelIDs.isEmpty)
+
+                    Button {
+                        Task {
+                            await loadModels()
+                        }
+                    } label: {
+                        if isLoadingModels {
+                            ProgressView()
+                                .controlSize(.small)
+                                .frame(width: 16, height: 16)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .frame(width: 16, height: 16)
+                        }
                     }
+                    .buttonStyle(OpenUISecondaryButtonStyle())
+                    .disabled(isLoadingModels)
+                    .help("Refresh models")
                 }
-                .buttonStyle(.borderless)
-                .disabled(isLoadingModels)
-                .help("Refresh models")
             }
 
             if let modelLoadError {
-                Label(modelLoadError, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            } else {
-                Text("Models are loaded from the server's OpenAI-compatible models API.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                OpenUIDivider()
+
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle")
+
+                    Text(modelLoadError)
+                        .font(.system(size: 13))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .foregroundStyle(OpenUITheme.warningForeground)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .background(OpenUITheme.warningBackground)
+                .overlay {
+                    Rectangle()
+                        .stroke(OpenUITheme.warningBorder, lineWidth: 1)
+                }
             }
         }
-        .padding(.vertical, 4)
+        .openUICard()
         .onAppear {
             bearerToken = store.bearerToken(for: model)
         }
@@ -186,5 +651,74 @@ private struct LocalModelEditor: View {
             availableModelIDs = []
             modelLoadError = "Couldn't load models: \(error.localizedDescription)"
         }
+    }
+}
+
+#Preview("Preferences") {
+    PreferencesViewPreview()
+}
+
+private struct PreferencesViewPreview: View {
+    private let modelContainer: ModelContainer
+    private let personaStore: PersonaStore
+    private let localModelStore: LocalModelStore
+    private let chatStore: ChatStore
+    private let navigation = PreferencesNavigation()
+
+    init() {
+        do {
+            let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+            let container = try ModelContainer(
+                for: Persona.self,
+                PersonaHeartbeat.self,
+                HeartbeatRun.self,
+                LocalModel.self,
+                StoredChat.self,
+                StoredGroupChatParticipant.self,
+                StoredChatMessage.self,
+                configurations: configuration
+            )
+            let context = container.mainContext
+            let localModel = LocalModel(
+                name: "Studio Qwen",
+                endpoint: "http://127.0.0.1:1234/v1",
+                modelID: "qwen3-8b"
+            )
+            context.insert(localModel)
+
+            for name in ["Joe", "Maya", "Rowan", "Sam"] {
+                context.insert(
+                    Persona(
+                        name: name,
+                        soul: "Be a thoughtful participant in the conversation.",
+                        modelIdentifier: ChatModelIdentifier.localModelID(localModel.id)
+                    )
+                )
+            }
+            try context.save()
+
+            let personaStore = PersonaStore(modelContext: context)
+            let localModelStore = LocalModelStore(modelContext: context)
+            modelContainer = container
+            self.personaStore = personaStore
+            self.localModelStore = localModelStore
+            chatStore = ChatStore(
+                personaStore: personaStore,
+                localModelStore: localModelStore,
+                modelContext: context
+            )
+        } catch {
+            fatalError("Failed to create Preferences preview: \(error.localizedDescription)")
+        }
+    }
+
+    var body: some View {
+        PreferencesView(
+            personaStore: personaStore,
+            localModelStore: localModelStore,
+            chatStore: chatStore,
+            navigation: navigation
+        )
+        .modelContainer(modelContainer)
     }
 }

@@ -1,66 +1,118 @@
 import SwiftUI
+import SwiftData
 
 #if os(macOS)
 import AppKit
 #endif
 
-struct PersonasWindow: View {
+struct PersonasPreferencesView: View {
     @ObservedObject var store: PersonaStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var chatStore: ChatStore
+    @State private var isPresentingEditor = false
 
     var body: some View {
-        NavigationSplitView {
-            PersonaSidebar(store: store)
-                .navigationSplitViewColumnWidth(min: 180, ideal: 220)
-        } detail: {
-            PersonaEditor(store: store, localModelStore: localModelStore, chatStore: chatStore)
-                .navigationSplitViewColumnWidth(min: 420, ideal: 560)
-        }
-        .frame(minWidth: 720, minHeight: 480)
-    }
-}
-
-struct PersonaSidebar: View {
-    @ObservedObject var store: PersonaStore
-
-    var body: some View {
-        VStack(spacing: 0) {
-            List(selection: $store.selectedPersonaID) {
-                ForEach(store.personas) { persona in
-                    Text(persona.displayName)
-                        .tag(persona.id)
-                }
+        Group {
+            if isPresentingEditor {
+                personaEditor
+            } else {
+                personaList
             }
+        }
+        .background(OpenUITheme.background)
+    }
 
-            Divider()
-
-            HStack(spacing: 8) {
-                Button {
-                    store.addPersona()
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .help("Add Persona")
-
-                Button {
-                    store.removeSelectedPersona()
-                } label: {
-                    Image(systemName: "minus")
-                }
-                .disabled(store.selectedPersonaID == nil)
-                .help("Remove Persona")
+    private var personaList: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack(alignment: .center) {
+                Text("Personas")
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(OpenUITheme.foreground)
 
                 Spacer()
+
+                Button {
+                    store.addPersona()
+                    isPresentingEditor = true
+                } label: {
+                    Label("Add Persona", systemImage: "plus")
+                }
+                .buttonStyle(OpenUIPrimaryButtonStyle())
             }
-            .buttonStyle(.borderless)
-            .padding(8)
+
+            VStack(spacing: 0) {
+                ForEach(Array(store.personas.enumerated()), id: \.element.id) { index, persona in
+                    Button {
+                        store.selectedPersonaID = persona.id
+                        isPresentingEditor = true
+                    } label: {
+                        HStack {
+                            Text(persona.displayName)
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(OpenUITheme.foreground)
+                                .lineLimit(1)
+
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 18)
+                        .frame(minHeight: 56)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Edit \(persona.displayName)")
+
+                    if index < store.personas.count - 1 {
+                        OpenUIDivider()
+                    }
+                }
+            }
+            .openUICard()
+
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: 800, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.horizontal, 40)
+        .padding(.vertical, 36)
+    }
+
+    private var personaEditor: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                HStack(spacing: 16) {
+                    Button("Personas") {
+                        isPresentingEditor = false
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 26, weight: .bold))
+                    .foregroundStyle(OpenUITheme.foregroundMuted)
+                    .accessibilityHint("Return to the persona list")
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+
+                    Text(store.selectedPersona?.displayName ?? "Persona")
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundStyle(OpenUITheme.foreground)
+                        .lineLimit(1)
+                }
+
+                PersonaEditor(
+                    store: store,
+                    localModelStore: localModelStore,
+                    chatStore: chatStore
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(.horizontal, 40)
+            .padding(.vertical, 36)
         }
     }
 }
 
-private let minimumSoulEditorHeight: CGFloat = 240
-private let maximumSoulEditorHeight: CGFloat = 720
+private let minimumPersonaTextEditorHeight: CGFloat = 170
+private let maximumPersonaTextEditorHeight: CGFloat = 720
 
 struct PersonaEditor: View {
     @ObservedObject var store: PersonaStore
@@ -68,6 +120,8 @@ struct PersonaEditor: View {
     @ObservedObject var chatStore: ChatStore
     @State private var draftSoul = ""
     @State private var soulEditorHeight: CGFloat = 360
+    @State private var draftMemory = ""
+    @State private var memoryEditorHeight: CGFloat = 240
 
     private var selectedPersona: Persona? {
         store.selectedPersona
@@ -91,13 +145,12 @@ struct PersonaEditor: View {
         }
     }
 
-    private var personaMemory: Binding<String> {
-        Binding {
-            selectedPersona?.memoryText ?? ""
-        } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaMemory(id: personaID, memory: newValue)
-        }
+    private var hasUnsavedSoulChanges: Bool {
+        draftSoul != selectedPersona?.soul
+    }
+
+    private var hasUnsavedMemoryChanges: Bool {
+        draftMemory != selectedPersona?.memoryText
     }
 
     var body: some View {
@@ -105,13 +158,22 @@ struct PersonaEditor: View {
             if let selectedPersona {
                 editor(for: selectedPersona)
             } else {
-                Text("Select or add a persona.")
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
+                VStack(spacing: 10) {
+                    Image(systemName: "person.crop.circle.badge.plus")
+                        .font(.system(size: 26))
+                        .foregroundStyle(OpenUITheme.accent)
+
+                    Text("Select or add a persona")
+                        .font(.system(size: 15, weight: .semibold))
+
+                    Text("Persona settings will appear here.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(OpenUITheme.foregroundMuted)
+                }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .openUICard()
             }
         }
-        .background(Color(red: 253 / 255, green: 253 / 255, blue: 252 / 255))
         .onAppear(perform: loadSelectedPersona)
         .onChange(of: store.selectedPersonaID) {
             loadSelectedPersona()
@@ -119,80 +181,126 @@ struct PersonaEditor: View {
     }
 
     private func editor(for persona: Persona) -> some View {
-        HStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    TextField("Persona name", text: personaName)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 22, weight: .semibold))
-                        .frame(height: 54)
+        VStack(alignment: .leading, spacing: 28) {
+                VStack(alignment: .leading, spacing: 10) {
+                    OpenUISectionHeader(
+                        title: "Identity"
+                        )
 
-                    Picker("Model", selection: personaModel) {
-                        Text("Apple Foundation Model")
-                            .tag(ChatModelIdentifier.appleFoundation)
-
-                        ForEach(localModelStore.localModels) { model in
-                            Text(model.displayName)
-                                .tag(ChatModelIdentifier.localModelID(model.id))
+                    VStack(spacing: 0) {
+                        OpenUISettingsRow(
+                            title: "Name",
+                            description: "Used in chat labels and @mentions."
+                        ) {
+                            TextField("Persona name", text: personaName)
+                                .openUIInput()
+                                .frame(width: 320)
                         }
 
-                        if !isSelectedModelConfigured(persona.selectedModelIdentifier) {
-                            Text("Missing local model")
-                                .tag(persona.selectedModelIdentifier)
+                        OpenUIDivider()
+
+                        OpenUISettingsRow(
+                            title: "Default model",
+                            description: "Heartbeats can override this selection individually."
+                        ) {
+                            Picker("Model", selection: personaModel) {
+                                Text("Apple Foundation Model")
+                                    .tag(ChatModelIdentifier.appleFoundation)
+
+                                ForEach(localModelStore.localModels) { model in
+                                    Text(model.displayName)
+                                        .tag(ChatModelIdentifier.localModelID(model.id))
+                                }
+
+                                if !isSelectedModelConfigured(persona.selectedModelIdentifier) {
+                                    Text("Missing local model")
+                                        .tag(persona.selectedModelIdentifier)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(width: 320)
                         }
                     }
-                    .pickerStyle(.menu)
-                    .padding(.top, 12)
+                    .openUICard()
+                }
 
-                    Text("Configure local models in Settings, then choose one for this persona.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 4)
+                VStack(alignment: .leading, spacing: 10) {
+                    OpenUISectionHeader(
+                        title: "Soul",
+                        description: "Your agent's personality and motivations."
+                    )
 
-                    Text("Soul")
-                        .font(.system(size: 15, weight: .semibold))
-                        .padding(.top, 28)
-                        .padding(.bottom, 12)
+                    VStack(spacing: 0) {
+                        ResizablePersonaTextEditor(
+                            text: $draftSoul,
+                            height: $soulEditorHeight,
+                            resizeHelpText: "Resize Soul editor"
+                        )
+                            .padding(16)
 
-                    ResizableSoulEditor(text: $draftSoul, height: $soulEditorHeight)
+                        OpenUIDivider()
 
-                    HStack {
-                        Spacer()
+                        HStack {
+                            Text("Soul changes are applied when you save.")
+                                .font(.system(size: 12))
+                                .foregroundStyle(OpenUITheme.foregroundSubtle)
 
-                        Button("Save soul") {
-                            store.updatePersonaSoul(id: persona.id, soul: draftSoul)
+                            Spacer()
+
+                            if hasUnsavedSoulChanges {
+                                Button("Save Soul") {
+                                    store.updatePersonaSoul(id: persona.id, soul: draftSoul)
+                                }
+                                .buttonStyle(OpenUIPrimaryButtonStyle())
+                            }
                         }
-                        .controlSize(.large)
-                        .buttonStyle(.borderedProminent)
+                        .padding(14)
                     }
-                    .padding(.top, 18)
+                    .openUICard()
+                }
 
-                    Text("Memory")
-                        .font(.system(size: 15, weight: .semibold))
-                        .padding(.top, 32)
-                        .padding(.bottom, 6)
+                VStack(alignment: .leading, spacing: 10) {
+                    OpenUISectionHeader(
+                        title: "Memory",
+                        description: "You can edit all memory; the persona can only append new entries."
+                    )
 
-                    Text("You can edit memory directly. The persona can append new entries, but it cannot change existing text.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.bottom, 10)
+                    VStack(spacing: 0) {
+                        ResizablePersonaTextEditor(
+                            text: $draftMemory,
+                            height: $memoryEditorHeight,
+                            resizeHelpText: "Resize Memory editor"
+                        )
+                            .padding(16)
 
-                    PersonaMemoryEditor(text: personaMemory)
+                        OpenUIDivider()
 
-                    Text("Memory saves automatically.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 6)
+                        HStack {
+                            Text("Memory changes are applied when you save.")
+                                .font(.system(size: 12))
+                                .foregroundStyle(OpenUITheme.foregroundSubtle)
 
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Heartbeats")
-                                .font(.system(size: 15, weight: .semibold))
+                            Spacer()
 
-                            Text("Run recurring persona instructions while Chat is open.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            if hasUnsavedMemoryChanges {
+                                Button("Save Memory") {
+                                    store.updatePersonaMemory(id: persona.id, memory: draftMemory)
+                                }
+                                .buttonStyle(OpenUIPrimaryButtonStyle())
+                            }
                         }
+                        .padding(14)
+                    }
+                    .openUICard()
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .center, spacing: 16) {
+                        OpenUISectionHeader(
+                            title: "Heartbeats",
+                            description: "Run recurring persona instructions while Chat is open."
+                        )
 
                         Spacer()
 
@@ -201,43 +309,46 @@ struct PersonaEditor: View {
                         } label: {
                             Label("Add heartbeat", systemImage: "plus")
                         }
+                        .buttonStyle(OpenUISecondaryButtonStyle())
                     }
-                    .padding(.top, 32)
-                    .padding(.bottom, 12)
 
-                    VStack(spacing: 12) {
-                        ForEach(store.heartbeats(for: persona.id)) { heartbeat in
-                            PersonaHeartbeatEditor(
-                                heartbeat: heartbeat,
-                                store: store,
-                                localModelStore: localModelStore,
-                                chatStore: chatStore
-                            )
+                    if store.heartbeats(for: persona.id).isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "waveform.path.ecg")
+                                .font(.system(size: 22))
+                                .foregroundStyle(OpenUITheme.foregroundSubtle)
+
+                            Text("No heartbeats configured")
+                                .font(.system(size: 14, weight: .medium))
+
+                            Text("Add one to let this persona check in on a schedule.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(OpenUITheme.foregroundMuted)
                         }
-
-                        if store.heartbeats(for: persona.id).isEmpty {
-                            Text("No heartbeats configured.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 32)
+                        .openUICard()
+                    } else {
+                        VStack(spacing: 16) {
+                            ForEach(store.heartbeats(for: persona.id)) { heartbeat in
+                                PersonaHeartbeatEditor(
+                                    heartbeat: heartbeat,
+                                    store: store,
+                                    localModelStore: localModelStore,
+                                    chatStore: chatStore
+                                )
+                            }
                         }
                     }
                 }
-                .frame(maxWidth: 760, alignment: .top)
-                .padding(.top, 54)
-                .padding(.bottom, 70)
-                .padding(.horizontal, 48)
-            }
-            .frame(maxWidth: 856, maxHeight: .infinity, alignment: .top)
-
-            Spacer(minLength: 0)
         }
+        .frame(maxWidth: 720, alignment: .topLeading)
     }
 
     private func loadSelectedPersona() {
         guard let selectedPersona else {
             draftSoul = ""
+            draftMemory = ""
             return
         }
 
@@ -246,28 +357,13 @@ struct PersonaEditor: View {
 
     private func load(_ persona: Persona) {
         draftSoul = persona.soul
+        draftMemory = persona.memoryText
     }
 
     private func isSelectedModelConfigured(_ identifier: String) -> Bool {
         identifier == ChatModelIdentifier.appleFoundation || localModelStore.localModels.contains {
             ChatModelIdentifier.localModelID($0.id) == identifier
         }
-    }
-}
-
-struct PersonaMemoryEditor: View {
-    @Binding var text: String
-
-    var body: some View {
-        SoulTextView(text: $text)
-            .padding(12)
-            .background(.white.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.gray.opacity(0.22), lineWidth: 1)
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: 170)
     }
 }
 
@@ -278,58 +374,107 @@ struct PersonaHeartbeatEditor: View {
     @ObservedObject var chatStore: ChatStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Toggle("Enabled", isOn: isEnabled)
-                    .toggleStyle(.switch)
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Heartbeat")
+                        .font(.system(size: 15, weight: .semibold))
+
+                    Text("Runs every \(heartbeat.normalizedIntervalMinutes) minutes")
+                        .font(.system(size: 12))
+                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .monospacedDigit()
+                }
 
                 Spacer()
+
+                Toggle("Enabled", isOn: isEnabled)
+                    .toggleStyle(.switch)
+                    .tint(OpenUITheme.accent)
 
                 Button(role: .destructive) {
                     store.removeHeartbeat(heartbeat)
                 } label: {
-                    Image(systemName: "trash")
+                    Label("Remove", systemImage: "trash")
                 }
-                .buttonStyle(.borderless)
-                .help("Remove heartbeat")
+                .buttonStyle(OpenUIDangerButtonStyle())
             }
+            .padding(16)
 
-            TextEditor(text: instruction)
-                .font(.body)
-                .frame(minHeight: 68, maxHeight: 100)
-                .padding(6)
-                .scrollContentBackground(.hidden)
-                .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            OpenUIDivider()
 
-            Picker("Model", selection: modelIdentifier) {
-                Text("Persona default (\(personaDefaultModelName))")
-                    .tag("")
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Instruction")
+                    .font(.system(size: 14, weight: .medium))
 
-                Section("Override") {
-                    Text("Apple Foundation Model")
-                        .tag(ChatModelIdentifier.appleFoundation)
+                Text("Tell the persona what to consider when this heartbeat runs.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(OpenUITheme.foregroundMuted)
 
-                    ForEach(localModelStore.localModels) { model in
-                        Text(model.displayName)
-                            .tag(ChatModelIdentifier.localModelID(model.id))
+                TextEditor(text: instruction)
+                    .font(.system(size: 14))
+                    .frame(minHeight: 76, maxHeight: 110)
+                    .padding(8)
+                    .scrollContentBackground(.hidden)
+                    .background(OpenUITheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(OpenUITheme.border, lineWidth: 1)
+                    }
+            }
+            .padding(16)
+
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Model",
+                description: "Override the persona's default for this heartbeat."
+            ) {
+                Picker("Model", selection: modelIdentifier) {
+                    Text("Persona default (\(personaDefaultModelName))")
+                        .tag("")
+
+                    Section("Override") {
+                        Text("Apple Foundation Model")
+                            .tag(ChatModelIdentifier.appleFoundation)
+
+                        ForEach(localModelStore.localModels) { model in
+                            Text(model.displayName)
+                                .tag(ChatModelIdentifier.localModelID(model.id))
+                        }
+                    }
+
+                    if let selectedIdentifier = heartbeat.modelIdentifier,
+                       !isModelConfigured(selectedIdentifier) {
+                        Text("Missing local model")
+                            .tag(selectedIdentifier)
                     }
                 }
-
-                if let selectedIdentifier = heartbeat.modelIdentifier,
-                   !isModelConfigured(selectedIdentifier) {
-                    Text("Missing local model")
-                        .tag(selectedIdentifier)
-                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 300)
             }
-            .pickerStyle(.menu)
-            .frame(maxWidth: 360)
 
-            HStack(spacing: 18) {
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Schedule",
+                description: "Choose an interval from one minute to one week."
+            ) {
                 Stepper(value: intervalMinutes, in: 1...10_080) {
                     Text("Every \(heartbeat.normalizedIntervalMinutes) minutes")
+                        .font(.system(size: 13))
                         .monospacedDigit()
                 }
+                .frame(width: 300)
+            }
 
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Post to",
+                description: "Select the private or group chat that receives posts."
+            ) {
                 Picker("Post to", selection: destination) {
                     Text("Private chat")
                         .tag("private")
@@ -350,30 +495,44 @@ struct PersonaHeartbeatEditor: View {
                             .tag("group.\(targetChatID.uuidString)")
                     }
                 }
+                .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(maxWidth: 260)
+                .frame(width: 300)
             }
 
             if let lastError = heartbeat.lastError {
-                Label(lastError, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                OpenUIDivider()
+
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle")
+
+                    Text(lastError)
+                        .font(.system(size: 13))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .foregroundStyle(OpenUITheme.warningForeground)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .background(OpenUITheme.warningBackground)
             } else if let lastCompletedAt = heartbeat.lastCompletedAt {
+                OpenUIDivider()
+
                 Text("Last completed \(lastCompletedAt.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(OpenUITheme.foregroundSubtle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
             } else {
+                OpenUIDivider()
+
                 Text("The persona may post a reply, append memory, or pass.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(OpenUITheme.foregroundSubtle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
             }
         }
-        .padding(14)
-        .background(.white.opacity(0.38), in: RoundedRectangle(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
-        }
+        .openUICard()
     }
 
     private var instruction: Binding<String> {
@@ -448,29 +607,33 @@ struct PersonaHeartbeatEditor: View {
     }
 }
 
-struct ResizableSoulEditor: View {
+struct ResizablePersonaTextEditor: View {
     @Binding var text: String
     @Binding var height: CGFloat
+    let resizeHelpText: String
     @State private var dragStartHeight: CGFloat?
 
     var body: some View {
         SoulTextView(text: $text)
             .padding(12)
             .padding(.bottom, 8)
-            .background(.white.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+            .background(OpenUITheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 12))
             .overlay {
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.gray.opacity(0.22), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(OpenUITheme.border, lineWidth: 1)
             }
             .overlay(alignment: .bottomTrailing) {
-                ResizeGrip()
+                ResizeGrip(helpText: resizeHelpText)
                     .padding(5)
                     .gesture(
                         DragGesture()
                             .onChanged { value in
                                 let startHeight = dragStartHeight ?? height
                                 dragStartHeight = startHeight
-                                height = min(max(startHeight + value.translation.height, minimumSoulEditorHeight), maximumSoulEditorHeight)
+                                height = min(
+                                    max(startHeight + value.translation.height, minimumPersonaTextEditorHeight),
+                                    maximumPersonaTextEditorHeight
+                                )
                             }
                             .onEnded { _ in
                                 dragStartHeight = nil
@@ -554,6 +717,8 @@ struct SoulTextView: View {
 #endif
 
 struct ResizeGrip: View {
+    let helpText: String
+
     var body: some View {
         Canvas { context, size in
             let stroke = StrokeStyle(lineWidth: 1.2, lineCap: .round)
@@ -568,6 +733,74 @@ struct ResizeGrip: View {
         }
         .frame(width: 14, height: 14)
         .contentShape(Rectangle())
-        .help("Resize Soul editor")
+        .help(helpText)
+    }
+}
+
+#Preview("Personas Preferences") {
+    PersonasPreferencesViewPreview()
+}
+
+private struct PersonasPreferencesViewPreview: View {
+    private let modelContainer: ModelContainer
+    private let personaStore: PersonaStore
+    private let localModelStore: LocalModelStore
+    private let chatStore: ChatStore
+
+    init() {
+        do {
+            let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+            let container = try ModelContainer(
+                for: Persona.self,
+                PersonaHeartbeat.self,
+                HeartbeatRun.self,
+                LocalModel.self,
+                StoredChat.self,
+                StoredGroupChatParticipant.self,
+                StoredChatMessage.self,
+                configurations: configuration
+            )
+            let context = container.mainContext
+            let localModel = LocalModel(
+                name: "Studio Qwen",
+                endpoint: "http://127.0.0.1:1234/v1",
+                modelID: "qwen3-8b"
+            )
+            context.insert(localModel)
+
+            for name in ["Joe", "Maya", "Rowan", "Sam"] {
+                context.insert(
+                    Persona(
+                        name: name,
+                        soul: "Be a thoughtful participant in the conversation.",
+                        modelIdentifier: ChatModelIdentifier.localModelID(localModel.id)
+                    )
+                )
+            }
+            try context.save()
+
+            let personaStore = PersonaStore(modelContext: context)
+            let localModelStore = LocalModelStore(modelContext: context)
+            modelContainer = container
+            self.personaStore = personaStore
+            self.localModelStore = localModelStore
+            chatStore = ChatStore(
+                personaStore: personaStore,
+                localModelStore: localModelStore,
+                modelContext: context
+            )
+        } catch {
+            fatalError("Failed to create Personas preferences preview: \(error.localizedDescription)")
+        }
+    }
+
+    var body: some View {
+        PersonasPreferencesView(
+            store: personaStore,
+            localModelStore: localModelStore,
+            chatStore: chatStore
+        )
+        .modelContainer(modelContainer)
+        .frame(width: 900, height: 680)
     }
 }

@@ -11,6 +11,7 @@ struct ChatApp: App {
     @StateObject private var localModelStore: LocalModelStore
     @StateObject private var chatStore: ChatStore
     @StateObject private var heartbeatScheduler: HeartbeatScheduler
+    @StateObject private var preferencesNavigation: PreferencesNavigation
 
     init() {
         do {
@@ -31,11 +32,13 @@ struct ChatApp: App {
                 modelContext: container.mainContext
             )
             let heartbeatScheduler = HeartbeatScheduler(personaStore: personaStore, chatStore: chatStore)
+            let preferencesNavigation = PreferencesNavigation()
             modelContainer = container
             _personaStore = StateObject(wrappedValue: personaStore)
             _localModelStore = StateObject(wrappedValue: localModelStore)
             _chatStore = StateObject(wrappedValue: chatStore)
             _heartbeatScheduler = StateObject(wrappedValue: heartbeatScheduler)
+            _preferencesNavigation = StateObject(wrappedValue: preferencesNavigation)
             heartbeatScheduler.start()
         } catch {
             fatalError("Failed to create model container: \(error.localizedDescription)")
@@ -48,14 +51,11 @@ struct ChatApp: App {
                 .modelContainer(modelContainer)
         }
         .commands {
-            PersonaCommands()
+#if os(macOS)
+            PersonaCommands(navigation: preferencesNavigation)
+#endif
             HeartbeatCommands()
             DeveloperCommands(chatStore: chatStore)
-        }
-
-        Window("Personas", id: "personas") {
-            PersonasWindow(store: personaStore, localModelStore: localModelStore, chatStore: chatStore)
-                .modelContainer(modelContainer)
         }
 
         Window("Heartbeats", id: "heartbeats") {
@@ -69,7 +69,13 @@ struct ChatApp: App {
 
 #if os(macOS)
         Settings {
-            ModelPreferencesView(store: localModelStore)
+            PreferencesView(
+                personaStore: personaStore,
+                localModelStore: localModelStore,
+                chatStore: chatStore,
+                navigation: preferencesNavigation
+            )
+            .modelContainer(modelContainer)
         }
 #endif
     }
@@ -719,17 +725,21 @@ struct GroupChatEmptyState: View {
     }
 }
 
+#if os(macOS)
 struct PersonaCommands: Commands {
-    @Environment(\.openWindow) private var openWindow
+    @ObservedObject var navigation: PreferencesNavigation
+    @Environment(\.openSettings) private var openSettings
 
     var body: some Commands {
         CommandGroup(after: .pasteboard) {
             Button("Personas") {
-                openWindow(id: "personas")
+                navigation.selection = .personas
+                openSettings()
             }
         }
     }
 }
+#endif
 
 struct DeveloperCommands: Commands {
     @ObservedObject var chatStore: ChatStore
