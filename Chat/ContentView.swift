@@ -583,6 +583,11 @@ struct ChatDetailView: View {
                 voiceSendIsPending = false
             }
         }
+        .onChange(of: voiceInput.isTranscribing) {
+            if voiceInput.isTranscribing {
+                VoiceChimePlayer.shared.play(.dictationStarted)
+            }
+        }
         .alert("Voice error", isPresented: voiceErrorIsPresented) {
             Button("OK") {
                 voiceErrorMessage = nil
@@ -657,6 +662,7 @@ struct ChatDetailView: View {
                 .padding(.bottom, 4)
             }
             .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .modifier(VoiceDictationGlow(isActive: voiceInput.isTranscribing))
 
             Button {
                 submitDraft()
@@ -912,6 +918,8 @@ struct ChatDetailView: View {
     }
 
     private func finishVoiceUtterance() {
+        VoiceChimePlayer.shared.play(.utteranceSent)
+
         guard chat.canSubmitDraft else {
             voiceSendIsPending = true
             voiceDraftPrefix = chat.draft
@@ -947,6 +955,7 @@ struct ChatDetailView: View {
             }
 
             let personaName = persona.displayName
+            VoiceChimePlayer.shared.play(.responseReady)
             voicePlayback.enqueue(
                 messageID: message.id,
                 text: message.text,
@@ -977,6 +986,7 @@ struct ChatDetailView: View {
         voiceInput.stop()
         readRepliesOnlyIsEnabled = false
         voicePlayback.stop()
+        VoiceChimePlayer.shared.stopAll()
         automaticReplyReadingStartedAt = nil
     }
 

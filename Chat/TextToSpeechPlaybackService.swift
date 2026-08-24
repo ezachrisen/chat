@@ -61,6 +61,7 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
     private struct GenerationRequest {
         let messageID: UUID
         let chunkIndex: Int
+        let chunkCount: Int
         let text: String
         let configuration: TextToSpeechPlaybackConfiguration
         let onError: (Error) -> Void
@@ -70,6 +71,7 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
         let messageID: UUID
         let chunkIndex: Int
         let outputURL: URL
+        let completionCue: VoiceChimeCue?
         let onError: (Error) -> Void
     }
 
@@ -84,6 +86,7 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
     private var currentPlaybackRequest: PlaybackRequest?
     private var audioPlayer: AVAudioPlayer?
     private var playbackProgressTask: Task<Void, Never>?
+    private var playbackTransitionTask: Task<Void, Never>?
 
     func enqueue(
         messageID: UUID,
@@ -102,6 +105,7 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
                 GenerationRequest(
                     messageID: messageID,
                     chunkIndex: chunkIndex,
+                    chunkCount: chunks.count,
                     text: chunk,
                     configuration: configuration,
                     onError: onError
@@ -128,6 +132,7 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
                 messageID: messageID,
                 chunkIndex: chunkIndex,
                 outputURL: outputURL,
+                completionCue: nil,
                 onError: onError
             )
         )
@@ -146,6 +151,8 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
         if let messageID = currentPlaybackRequest?.messageID {
             automaticPlaybackSuppressedMessageIDs.insert(messageID)
         }
+        playbackTransitionTask?.cancel()
+        playbackTransitionTask = nil
         pendingPlaybackRequests.removeAll()
         finishCurrentPlayback(continueWithNextRequest: false)
     }
@@ -204,6 +211,9 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
                             messageID: request.messageID,
                             chunkIndex: request.chunkIndex,
                             outputURL: outputURL,
+                            completionCue: request.chunkIndex + 1 < request.chunkCount
+                                ? .segmentContinues
+                                : .handover,
                             onError: request.onError
                         )
                     )
@@ -231,7 +241,11 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
     }
 
     private func processNextPlaybackIfNeeded() {
-        guard audioPlayer == nil, !pendingPlaybackRequests.isEmpty else { return }
+        guard audioPlayer == nil,
+              playbackTransitionTask == nil,
+              !pendingPlaybackRequests.isEmpty else {
+            return
+        }
 
         let request = pendingPlaybackRequests.removeFirst()
         do {
@@ -261,7 +275,8 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
         Task { @MainActor [weak self] in
             guard let self, self.audioPlayer === player else { return }
             let onError = self.currentPlaybackRequest?.onError
-            self.finishCurrentPlayback()
+            let completionCue = flag ? self.currentPlaybackRequest?.completionCue : nil
+            self.finishCurrentPlayback(completionCue: completionCue)
             if !flag {
                 onError?(TextToSpeechPlaybackError.playbackFailed)
             }
@@ -278,11 +293,31 @@ final class TextToSpeechPlaybackService: NSObject, ObservableObject, AVAudioPlay
         }
     }
 
-    private func finishCurrentPlayback(continueWithNextRequest: Bool = true) {
+    private func finishCurrentPlayback(
+        continueWithNextRequest: Bool = true,
+        completionCue: VoiceChimeCue? = nil
+    ) {
         audioPlayer?.stop()
         resetCurrentPlayback()
-        if continueWithNextRequest {
+        guard continueWithNextRequest else { return }
+
+        guard let completionCue else {
             processNextPlaybackIfNeeded()
+            return
+        }
+
+        let completionCueDuration = VoiceChimePlayer.shared.play(completionCue)
+        playbackTransitionTask?.cancel()
+        playbackTransitionTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: completionCueDuration + .milliseconds(45))
+            } catch {
+                return
+            }
+
+            guard let self else { return }
+            self.playbackTransitionTask = nil
+            self.processNextPlaybackIfNeeded()
         }
     }
 
