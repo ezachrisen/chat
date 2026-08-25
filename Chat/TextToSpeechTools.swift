@@ -94,15 +94,15 @@ final class TextToSpeechToolStore: ObservableObject {
         )
     }
 
-    func playbackConfiguration(for persona: Persona) -> TextToSpeechPlaybackConfiguration? {
-        guard let toolID = persona.textToSpeechToolID,
+    func playbackConfiguration(for agent: Agent) -> TextToSpeechPlaybackConfiguration? {
+        guard let toolID = agent.textToSpeechToolID,
               let tool = tools.first(where: { $0.id == toolID }) else {
             return nil
         }
 
-        let voiceName = (persona.textToSpeechVoiceName ?? "")
+        let voiceName = (agent.textToSpeechVoiceName ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let voiceModel = (persona.textToSpeechVoiceModel ?? "")
+        let voiceModel = (agent.textToSpeechVoiceModel ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !voiceName.isEmpty, !voiceModel.isEmpty else { return nil }
 

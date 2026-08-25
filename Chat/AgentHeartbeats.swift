@@ -10,15 +10,15 @@ enum HeartbeatTargetKind: String {
 enum HeartbeatExecutionError: LocalizedError {
     static let busyDestinationRetryDelay: TimeInterval = 60
 
-    case personaMissing
+    case agentMissing
     case emptyInstruction
     case targetMissing
     case chatBusy
 
     var errorDescription: String? {
         switch self {
-        case .personaMissing:
-            return "The persona no longer exists."
+        case .agentMissing:
+            return "The agent no longer exists."
         case .emptyInstruction:
             return "Add an instruction before enabling this heartbeat."
         case .targetMissing:
@@ -32,16 +32,16 @@ enum HeartbeatExecutionError: LocalizedError {
         switch self {
         case .chatBusy:
             return Self.busyDestinationRetryDelay
-        case .personaMissing, .emptyInstruction, .targetMissing:
+        case .agentMissing, .emptyInstruction, .targetMissing:
             return nil
         }
     }
 }
 
 @Model
-final class PersonaHeartbeat: Identifiable {
+final class AgentHeartbeat: Identifiable {
     @Attribute(.unique) var id: UUID
-    var personaID: UUID
+    @Attribute(originalName: "personaID") var agentID: UUID
     var instruction: String
     var intervalMinutes: Int
     var isEnabled: Bool
@@ -56,7 +56,7 @@ final class PersonaHeartbeat: Identifiable {
 
     init(
         id: UUID = UUID(),
-        personaID: UUID,
+        agentID: UUID,
         instruction: String = "Check whether you have anything useful to add.",
         intervalMinutes: Int = 60,
         isEnabled: Bool = false,
@@ -70,7 +70,7 @@ final class PersonaHeartbeat: Identifiable {
         createdAt: Date = .now
     ) {
         self.id = id
-        self.personaID = personaID
+        self.agentID = agentID
         self.instruction = instruction
         self.intervalMinutes = intervalMinutes
         self.isEnabled = isEnabled
@@ -97,8 +97,8 @@ final class PersonaHeartbeat: Identifiable {
 final class HeartbeatRun: Identifiable {
     @Attribute(.unique) var id: UUID
     var heartbeatID: UUID
-    var personaID: UUID
-    var personaName: String
+    @Attribute(originalName: "personaID") var agentID: UUID
+    @Attribute(originalName: "personaName") var agentName: String
     var instruction: String
     var destination: String
     var startedAt: Date
@@ -111,8 +111,8 @@ final class HeartbeatRun: Identifiable {
     init(
         id: UUID = UUID(),
         heartbeatID: UUID,
-        personaID: UUID,
-        personaName: String,
+        agentID: UUID,
+        agentName: String,
         instruction: String,
         destination: String,
         startedAt: Date,
@@ -124,8 +124,8 @@ final class HeartbeatRun: Identifiable {
     ) {
         self.id = id
         self.heartbeatID = heartbeatID
-        self.personaID = personaID
-        self.personaName = personaName
+        self.agentID = agentID
+        self.agentName = agentName
         self.instruction = instruction
         self.destination = destination
         self.startedAt = startedAt
@@ -142,7 +142,7 @@ final class HeartbeatRun: Identifiable {
 }
 
 struct HeartbeatExecutionReport {
-    let personaName: String
+    let agentName: String
     let instruction: String
     let destination: String
     let startedAt: Date
@@ -155,9 +155,9 @@ struct HeartbeatExecutionReport {
 }
 
 struct RunningHeartbeat: Identifiable {
-    let id: PersonaHeartbeat.ID
-    let personaID: Persona.ID
-    let personaName: String
+    let id: AgentHeartbeat.ID
+    let agentID: Agent.ID
+    let agentName: String
     let instruction: String
     let destination: String
     let startedAt: Date
@@ -180,12 +180,12 @@ struct HeartbeatModelFailure: LocalizedError {
     }
 }
 
-struct PersonaModelOutput {
+struct AgentModelOutput {
     let visibleText: String
     let memoryEntries: [String]
 }
 
-enum PersonaMemoryHarness {
+enum AgentMemoryHarness {
     private static let memoryExpression = try! NSRegularExpression(
         pattern: #"\[\[MEMORY\]\](.*?)\[\[/MEMORY\]\]"#,
         options: [.caseInsensitive, .dotMatchesLineSeparators]
@@ -210,7 +210,7 @@ enum PersonaMemoryHarness {
         """
     }
 
-    static func parse(_ response: String) -> PersonaModelOutput {
+    static func parse(_ response: String) -> AgentModelOutput {
         let fullRange = NSRange(response.startIndex..<response.endIndex, in: response)
         let matches = memoryExpression.matches(in: response, range: fullRange)
         var entries: [String] = []
@@ -235,7 +235,7 @@ enum PersonaMemoryHarness {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\n\n\n", with: "\n\n")
 
-        return PersonaModelOutput(visibleText: visibleText, memoryEntries: entries)
+        return AgentModelOutput(visibleText: visibleText, memoryEntries: entries)
     }
 }
 
@@ -245,15 +245,15 @@ final class HeartbeatScheduler: ObservableObject {
 
     @Published private(set) var runningHeartbeats: [RunningHeartbeat] = []
 
-    private let personaStore: PersonaStore
+    private let agentStore: AgentStore
     private let chatStore: ChatStore
     private var schedulerTask: Task<Void, Never>?
-    private var executionTasks: [PersonaHeartbeat.ID: (token: UUID, task: Task<Void, Never>)] = [:]
-    private var timeoutTasks: [PersonaHeartbeat.ID: (token: UUID, task: Task<Void, Never>)] = [:]
-    private var runningModelInputs: [PersonaHeartbeat.ID: String] = [:]
+    private var executionTasks: [AgentHeartbeat.ID: (token: UUID, task: Task<Void, Never>)] = [:]
+    private var timeoutTasks: [AgentHeartbeat.ID: (token: UUID, task: Task<Void, Never>)] = [:]
+    private var runningModelInputs: [AgentHeartbeat.ID: String] = [:]
 
-    init(personaStore: PersonaStore, chatStore: ChatStore) {
-        self.personaStore = personaStore
+    init(agentStore: AgentStore, chatStore: ChatStore) {
+        self.agentStore = agentStore
         self.chatStore = chatStore
     }
 
@@ -274,30 +274,30 @@ final class HeartbeatScheduler: ObservableObject {
         }
     }
 
-    func skip(_ heartbeatID: PersonaHeartbeat.ID) {
+    func skip(_ heartbeatID: AgentHeartbeat.ID) {
         guard executionTasks[heartbeatID] == nil else { return }
-        personaStore.skipHeartbeat(id: heartbeatID, at: .now)
+        agentStore.skipHeartbeat(id: heartbeatID, at: .now)
     }
 
-    func disable(_ heartbeatID: PersonaHeartbeat.ID) {
+    func disable(_ heartbeatID: AgentHeartbeat.ID) {
         guard executionTasks[heartbeatID] == nil,
-              let heartbeat = personaStore.heartbeats.first(where: { $0.id == heartbeatID }) else {
+              let heartbeat = agentStore.heartbeats.first(where: { $0.id == heartbeatID }) else {
             return
         }
-        personaStore.updateHeartbeatEnabled(heartbeat, isEnabled: false)
+        agentStore.updateHeartbeatEnabled(heartbeat, isEnabled: false)
     }
 
-    func runNow(_ heartbeatID: PersonaHeartbeat.ID) {
+    func runNow(_ heartbeatID: AgentHeartbeat.ID) {
         guard executionTasks[heartbeatID] == nil else { return }
 
         let requestDate = Date()
         guard executionTasks.isEmpty else {
-            personaStore.deferHeartbeatForOverlap(id: heartbeatID, at: requestDate)
+            agentStore.deferHeartbeatForOverlap(id: heartbeatID, at: requestDate)
             return
         }
 
         guard
-              let heartbeat = personaStore.claimHeartbeatForImmediateRun(
+              let heartbeat = agentStore.claimHeartbeatForImmediateRun(
                 id: heartbeatID,
                 at: requestDate
               ) else {
@@ -306,33 +306,33 @@ final class HeartbeatScheduler: ObservableObject {
         startExecution(heartbeat)
     }
 
-    func abort(_ heartbeatID: PersonaHeartbeat.ID) {
+    func abort(_ heartbeatID: AgentHeartbeat.ID) {
         executionTasks[heartbeatID]?.task.cancel()
     }
 
     private func runDueHeartbeats() {
         let checkDate = Date()
         guard executionTasks.isEmpty else {
-            personaStore.deferDueHeartbeatsForOverlap(at: checkDate)
+            agentStore.deferDueHeartbeatsForOverlap(at: checkDate)
             return
         }
 
-        guard let heartbeat = personaStore.claimNextDueHeartbeat(at: checkDate) else { return }
+        guard let heartbeat = agentStore.claimNextDueHeartbeat(at: checkDate) else { return }
         startExecution(heartbeat)
     }
 
-    private func startExecution(_ heartbeat: PersonaHeartbeat) {
+    private func startExecution(_ heartbeat: AgentHeartbeat) {
         guard executionTasks[heartbeat.id] == nil else { return }
         guard executionTasks.isEmpty else {
-            personaStore.deferHeartbeatForOverlap(id: heartbeat.id, at: .now)
+            agentStore.deferHeartbeatForOverlap(id: heartbeat.id, at: .now)
             return
         }
 
         let executionToken = UUID()
         let runningHeartbeat = RunningHeartbeat(
             id: heartbeat.id,
-            personaID: heartbeat.personaID,
-            personaName: personaStore.persona(for: heartbeat.personaID)?.displayName ?? "Deleted persona",
+            agentID: heartbeat.agentID,
+            agentName: agentStore.agent(for: heartbeat.agentID)?.displayName ?? "Deleted agent",
             instruction: heartbeat.instruction.trimmingCharacters(in: .whitespacesAndNewlines),
             destination: chatStore.heartbeatDestinationDescription(for: heartbeat),
             startedAt: .now
@@ -357,9 +357,9 @@ final class HeartbeatScheduler: ObservableObject {
 
             timeoutTasks[heartbeat.id]?.task.cancel()
             timeoutTasks[heartbeat.id] = nil
-            personaStore.recordHeartbeatCompletion(
+            agentStore.recordHeartbeatCompletion(
                 heartbeatID: heartbeat.id,
-                personaID: heartbeat.personaID,
+                agentID: heartbeat.agentID,
                 report: report
             )
             executionTasks[heartbeat.id] = nil
@@ -383,7 +383,7 @@ final class HeartbeatScheduler: ObservableObject {
     }
 
     private func timeOut(
-        _ heartbeatID: PersonaHeartbeat.ID,
+        _ heartbeatID: AgentHeartbeat.ID,
         executionToken: UUID
     ) {
         guard let execution = executionTasks[heartbeatID],
@@ -398,12 +398,12 @@ final class HeartbeatScheduler: ObservableObject {
         runningHeartbeats.removeAll { $0.id == heartbeatID }
 
         let completionDate = Date()
-        personaStore.rescheduleHeartbeatAfterTimeout(id: heartbeatID, at: completionDate)
-        personaStore.recordHeartbeatCompletion(
+        agentStore.rescheduleHeartbeatAfterTimeout(id: heartbeatID, at: completionDate)
+        agentStore.recordHeartbeatCompletion(
             heartbeatID: heartbeatID,
-            personaID: runningHeartbeat.personaID,
+            agentID: runningHeartbeat.agentID,
             report: HeartbeatExecutionReport(
-                personaName: runningHeartbeat.personaName,
+                agentName: runningHeartbeat.agentName,
                 instruction: runningHeartbeat.instruction,
                 destination: runningHeartbeat.destination,
                 startedAt: runningHeartbeat.startedAt,

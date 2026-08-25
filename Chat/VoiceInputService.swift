@@ -570,7 +570,7 @@ enum VoiceInputError: LocalizedError {
         case .speechRecognitionRestricted:
             return "Speech recognition is restricted on this Mac."
         case .triggerPhraseMissing:
-            return "Set a voice phrase for this persona before starting voice mode."
+            return "Set a voice phrase for this agent before starting voice mode."
         }
     }
 }

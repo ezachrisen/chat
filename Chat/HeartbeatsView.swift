@@ -15,16 +15,16 @@ struct HeartbeatCommands: Commands {
 }
 
 struct HeartbeatsView: View {
-    @ObservedObject var personaStore: PersonaStore
+    @ObservedObject var agentStore: AgentStore
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
 
-    private var runningHeartbeatIDs: Set<PersonaHeartbeat.ID> {
+    private var runningHeartbeatIDs: Set<AgentHeartbeat.ID> {
         Set(heartbeatScheduler.runningHeartbeats.map(\.id))
     }
 
-    private var upcomingHeartbeats: [PersonaHeartbeat] {
-        personaStore.heartbeats
+    private var upcomingHeartbeats: [AgentHeartbeat] {
+        agentStore.heartbeats
             .filter {
                 $0.isEnabled
                     && $0.nextRunAt != nil
@@ -74,13 +74,13 @@ struct HeartbeatsView: View {
                 }
 
                 Section("Completed") {
-                    if personaStore.heartbeatRuns.isEmpty {
+                    if agentStore.heartbeatRuns.isEmpty {
                         EmptyHeartbeatRow(
                             title: "No completed heartbeats",
                             systemImage: "checkmark.circle"
                         )
                     } else {
-                        ForEach(personaStore.heartbeatRuns) { run in
+                        ForEach(agentStore.heartbeatRuns) { run in
                             CompletedHeartbeatRow(run: run)
                         }
                     }
@@ -92,19 +92,19 @@ struct HeartbeatsView: View {
         .frame(minWidth: 760, minHeight: 520)
     }
 
-    private func personaName(for heartbeat: PersonaHeartbeat) -> String {
-        personaStore.persona(for: heartbeat.personaID)?.displayName ?? "Deleted persona"
+    private func agentName(for heartbeat: AgentHeartbeat) -> String {
+        agentStore.agent(for: heartbeat.agentID)?.displayName ?? "Deleted agent"
     }
 
-    private func destination(for heartbeat: PersonaHeartbeat) -> String {
+    private func destination(for heartbeat: AgentHeartbeat) -> String {
         chatStore.heartbeatDestinationDescription(for: heartbeat)
     }
 
-    private func upcomingHeartbeatRow(_ heartbeat: PersonaHeartbeat) -> some View {
+    private func upcomingHeartbeatRow(_ heartbeat: AgentHeartbeat) -> some View {
         HStack(spacing: 8) {
             UpcomingHeartbeatRow(
                 heartbeat: heartbeat,
-                personaName: personaName(for: heartbeat),
+                agentName: agentName(for: heartbeat),
                 destination: destination(for: heartbeat)
             )
 
@@ -129,7 +129,7 @@ struct HeartbeatsView: View {
     }
 
     @ViewBuilder
-    private func upcomingHeartbeatActions(_ heartbeat: PersonaHeartbeat) -> some View {
+    private func upcomingHeartbeatActions(_ heartbeat: AgentHeartbeat) -> some View {
         Group {
             Button {
                 heartbeatScheduler.runNow(heartbeat.id)
@@ -155,8 +155,8 @@ struct HeartbeatsView: View {
 }
 
 private struct UpcomingHeartbeatRow: View {
-    let heartbeat: PersonaHeartbeat
-    let personaName: String
+    let heartbeat: AgentHeartbeat
+    let agentName: String
     let destination: String
 
     var body: some View {
@@ -165,7 +165,7 @@ private struct UpcomingHeartbeatRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 18)
 
-            Text(personaName)
+            Text(agentName)
                 .fontWeight(.medium)
                 .lineLimit(1)
                 .frame(width: 120, alignment: .leading)
@@ -206,7 +206,7 @@ private struct RunningHeartbeatRow: View {
                 .controlSize(.small)
                 .frame(width: 18)
 
-            Text(heartbeat.personaName)
+            Text(heartbeat.agentName)
                 .fontWeight(.medium)
                 .lineLimit(1)
                 .frame(width: 120, alignment: .leading)
@@ -281,7 +281,7 @@ private struct CompletedHeartbeatRow: View {
                     .foregroundStyle(run.succeeded ? .green : .orange)
                     .frame(width: 18)
 
-                Text(run.personaName)
+                Text(run.agentName)
                     .fontWeight(.medium)
                     .lineLimit(1)
                     .frame(width: 120, alignment: .leading)

@@ -7,7 +7,7 @@ import SwiftUI
 @main
 struct ChatApp: App {
     private let modelContainer: ModelContainer
-    @StateObject private var personaStore: PersonaStore
+    @StateObject private var agentStore: AgentStore
     @StateObject private var localModelStore: LocalModelStore
     @StateObject private var textToSpeechToolStore: TextToSpeechToolStore
     @StateObject private var chatStore: ChatStore
@@ -16,28 +16,19 @@ struct ChatApp: App {
 
     init() {
         do {
-            let container = try ModelContainer(
-                for: Persona.self,
-                PersonaHeartbeat.self,
-                HeartbeatRun.self,
-                LocalModel.self,
-                TextToSpeechTool.self,
-                StoredChat.self,
-                StoredGroupChatParticipant.self,
-                StoredChatMessage.self
-            )
-            let personaStore = PersonaStore(modelContext: container.mainContext)
+            let container = try ChatModelContainer.make()
+            let agentStore = AgentStore(modelContext: container.mainContext)
             let localModelStore = LocalModelStore(modelContext: container.mainContext)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: container.mainContext)
             let chatStore = ChatStore(
-                personaStore: personaStore,
+                agentStore: agentStore,
                 localModelStore: localModelStore,
                 modelContext: container.mainContext
             )
-            let heartbeatScheduler = HeartbeatScheduler(personaStore: personaStore, chatStore: chatStore)
+            let heartbeatScheduler = HeartbeatScheduler(agentStore: agentStore, chatStore: chatStore)
             let preferencesNavigation = PreferencesNavigation()
             modelContainer = container
-            _personaStore = StateObject(wrappedValue: personaStore)
+            _agentStore = StateObject(wrappedValue: agentStore)
             _localModelStore = StateObject(wrappedValue: localModelStore)
             _textToSpeechToolStore = StateObject(wrappedValue: textToSpeechToolStore)
             _chatStore = StateObject(wrappedValue: chatStore)
@@ -52,7 +43,7 @@ struct ChatApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(
-                personaStore: personaStore,
+                agentStore: agentStore,
                 textToSpeechToolStore: textToSpeechToolStore,
                 chatStore: chatStore
             )
@@ -60,7 +51,7 @@ struct ChatApp: App {
         }
         .commands {
 #if os(macOS)
-            PersonaCommands(navigation: preferencesNavigation)
+            AgentCommands(navigation: preferencesNavigation)
 #endif
             HeartbeatCommands()
             DeveloperCommands(chatStore: chatStore)
@@ -68,7 +59,7 @@ struct ChatApp: App {
 
         Window("Heartbeats", id: "heartbeats") {
             HeartbeatsView(
-                personaStore: personaStore,
+                agentStore: agentStore,
                 chatStore: chatStore,
                 heartbeatScheduler: heartbeatScheduler
             )
@@ -78,7 +69,7 @@ struct ChatApp: App {
 #if os(macOS)
         Settings {
             PreferencesView(
-                personaStore: personaStore,
+                agentStore: agentStore,
                 localModelStore: localModelStore,
                 textToSpeechToolStore: textToSpeechToolStore,
                 chatStore: chatStore,
@@ -91,29 +82,29 @@ struct ChatApp: App {
 }
 
 struct ContentView: View {
-    @ObservedObject private var personaStore: PersonaStore
+    @ObservedObject private var agentStore: AgentStore
     @ObservedObject private var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject private var chatStore: ChatStore
 
     init(
-        personaStore: PersonaStore,
+        agentStore: AgentStore,
         textToSpeechToolStore: TextToSpeechToolStore,
         chatStore: ChatStore
     ) {
-        self.personaStore = personaStore
+        self.agentStore = agentStore
         self.textToSpeechToolStore = textToSpeechToolStore
         self.chatStore = chatStore
     }
 
     var body: some View {
         NavigationSplitView {
-            ChatSidebar(personaStore: personaStore, chatStore: chatStore)
+            ChatSidebar(agentStore: agentStore, chatStore: chatStore)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 280)
         } detail: {
             if let chat = chatStore.selectedChat {
                 ChatDetailView(
                     chat: chat,
-                    personaStore: personaStore,
+                    agentStore: agentStore,
                     textToSpeechToolStore: textToSpeechToolStore
                 )
             } else {
@@ -128,9 +119,9 @@ struct ContentView: View {
 }
 
 struct ChatSidebar: View {
-    @ObservedObject var personaStore: PersonaStore
+    @ObservedObject var agentStore: AgentStore
     @ObservedObject var chatStore: ChatStore
-    @State private var collapsedPersonaIDs: Set<Persona.ID> = []
+    @State private var collapsedAgentIDs: Set<Agent.ID> = []
     @State private var groupChatsAreCollapsed = false
     @State private var chatBeingRenamed: ChatViewModel?
     @State private var renameDraft = ""
@@ -161,21 +152,21 @@ struct ChatSidebar: View {
                         }
                     }
 
-                    ForEach(personaStore.personas) { persona in
-                        let chats = chatStore.chats(for: persona.id)
+                    ForEach(agentStore.agents) { agent in
+                        let chats = chatStore.chats(for: agent.id)
 
                         if !chats.isEmpty {
-                            PersonaProjectSection(
-                                persona: persona,
+                            AgentProjectSection(
+                                agent: agent,
                                 chats: chats,
                                 selectedChatID: $chatStore.selectedChatID,
-                                isCollapsed: collapsedPersonaIDs.contains(persona.id),
+                                isCollapsed: collapsedAgentIDs.contains(agent.id),
                                 onRenameChat: beginRenaming,
                                 onNewChat: {
-                                    startChat(with: persona)
+                                    startChat(with: agent)
                                 }
                             ) {
-                                togglePersona(persona.id)
+                                toggleAgent(agent.id)
                             }
                         }
                     }
@@ -200,17 +191,17 @@ struct ChatSidebar: View {
         renameAlertIsPresented = true
     }
 
-    private func togglePersona(_ personaID: Persona.ID) {
-        if collapsedPersonaIDs.contains(personaID) {
-            collapsedPersonaIDs.remove(personaID)
+    private func toggleAgent(_ agentID: Agent.ID) {
+        if collapsedAgentIDs.contains(agentID) {
+            collapsedAgentIDs.remove(agentID)
         } else {
-            collapsedPersonaIDs.insert(personaID)
+            collapsedAgentIDs.insert(agentID)
         }
     }
 
-    private func startChat(with persona: Persona) {
-        collapsedPersonaIDs.remove(persona.id)
-        chatStore.startChat(with: persona)
+    private func startChat(with agent: Agent) {
+        collapsedAgentIDs.remove(agent.id)
+        chatStore.startChat(with: agent)
     }
 
     @ViewBuilder
@@ -222,12 +213,12 @@ struct ChatSidebar: View {
                 Label("Group chat", systemImage: "person.2")
             }
 
-            if !personaStore.personas.isEmpty {
+            if !agentStore.agents.isEmpty {
                 Divider()
 
-                ForEach(personaStore.personas) { persona in
-                    Button(persona.displayName) {
-                        startChat(with: persona)
+                ForEach(agentStore.agents) { agent in
+                    Button(agent.displayName) {
+                        startChat(with: agent)
                     }
                 }
             }
@@ -257,8 +248,8 @@ struct NewChatLabel: View {
     }
 }
 
-struct PersonaProjectSection: View {
-    let persona: Persona
+struct AgentProjectSection: View {
+    let agent: Agent
     let chats: [ChatViewModel]
     @Binding var selectedChatID: ChatViewModel.ID?
     let isCollapsed: Bool
@@ -276,7 +267,7 @@ struct PersonaProjectSection: View {
                             .font(.body)
                             .frame(width: 20, height: 20)
 
-                        Text(persona.displayName)
+                        Text(agent.displayName)
                             .font(.body)
                             .lineLimit(1)
 
@@ -303,7 +294,7 @@ struct PersonaProjectSection: View {
                     }
                     .buttonStyle(.plain)
                     .padding(.trailing, 6)
-                    .help("New chat with \(persona.displayName)")
+                    .help("New chat with \(agent.displayName)")
                     .transition(.opacity)
                 }
             }
@@ -422,7 +413,7 @@ struct ChatDetailView: View {
     private static let voiceGenerationIndicatorID = UUID()
 
     @ObservedObject var chat: ChatViewModel
-    @ObservedObject var personaStore: PersonaStore
+    @ObservedObject var agentStore: AgentStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @StateObject private var voiceInput = VoiceInputService()
     @StateObject private var voicePlayback = TextToSpeechPlaybackService()
@@ -454,7 +445,7 @@ struct ChatDetailView: View {
                     ScrollView {
                         LazyVStack(spacing: 14) {
                             if chat.isGroupChat, chat.messages.isEmpty {
-                                GroupChatEmptyState(mentions: chat.availablePersonaMentions)
+                                GroupChatEmptyState(mentions: chat.availableAgentMentions)
                             }
 
                             ForEach(chat.messages) { message in
@@ -503,7 +494,7 @@ struct ChatDetailView: View {
                             }
 
                             if chat.isResponding {
-                                TypingBubble(personaName: chat.respondingPersonaName)
+                                TypingBubble(agentName: chat.respondingAgentName)
                                     .id(ChatViewModel.typingIndicatorID)
                             }
                         }
@@ -740,7 +731,7 @@ struct ChatDetailView: View {
             return "Reading replies; click to turn off"
         }
         if !replyReadingIsConfigured {
-            return "Configure a voice tool, voice name, and model for this persona"
+            return "Configure a voice tool, voice name, and model for this agent"
         }
         return voiceInput.isActive
             ? "Switch to reading replies without dictation"
@@ -752,11 +743,11 @@ struct ChatDetailView: View {
         case .idle:
             if voiceTriggerPhrases.isEmpty {
                 return chat.isGroupChat
-                    ? "Set a Voice phrase for a persona in this chat"
-                    : "Set a phrase in this persona's Voice settings"
+                    ? "Set a Voice phrase for an agent in this chat"
+                    : "Set a phrase in this agent's Voice settings"
             }
             if !replyReadingIsConfigured {
-                return "Configure a voice tool, voice name, and model for this persona"
+                return "Configure a voice tool, voice name, and model for this agent"
             }
             return readRepliesOnlyIsEnabled
                 ? "Switch to complete voice mode; \(waitingForVoicePhraseHelp.lowercased())"
@@ -785,19 +776,19 @@ struct ChatDetailView: View {
         if voiceTriggerPhrases.count == 1, let phrase = voiceTriggerPhrases.first {
             return "Listening for “\(phrase)”"
         }
-        return "Listening for any configured persona phrase"
+        return "Listening for any configured agent phrase"
     }
 
-    private var voicePersonaIDs: Set<Persona.ID> {
+    private var voiceAgentIDs: Set<Agent.ID> {
         chat.isGroupChat
-            ? Set(chat.groupParticipants.map(\.personaID))
-            : [chat.personaID]
+            ? Set(chat.groupParticipants.map(\.agentID))
+            : [chat.agentID]
     }
 
     private var voiceTriggerPhrases: [String] {
         var normalizedPhrases = Set<String>()
-        return personaStore.personas
-            .filter { voicePersonaIDs.contains($0.id) }
+        return agentStore.agents
+            .filter { voiceAgentIDs.contains($0.id) }
             .flatMap(\.voiceTriggerPhrases)
             .filter { phrase in
                 let normalizedPhrase = phrase.folding(
@@ -814,8 +805,8 @@ struct ChatDetailView: View {
     }
 
     private var replyReadingIsConfigured: Bool {
-        personaStore.personas
-            .filter { voicePersonaIDs.contains($0.id) }
+        agentStore.agents
+            .filter { voiceAgentIDs.contains($0.id) }
             .contains { textToSpeechToolStore.playbackConfiguration(for: $0) != nil }
     }
 
@@ -948,20 +939,20 @@ struct ChatDetailView: View {
 
         for message in newMessages
         where message.role == .assistant && message.createdAt >= automaticReplyReadingStartedAt {
-            guard let personaID = message.authorPersonaID ?? (chat.isGroupChat ? nil : chat.personaID),
-                  let persona = personaStore.persona(for: personaID),
-                  let configuration = textToSpeechToolStore.playbackConfiguration(for: persona) else {
+            guard let agentID = message.authorAgentID ?? (chat.isGroupChat ? nil : chat.agentID),
+                  let agent = agentStore.agent(for: agentID),
+                  let configuration = textToSpeechToolStore.playbackConfiguration(for: agent) else {
                 continue
             }
 
-            let personaName = persona.displayName
+            let agentName = agent.displayName
             VoiceChimePlayer.shared.play(.responseReady)
             voicePlayback.enqueue(
                 messageID: message.id,
                 text: message.text,
                 configuration: configuration
             ) { error in
-                voiceErrorMessage = "Could not play \(personaName)'s response. \(error.localizedDescription)"
+                voiceErrorMessage = "Could not play \(agentName)'s response. \(error.localizedDescription)"
             }
         }
     }
@@ -1180,7 +1171,7 @@ struct AudioPlaybackTimeline: View {
 }
 
 struct TypingBubble: View {
-    let personaName: String?
+    let agentName: String?
 
     var body: some View {
         HStack {
@@ -1188,7 +1179,7 @@ struct TypingBubble: View {
                 ProgressView()
                     .controlSize(.small)
 
-                Text(personaName.map { "\($0) is thinking" } ?? "Thinking")
+                Text(agentName.map { "\($0) is thinking" } ?? "Thinking")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -1272,7 +1263,7 @@ struct GroupChatConfigurationView: View {
                         .scrollContentBackground(.hidden)
                         .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
-                    Text("These instructions are sent with each persona's individual instructions.")
+                    Text("These instructions are sent with each agent's individual instructions.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1315,21 +1306,21 @@ struct GroupChatEmptyState: View {
 
     private var emptyStateDescription: String {
         guard !mentions.isEmpty else {
-            return "Create a persona, then mention them in your first message."
+            return "Create an agent, then mention them in your first message."
         }
-        return "Mention personas in your first message, such as \(mentions.prefix(2).joined(separator: " and "))."
+        return "Mention agents in your first message, such as \(mentions.prefix(2).joined(separator: " and "))."
     }
 }
 
 #if os(macOS)
-struct PersonaCommands: Commands {
+struct AgentCommands: Commands {
     @ObservedObject var navigation: PreferencesNavigation
     @Environment(\.openSettings) private var openSettings
 
     var body: some Commands {
         CommandGroup(after: .pasteboard) {
-            Button("Personas") {
-                navigation.selection = .personas
+            Button("Agents") {
+                navigation.selection = .agents
                 openSettings()
             }
         }
@@ -1356,169 +1347,169 @@ struct DeveloperCommands: Commands {
 }
 
 @MainActor
-final class PersonaStore: ObservableObject {
-    @Published private(set) var personas: [Persona] = []
-    @Published private(set) var heartbeats: [PersonaHeartbeat] = []
+final class AgentStore: ObservableObject {
+    @Published private(set) var agents: [Agent] = []
+    @Published private(set) var heartbeats: [AgentHeartbeat] = []
     @Published private(set) var heartbeatRuns: [HeartbeatRun] = []
-    @Published var selectedPersonaID: Persona.ID?
+    @Published var selectedAgentID: Agent.ID?
 
     private let modelContext: ModelContext
 
-    var selectedPersona: Persona? {
-        guard let selectedPersonaID else { return nil }
-        return personas.first { $0.id == selectedPersonaID }
+    var selectedAgent: Agent? {
+        guard let selectedAgentID else { return nil }
+        return agents.first { $0.id == selectedAgentID }
     }
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
-        loadPersonas()
+        loadAgents()
         loadHeartbeats()
         loadHeartbeatRuns()
     }
 
-    func addPersona() {
-        let persona = Persona(name: "", soul: "")
-        modelContext.insert(persona)
+    func addAgent() {
+        let agent = Agent(name: "", soul: "")
+        modelContext.insert(agent)
         saveChanges()
-        loadPersonas(selecting: persona.id)
+        loadAgents(selecting: agent.id)
     }
 
-    func removeSelectedPersona() {
-        guard let selectedPersonaID,
-              let index = personas.firstIndex(where: { $0.id == selectedPersonaID }) else {
+    func removeSelectedAgent() {
+        guard let selectedAgentID,
+              let index = agents.firstIndex(where: { $0.id == selectedAgentID }) else {
             return
         }
 
-        let nextSelection: Persona.ID?
-        if personas.count <= 1 {
+        let nextSelection: Agent.ID?
+        if agents.count <= 1 {
             nextSelection = nil
         } else {
-            let nextIndex = min(index, personas.count - 2)
-            nextSelection = personas[nextIndex == index ? index + 1 : nextIndex].id
+            let nextIndex = min(index, agents.count - 2)
+            nextSelection = agents[nextIndex == index ? index + 1 : nextIndex].id
         }
 
-        let heartbeatsToDelete = heartbeats.filter { $0.personaID == selectedPersonaID }
+        let heartbeatsToDelete = heartbeats.filter { $0.agentID == selectedAgentID }
         for heartbeat in heartbeatsToDelete {
             modelContext.delete(heartbeat)
         }
-        heartbeats.removeAll { $0.personaID == selectedPersonaID }
-        modelContext.delete(personas[index])
+        heartbeats.removeAll { $0.agentID == selectedAgentID }
+        modelContext.delete(agents[index])
         saveChanges()
-        loadPersonas(selecting: nextSelection)
+        loadAgents(selecting: nextSelection)
     }
 
-    func updatePersonaName(id: Persona.ID, name: String) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentName(id: Agent.ID, name: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        persona.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        saveChanges()
-        objectWillChange.send()
-    }
-
-    func updatePersonaSoul(id: Persona.ID, soul: String) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
-
-        persona.soul = soul
+        agent.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         saveChanges()
         objectWillChange.send()
     }
 
-    func updatePersonaMemory(id: Persona.ID, memory: String) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentSoul(id: Agent.ID, soul: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        persona.memory = memory
+        agent.soul = soul
         saveChanges()
         objectWillChange.send()
     }
 
-    func updatePersonaVoiceTriggerPhrases(id: Persona.ID, phrasesText: String) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentMemory(id: Agent.ID, memory: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        persona.voiceTriggerPhrase = phrasesText
+        agent.memory = memory
         saveChanges()
         objectWillChange.send()
     }
 
-    func updatePersonaTextToSpeechTool(id: Persona.ID, toolID: TextToSpeechTool.ID?) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentVoiceTriggerPhrases(id: Agent.ID, phrasesText: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        persona.textToSpeechToolID = toolID
+        agent.voiceTriggerPhrase = phrasesText
         saveChanges()
         objectWillChange.send()
     }
 
-    func updatePersonaTextToSpeechVoiceName(id: Persona.ID, voiceName: String) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentTextToSpeechTool(id: Agent.ID, toolID: TextToSpeechTool.ID?) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        persona.textToSpeechVoiceName = voiceName
+        agent.textToSpeechToolID = toolID
         saveChanges()
         objectWillChange.send()
     }
 
-    func updatePersonaTextToSpeechVoiceModel(id: Persona.ID, voiceModel: String) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentTextToSpeechVoiceName(id: Agent.ID, voiceName: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        persona.textToSpeechVoiceModel = voiceModel
+        agent.textToSpeechVoiceName = voiceName
         saveChanges()
         objectWillChange.send()
     }
 
-    func appendPersonaMemoryEntries(id: Persona.ID, entries: [String]) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentTextToSpeechVoiceModel(id: Agent.ID, voiceModel: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
+
+        agent.textToSpeechVoiceModel = voiceModel
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func appendAgentMemoryEntries(id: Agent.ID, entries: [String]) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
         let newEntries = entries
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !newEntries.isEmpty else { return }
 
-        let existingMemory = (persona.memory ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let existingMemory = (agent.memory ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let appendedMemory = newEntries.joined(separator: "\n\n")
-        persona.memory = existingMemory.isEmpty
+        agent.memory = existingMemory.isEmpty
             ? appendedMemory
             : "\(existingMemory)\n\n\(appendedMemory)"
         saveChanges()
         objectWillChange.send()
     }
 
-    func updatePersonaModelIdentifier(id: Persona.ID, modelIdentifier: String) {
-        guard let persona = personas.first(where: { $0.id == id }) else { return }
+    func updateAgentModelIdentifier(id: Agent.ID, modelIdentifier: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        persona.modelIdentifier = modelIdentifier
+        agent.modelIdentifier = modelIdentifier
         saveChanges()
         objectWillChange.send()
     }
 
-    func persona(for id: Persona.ID) -> Persona? {
-        personas.first { $0.id == id }
+    func agent(for id: Agent.ID) -> Agent? {
+        agents.first { $0.id == id }
     }
 
-    func heartbeats(for personaID: Persona.ID) -> [PersonaHeartbeat] {
-        heartbeats.filter { $0.personaID == personaID }
+    func heartbeats(for agentID: Agent.ID) -> [AgentHeartbeat] {
+        heartbeats.filter { $0.agentID == agentID }
     }
 
-    func addHeartbeat(to personaID: Persona.ID) {
-        let heartbeat = PersonaHeartbeat(personaID: personaID)
+    func addHeartbeat(to agentID: Agent.ID) {
+        let heartbeat = AgentHeartbeat(agentID: agentID)
         modelContext.insert(heartbeat)
         heartbeats.append(heartbeat)
         saveChanges()
         objectWillChange.send()
     }
 
-    func removeHeartbeat(_ heartbeat: PersonaHeartbeat) {
+    func removeHeartbeat(_ heartbeat: AgentHeartbeat) {
         modelContext.delete(heartbeat)
         heartbeats.removeAll { $0.id == heartbeat.id }
         saveChanges()
         objectWillChange.send()
     }
 
-    func updateHeartbeatInstruction(_ heartbeat: PersonaHeartbeat, instruction: String) {
+    func updateHeartbeatInstruction(_ heartbeat: AgentHeartbeat, instruction: String) {
         heartbeat.instruction = instruction
         heartbeat.lastError = nil
         saveChanges()
         objectWillChange.send()
     }
 
-    func updateHeartbeatInterval(_ heartbeat: PersonaHeartbeat, minutes: Int) {
+    func updateHeartbeatInterval(_ heartbeat: AgentHeartbeat, minutes: Int) {
         heartbeat.intervalMinutes = min(max(minutes, 1), 10_080)
         if heartbeat.isEnabled {
             heartbeat.nextRunAt = Date().addingTimeInterval(TimeInterval(heartbeat.intervalMinutes * 60))
@@ -1527,7 +1518,7 @@ final class PersonaStore: ObservableObject {
         objectWillChange.send()
     }
 
-    func updateHeartbeatEnabled(_ heartbeat: PersonaHeartbeat, isEnabled: Bool) {
+    func updateHeartbeatEnabled(_ heartbeat: AgentHeartbeat, isEnabled: Bool) {
         heartbeat.isEnabled = isEnabled
         heartbeat.nextRunAt = isEnabled
             ? Date().addingTimeInterval(TimeInterval(heartbeat.normalizedIntervalMinutes * 60))
@@ -1538,7 +1529,7 @@ final class PersonaStore: ObservableObject {
     }
 
     func updateHeartbeatDestination(
-        _ heartbeat: PersonaHeartbeat,
+        _ heartbeat: AgentHeartbeat,
         targetKind: HeartbeatTargetKind,
         targetChatID: UUID?
     ) {
@@ -1550,7 +1541,7 @@ final class PersonaStore: ObservableObject {
     }
 
     func updateHeartbeatModelIdentifier(
-        _ heartbeat: PersonaHeartbeat,
+        _ heartbeat: AgentHeartbeat,
         modelIdentifier: String?
     ) {
         heartbeat.modelIdentifier = modelIdentifier
@@ -1559,7 +1550,7 @@ final class PersonaStore: ObservableObject {
         objectWillChange.send()
     }
 
-    func claimNextDueHeartbeat(at date: Date) -> PersonaHeartbeat? {
+    func claimNextDueHeartbeat(at date: Date) -> AgentHeartbeat? {
         let dueHeartbeats = heartbeats
             .filter { heartbeat in
                 heartbeat.isEnabled && (heartbeat.nextRunAt ?? .distantFuture) <= date
@@ -1612,7 +1603,7 @@ final class PersonaStore: ObservableObject {
         objectWillChange.send()
     }
 
-    func deferHeartbeatForOverlap(id: PersonaHeartbeat.ID, at date: Date) {
+    func deferHeartbeatForOverlap(id: AgentHeartbeat.ID, at date: Date) {
         guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
             return
         }
@@ -1622,7 +1613,7 @@ final class PersonaStore: ObservableObject {
         objectWillChange.send()
     }
 
-    func skipHeartbeat(id: PersonaHeartbeat.ID, at date: Date) {
+    func skipHeartbeat(id: AgentHeartbeat.ID, at date: Date) {
         guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
             return
         }
@@ -1637,9 +1628,9 @@ final class PersonaStore: ObservableObject {
     }
 
     func claimHeartbeatForImmediateRun(
-        id: PersonaHeartbeat.ID,
+        id: AgentHeartbeat.ID,
         at date: Date
-    ) -> PersonaHeartbeat? {
+    ) -> AgentHeartbeat? {
         guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
             return nil
         }
@@ -1654,7 +1645,7 @@ final class PersonaStore: ObservableObject {
         return heartbeat
     }
 
-    func rescheduleHeartbeatAfterTimeout(id: PersonaHeartbeat.ID, at date: Date) {
+    func rescheduleHeartbeatAfterTimeout(id: AgentHeartbeat.ID, at date: Date) {
         guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
             return
         }
@@ -1667,8 +1658,8 @@ final class PersonaStore: ObservableObject {
     }
 
     func recordHeartbeatCompletion(
-        heartbeatID: PersonaHeartbeat.ID,
-        personaID: Persona.ID,
+        heartbeatID: AgentHeartbeat.ID,
+        agentID: Agent.ID,
         report: HeartbeatExecutionReport
     ) {
         if let heartbeat = heartbeats.first(where: { $0.id == heartbeatID }) {
@@ -1681,8 +1672,8 @@ final class PersonaStore: ObservableObject {
 
         let run = HeartbeatRun(
             heartbeatID: heartbeatID,
-            personaID: personaID,
-            personaName: report.personaName,
+            agentID: agentID,
+            agentName: report.agentName,
             instruction: report.instruction,
             destination: report.destination,
             startedAt: report.startedAt,
@@ -1698,39 +1689,39 @@ final class PersonaStore: ObservableObject {
         objectWillChange.send()
     }
 
-    private func deferHeartbeatByInterval(_ heartbeat: PersonaHeartbeat, from date: Date) {
+    private func deferHeartbeatByInterval(_ heartbeat: AgentHeartbeat, from date: Date) {
         heartbeat.nextRunAt = date.addingTimeInterval(
             TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
         )
     }
 
-    private func loadPersonas(selecting selection: Persona.ID? = nil) {
-        let descriptor = FetchDescriptor<Persona>(
+    private func loadAgents(selecting selection: Agent.ID? = nil) {
+        let descriptor = FetchDescriptor<Agent>(
             sortBy: [SortDescriptor(\.createdAt)]
         )
 
         do {
-            personas = try modelContext.fetch(descriptor)
+            agents = try modelContext.fetch(descriptor)
         } catch {
-            personas = []
+            agents = []
         }
 
-        if personas.isEmpty {
-            let persona = Persona(name: "Default", soul: "You are a concise, very quirky and goofy assistant inside a simple chat app.")
-            modelContext.insert(persona)
+        if agents.isEmpty {
+            let agent = Agent(name: "Default", soul: "You are a concise, very quirky and goofy assistant inside a simple chat app.")
+            modelContext.insert(agent)
             saveChanges()
-            personas = [persona]
+            agents = [agent]
         }
 
-        selectedPersonaID = selection.flatMap { selectedID in
-            personas.contains { $0.id == selectedID } ? selectedID : nil
-        } ?? selectedPersonaID.flatMap { selectedID in
-            personas.contains { $0.id == selectedID } ? selectedID : nil
-        } ?? personas.first?.id
+        selectedAgentID = selection.flatMap { selectedID in
+            agents.contains { $0.id == selectedID } ? selectedID : nil
+        } ?? selectedAgentID.flatMap { selectedID in
+            agents.contains { $0.id == selectedID } ? selectedID : nil
+        } ?? agents.first?.id
     }
 
     private func loadHeartbeats() {
-        let descriptor = FetchDescriptor<PersonaHeartbeat>(
+        let descriptor = FetchDescriptor<AgentHeartbeat>(
             sortBy: [SortDescriptor(\.createdAt)]
         )
 
@@ -1774,13 +1765,13 @@ final class PersonaStore: ObservableObject {
         do {
             try modelContext.save()
         } catch {
-            assertionFailure("Failed to save personas: \(error.localizedDescription)")
+            assertionFailure("Failed to save agents: \(error.localizedDescription)")
         }
     }
 }
 
 @Model
-final class Persona: Identifiable {
+final class Agent: Identifiable {
     @Attribute(.unique) var id: UUID
     var name: String
     var soul: String
@@ -1817,7 +1808,7 @@ final class Persona: Identifiable {
     }
 
     var displayName: String {
-        name.isEmpty ? "Untitled Persona" : name
+        name.isEmpty ? "Untitled Agent" : name
     }
 
     var selectedModelIdentifier: String {
@@ -1849,10 +1840,10 @@ final class Persona: Identifiable {
 @Model
 final class StoredChat: Identifiable {
     @Attribute(.unique) var id: UUID
-    var personaID: UUID
-    var personaName: String
-    var personaSoul: String
-    var personaModelIdentifier: String?
+    @Attribute(originalName: "personaID") var agentID: UUID
+    @Attribute(originalName: "personaName") var agentName: String
+    @Attribute(originalName: "personaSoul") var agentSoul: String
+    @Attribute(originalName: "personaModelIdentifier") var agentModelIdentifier: String?
     var kindRawValue: String?
     var groupSystemInstructions: String?
     var title: String
@@ -1861,10 +1852,10 @@ final class StoredChat: Identifiable {
 
     init(
         id: UUID = UUID(),
-        personaID: UUID,
-        personaName: String,
-        personaSoul: String,
-        personaModelIdentifier: String? = nil,
+        agentID: UUID,
+        agentName: String,
+        agentSoul: String,
+        agentModelIdentifier: String? = nil,
         kind: ChatKind = .direct,
         groupSystemInstructions: String? = nil,
         title: String = "New chat",
@@ -1872,10 +1863,10 @@ final class StoredChat: Identifiable {
         updatedAt: Date = .now
     ) {
         self.id = id
-        self.personaID = personaID
-        self.personaName = personaName
-        self.personaSoul = personaSoul
-        self.personaModelIdentifier = personaModelIdentifier
+        self.agentID = agentID
+        self.agentName = agentName
+        self.agentSoul = agentSoul
+        self.agentModelIdentifier = agentModelIdentifier
         kindRawValue = kind.rawValue
         self.groupSystemInstructions = groupSystemInstructions
         self.title = title
@@ -1894,7 +1885,7 @@ final class StoredChatMessage: Identifiable {
     var chatID: UUID
     var roleRawValue: String
     var text: String
-    var authorPersonaID: UUID?
+    @Attribute(originalName: "authorPersonaID") var authorAgentID: UUID?
     var authorName: String?
     var createdAt: Date
 
@@ -1903,7 +1894,7 @@ final class StoredChatMessage: Identifiable {
         chatID: UUID,
         role: ChatRole,
         text: String,
-        authorPersonaID: UUID? = nil,
+        authorAgentID: UUID? = nil,
         authorName: String? = nil,
         createdAt: Date = .now
     ) {
@@ -1911,7 +1902,7 @@ final class StoredChatMessage: Identifiable {
         self.chatID = chatID
         self.roleRawValue = role.rawValue
         self.text = text
-        self.authorPersonaID = authorPersonaID
+        self.authorAgentID = authorAgentID
         self.authorName = authorName
         self.createdAt = createdAt
     }
@@ -1929,7 +1920,7 @@ final class ChatStore: ObservableObject {
     @Published var selectedChatID: ChatViewModel.ID?
 
     private let modelContext: ModelContext
-    private let personaStore: PersonaStore
+    private let agentStore: AgentStore
     private let localModelStore: LocalModelStore
 
     var selectedChat: ChatViewModel? {
@@ -1937,39 +1928,39 @@ final class ChatStore: ObservableObject {
         return chats.first { $0.id == selectedChatID }
     }
 
-    init(personaStore: PersonaStore, localModelStore: LocalModelStore, modelContext: ModelContext) {
+    init(agentStore: AgentStore, localModelStore: LocalModelStore, modelContext: ModelContext) {
         self.modelContext = modelContext
-        self.personaStore = personaStore
+        self.agentStore = agentStore
         self.localModelStore = localModelStore
         loadChats()
 
-        if chats.isEmpty, let persona = personaStore.personas.first {
-            startChat(with: persona)
+        if chats.isEmpty, let agent = agentStore.agents.first {
+            startChat(with: agent)
         } else {
             selectedChatID = chats.first?.id
         }
     }
 
-    func startChat(with persona: Persona) {
-        let chat = makeDirectChat(with: persona)
+    func startChat(with agent: Agent) {
+        let chat = makeDirectChat(with: agent)
         selectedChatID = chat.id
     }
 
-    private func makeDirectChat(with persona: Persona) -> ChatViewModel {
+    private func makeDirectChat(with agent: Agent) -> ChatViewModel {
         let storedChat = StoredChat(
-            personaID: persona.id,
-            personaName: persona.displayName,
-            personaSoul: persona.soul,
-            personaModelIdentifier: persona.selectedModelIdentifier
+            agentID: agent.id,
+            agentName: agent.displayName,
+            agentSoul: agent.soul,
+            agentModelIdentifier: agent.selectedModelIdentifier
         )
         modelContext.insert(storedChat)
 
         let greeting = StoredChatMessage(
             chatID: storedChat.id,
             role: .assistant,
-            text: "New chat with \(persona.displayName). What would you like to ask?",
-            authorPersonaID: persona.id,
-            authorName: persona.displayName
+            text: "New chat with \(agent.displayName). What would you like to ask?",
+            authorAgentID: agent.id,
+            authorName: agent.displayName
         )
         modelContext.insert(greeting)
         saveChanges()
@@ -1978,7 +1969,7 @@ final class ChatStore: ObservableObject {
             storedChat: storedChat,
             storedMessages: [greeting],
             storedGroupParticipants: [],
-            personaStore: personaStore,
+            agentStore: agentStore,
             localModelStore: localModelStore,
             modelContext: modelContext
         )
@@ -1988,9 +1979,9 @@ final class ChatStore: ObservableObject {
 
     func startGroupChat() {
         let storedChat = StoredChat(
-            personaID: UUID(),
-            personaName: "Group chat",
-            personaSoul: "",
+            agentID: UUID(),
+            agentName: "Group chat",
+            agentSoul: "",
             kind: .group,
             groupSystemInstructions: "",
             title: "Untitled chat"
@@ -2002,7 +1993,7 @@ final class ChatStore: ObservableObject {
             storedChat: storedChat,
             storedMessages: [],
             storedGroupParticipants: [],
-            personaStore: personaStore,
+            agentStore: agentStore,
             localModelStore: localModelStore,
             modelContext: modelContext
         )
@@ -2010,8 +2001,8 @@ final class ChatStore: ObservableObject {
         selectedChatID = chat.id
     }
 
-    func chats(for personaID: Persona.ID) -> [ChatViewModel] {
-        chats.filter { !$0.isGroupChat && $0.personaID == personaID }
+    func chats(for agentID: Agent.ID) -> [ChatViewModel] {
+        chats.filter { !$0.isGroupChat && $0.agentID == agentID }
     }
 
     var groupChats: [ChatViewModel] {
@@ -2027,17 +2018,17 @@ final class ChatStore: ObservableObject {
     }
 
     func executeHeartbeat(
-        _ heartbeat: PersonaHeartbeat,
+        _ heartbeat: AgentHeartbeat,
         onModelInput: ((String) -> Void)? = nil,
         onModelResponseAccepted: (() -> Void)? = nil
     ) async -> HeartbeatExecutionReport {
         let startedAt = Date()
-        let fallbackPersonaName = "Deleted persona"
+        let fallbackAgentName = "Deleted agent"
         let instruction = heartbeat.instruction.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if Task.isCancelled {
             return failedHeartbeatReport(
-                personaName: personaStore.persona(for: heartbeat.personaID)?.displayName ?? fallbackPersonaName,
+                agentName: agentStore.agent(for: heartbeat.agentID)?.displayName ?? fallbackAgentName,
                 instruction: instruction,
                 destination: heartbeatDestinationDescription(for: heartbeat),
                 startedAt: startedAt,
@@ -2050,19 +2041,19 @@ final class ChatStore: ObservableObject {
             )
         }
 
-        guard let persona = personaStore.persona(for: heartbeat.personaID) else {
+        guard let agent = agentStore.agent(for: heartbeat.agentID) else {
             return failedHeartbeatReport(
-                personaName: fallbackPersonaName,
+                agentName: fallbackAgentName,
                 instruction: instruction,
                 destination: heartbeatDestinationDescription(for: heartbeat),
                 startedAt: startedAt,
-                error: HeartbeatExecutionError.personaMissing
+                error: HeartbeatExecutionError.agentMissing
             )
         }
 
         guard !instruction.isEmpty else {
             return failedHeartbeatReport(
-                personaName: persona.displayName,
+                agentName: agent.displayName,
                 instruction: instruction,
                 destination: heartbeatDestinationDescription(for: heartbeat),
                 startedAt: startedAt,
@@ -2074,14 +2065,14 @@ final class ChatStore: ObservableObject {
         switch heartbeat.targetKind {
         case .privateChat:
             targetChat = chats
-                .filter { !$0.isGroupChat && $0.personaID == persona.id }
+                .filter { !$0.isGroupChat && $0.agentID == agent.id }
                 .max { $0.updatedAt < $1.updatedAt }
-                ?? makeDirectChat(with: persona)
+                ?? makeDirectChat(with: agent)
         case .groupChat:
             guard let targetChatID = heartbeat.targetChatID,
                   let groupChat = chats.first(where: { $0.id == targetChatID && $0.isGroupChat }) else {
                 return failedHeartbeatReport(
-                    personaName: persona.displayName,
+                    agentName: agent.displayName,
                     instruction: instruction,
                     destination: heartbeatDestinationDescription(for: heartbeat),
                     startedAt: startedAt,
@@ -2092,10 +2083,10 @@ final class ChatStore: ObservableObject {
         }
 
         let destination = targetChat.heartbeatDestinationDescription
-        let modelIdentifier = heartbeat.modelIdentifier ?? persona.selectedModelIdentifier
+        let modelIdentifier = heartbeat.modelIdentifier ?? agent.selectedModelIdentifier
         do {
             let exchange = try await targetChat.executeHeartbeat(
-                as: persona,
+                as: agent,
                 instruction: instruction,
                 modelIdentifier: modelIdentifier,
                 lastCompletedAt: heartbeat.lastCompletedAt,
@@ -2104,7 +2095,7 @@ final class ChatStore: ObservableObject {
                 onModelResponseAccepted: onModelResponseAccepted
             )
             return HeartbeatExecutionReport(
-                personaName: persona.displayName,
+                agentName: agent.displayName,
                 instruction: instruction,
                 destination: destination,
                 startedAt: startedAt,
@@ -2117,7 +2108,7 @@ final class ChatStore: ObservableObject {
             )
         } catch let error as HeartbeatModelFailure {
             return failedHeartbeatReport(
-                personaName: persona.displayName,
+                agentName: agent.displayName,
                 instruction: instruction,
                 destination: destination,
                 startedAt: startedAt,
@@ -2127,7 +2118,7 @@ final class ChatStore: ObservableObject {
             )
         } catch {
             return failedHeartbeatReport(
-                personaName: persona.displayName,
+                agentName: agent.displayName,
                 instruction: instruction,
                 destination: destination,
                 startedAt: startedAt,
@@ -2136,11 +2127,11 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    func heartbeatDestinationDescription(for heartbeat: PersonaHeartbeat) -> String {
+    func heartbeatDestinationDescription(for heartbeat: AgentHeartbeat) -> String {
         switch heartbeat.targetKind {
         case .privateChat:
             guard let chat = chats
-                .filter({ !$0.isGroupChat && $0.personaID == heartbeat.personaID })
+                .filter({ !$0.isGroupChat && $0.agentID == heartbeat.agentID })
                 .max(by: { $0.updatedAt < $1.updatedAt }) else {
                 return "New private chat"
             }
@@ -2155,7 +2146,7 @@ final class ChatStore: ObservableObject {
     }
 
     private func failedHeartbeatReport(
-        personaName: String,
+        agentName: String,
         instruction: String,
         destination: String,
         startedAt: Date,
@@ -2175,7 +2166,7 @@ final class ChatStore: ObservableObject {
         }
 
         return HeartbeatExecutionReport(
-            personaName: personaName,
+            agentName: agentName,
             instruction: instruction,
             destination: destination,
             startedAt: startedAt,
@@ -2200,7 +2191,7 @@ final class ChatStore: ObservableObject {
                     storedChat: storedChat,
                     storedMessages: fetchMessages(for: storedChat.id),
                     storedGroupParticipants: fetchGroupParticipants(for: storedChat.id),
-                    personaStore: personaStore,
+                    agentStore: agentStore,
                     localModelStore: localModelStore,
                     modelContext: modelContext
                 )
@@ -2258,8 +2249,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private static let messageBatchSize = 40
 
     var id: UUID { storedChat.id }
-    var personaID: Persona.ID { storedChat.personaID }
-    var personaName: String { storedChat.personaName }
+    var agentID: Agent.ID { storedChat.agentID }
+    var agentName: String { storedChat.agentName }
     var isGroupChat: Bool { storedChat.kind == .group }
     var updatedAt: Date { storedChat.updatedAt }
     var heartbeatDestinationDescription: String {
@@ -2274,14 +2265,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
     @Published private(set) var isLoadingOlderMessages = false
     @Published private(set) var hasOlderMessages: Bool
     @Published private(set) var isResponding = false
-    @Published private(set) var respondingPersonaName: String?
+    @Published private(set) var respondingAgentName: String?
     @Published private(set) var availabilityMessage = ""
     @Published private(set) var canSend = false
 
     private let model = SystemLanguageModel.default
     private let modelContext: ModelContext
     private let storedChat: StoredChat
-    private let personaStore: PersonaStore
+    private let agentStore: AgentStore
     private let localModelStore: LocalModelStore
     private let backend: ChatBackend
 
@@ -2293,24 +2284,24 @@ final class ChatViewModel: ObservableObject, Identifiable {
         storedChat: StoredChat,
         storedMessages: [StoredChatMessage],
         storedGroupParticipants: [StoredGroupChatParticipant],
-        personaStore: PersonaStore,
+        agentStore: AgentStore,
         localModelStore: LocalModelStore,
         modelContext: ModelContext
     ) {
         self.storedChat = storedChat
-        self.personaStore = personaStore
+        self.agentStore = agentStore
         self.localModelStore = localModelStore
         self.modelContext = modelContext
         title = storedChat.title
-        let fallbackAssistantName = storedChat.kind == .direct ? storedChat.personaName : nil
+        let fallbackAssistantName = storedChat.kind == .direct ? storedChat.agentName : nil
         messages = storedMessages.map {
             ChatMessage(storedMessage: $0, fallbackAssistantName: fallbackAssistantName)
         }
         groupParticipants = storedGroupParticipants
         groupSystemInstructions = storedChat.groupSystemInstructions ?? ""
-        respondingPersonaName = nil
+        respondingAgentName = nil
         hasOlderMessages = storedMessages.count == ChatViewModel.messageBatchSize
-        backend = localModelStore.backend(for: storedChat.personaModelIdentifier)
+        backend = localModelStore.backend(for: storedChat.agentModelIdentifier)
         updateAvailability()
     }
 
@@ -2318,9 +2309,9 @@ final class ChatViewModel: ObservableObject, Identifiable {
         groupParticipants.map(\.mention)
     }
 
-    var availablePersonaMentions: [String] {
+    var availableAgentMentions: [String] {
         var mentions = groupParticipantMentions
-        mentions.append(contentsOf: personaStore.personas.map(\.mention))
+        mentions.append(contentsOf: agentStore.agents.map(\.mention))
         return Array(Set(mentions)).sorted {
             $0.localizedStandardCompare($1) == .orderedAscending
         }
@@ -2328,7 +2319,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     var composerPlaceholder: String {
         guard isGroupChat, groupParticipants.isEmpty else { return "Message" }
-        guard let firstMention = availablePersonaMentions.first else {
+        guard let firstMention = availableAgentMentions.first else {
             return "Message"
         }
         return "Message \(firstMention) to add them"
@@ -2354,7 +2345,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         descriptor.fetchLimit = ChatViewModel.messageBatchSize
 
         do {
-            let fallbackAssistantName = isGroupChat ? nil : storedChat.personaName
+            let fallbackAssistantName = isGroupChat ? nil : storedChat.agentName
             let olderMessages = try modelContext.fetch(descriptor).reversed().map {
                 ChatMessage(storedMessage: $0, fallbackAssistantName: fallbackAssistantName)
             }
@@ -2390,8 +2381,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 chatID: id,
                 role: role,
                 text: "Fake message \(messageNumber)",
-                authorPersonaID: role == .assistant ? groupParticipants.first?.personaID ?? personaID : nil,
-                authorName: role == .assistant ? groupParticipants.first?.personaName ?? personaName : nil,
+                authorAgentID: role == .assistant ? groupParticipants.first?.agentID ?? agentID : nil,
+                authorName: role == .assistant ? groupParticipants.first?.agentName ?? agentName : nil,
                 createdAt: Date().addingTimeInterval(TimeInterval(offset) * 0.001)
             )
         }
@@ -2403,7 +2394,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         storedChat.updatedAt = .now
         saveChanges()
         messages.append(contentsOf: storedMessages.map {
-            ChatMessage(storedMessage: $0, fallbackAssistantName: isGroupChat ? nil : personaName)
+            ChatMessage(storedMessage: $0, fallbackAssistantName: isGroupChat ? nil : agentName)
         })
     }
 
@@ -2414,8 +2405,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
             appendMessage(
                 role: .assistant,
                 text: "Slow response",
-                authorPersonaID: participant?.personaID ?? (isGroupChat ? nil : personaID),
-                authorName: participant?.personaName ?? (isGroupChat ? nil : personaName)
+                authorAgentID: participant?.agentID ?? (isGroupChat ? nil : agentID),
+                authorName: participant?.agentName ?? (isGroupChat ? nil : agentName)
             )
         }
     }
@@ -2426,20 +2417,20 @@ final class ChatViewModel: ObservableObject, Identifiable {
         guard canSubmitDraft, !prompt.isEmpty else { return }
 
         if isGroupChat {
-            let mentionedHandles = PersonaMention.handles(in: prompt)
-            addMentionedPersonas(matching: mentionedHandles)
+            let mentionedHandles = AgentMention.handles(in: prompt)
+            addMentionedAgents(matching: mentionedHandles)
 
             guard !groupParticipants.isEmpty else {
-                availabilityMessage = availablePersonaMentions.isEmpty
-                    ? "Create a persona before starting this group discussion."
-                    : "Mention a persona, such as \(availablePersonaMentions[0]), to add them."
+                availabilityMessage = availableAgentMentions.isEmpty
+                    ? "Create an agent before starting this group discussion."
+                    : "Mention an agent, such as \(availableAgentMentions[0]), to add them."
                 return
             }
 
-            let directlyMentionedPersonaIDs = Set(
+            let directlyMentionedAgentIDs = Set(
                 groupParticipants
-                    .filter { mentionedHandles.contains(PersonaMention.handle(for: $0.personaName).lowercased()) }
-                    .map(\.personaID)
+                    .filter { mentionedHandles.contains(AgentMention.handle(for: $0.agentName).lowercased()) }
+                    .map(\.agentID)
             )
 
             if title == "Untitled chat" {
@@ -2451,7 +2442,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             isResponding = true
 
             Task {
-                await respondAsGroup(directlyMentionedPersonaIDs: directlyMentionedPersonaIDs)
+                await respondAsGroup(directlyMentionedAgentIDs: directlyMentionedAgentIDs)
             }
             return
         }
@@ -2470,7 +2461,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     }
 
     func executeHeartbeat(
-        as persona: Persona,
+        as agent: Agent,
         instruction: String,
         modelIdentifier: String,
         lastCompletedAt: Date?,
@@ -2492,20 +2483,20 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
 
         if isGroupChat {
-            addGroupParticipantIfNeeded(persona)
+            addGroupParticipantIfNeeded(agent)
         }
 
         isResponding = true
-        respondingPersonaName = persona.displayName
+        respondingAgentName = agent.displayName
         defer {
-            respondingPersonaName = nil
+            respondingAgentName = nil
             isResponding = false
             updateAvailability()
         }
 
-        let systemInstructions = heartbeatSystemInstructions(for: persona)
+        let systemInstructions = heartbeatSystemInstructions(for: agent)
         let conversationPrompt = heartbeatConversationPrompt(
-            personaName: persona.displayName,
+            agentName: agent.displayName,
             instruction: instruction,
             lastCompletedAt: lastCompletedAt,
             referenceDate: referenceDate
@@ -2548,9 +2539,9 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
         onModelResponseAccepted?()
 
-        let parsedResponse = PersonaMemoryHarness.parse(response)
-        personaStore.appendPersonaMemoryEntries(
-            id: persona.id,
+        let parsedResponse = AgentMemoryHarness.parse(response)
+        agentStore.appendAgentMemoryEntries(
+            id: agent.id,
             entries: parsedResponse.memoryEntries
         )
 
@@ -2561,8 +2552,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
             appendMessage(
                 role: .assistant,
                 text: visibleText,
-                authorPersonaID: persona.id,
-                authorName: persona.displayName
+                authorAgentID: agent.id,
+                authorName: agent.displayName
             )
         }
 
@@ -2589,13 +2580,13 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     private func respond() async {
         do {
-            let systemInstructions = ChatViewModel.personaSystemInstructions(
-                personaName: storedChat.personaName,
+            let systemInstructions = ChatViewModel.agentSystemInstructions(
+                agentName: storedChat.agentName,
                 soul: currentSoul(
-                    for: storedChat.personaID,
-                    fallback: storedChat.personaSoul
+                    for: storedChat.agentID,
+                    fallback: storedChat.agentSoul
                 ),
-                memory: currentMemory(for: storedChat.personaID)
+                memory: currentMemory(for: storedChat.agentID)
             )
             let response: String
             switch backend {
@@ -2606,34 +2597,34 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 response = try await OpenAICompatibleClient(configuration: configuration).respond(
                     systemPrompt: systemInstructions,
                     messages: allStoredMessages().map {
-                        ChatMessage(storedMessage: $0, fallbackAssistantName: storedChat.personaName)
+                        ChatMessage(storedMessage: $0, fallbackAssistantName: storedChat.agentName)
                     }
                 )
             case .missingLocalModel:
                 throw OpenAICompatibleError.server(
                     statusCode: 0,
-                    message: "This chat's local model is no longer configured. Choose a configured model for the persona and start a new chat."
+                    message: "This chat's local model is no longer configured. Choose a configured model for the agent and start a new chat."
                 )
             }
-            let parsedResponse = PersonaMemoryHarness.parse(response)
-            personaStore.appendPersonaMemoryEntries(
-                id: storedChat.personaID,
+            let parsedResponse = AgentMemoryHarness.parse(response)
+            agentStore.appendAgentMemoryEntries(
+                id: storedChat.agentID,
                 entries: parsedResponse.memoryEntries
             )
             if !parsedResponse.visibleText.isEmpty {
                 appendMessage(
                     role: .assistant,
                     text: parsedResponse.visibleText,
-                    authorPersonaID: personaID,
-                    authorName: personaName
+                    authorAgentID: agentID,
+                    authorName: agentName
                 )
             }
         } catch {
             appendMessage(
                 role: .assistant,
                 text: "I could not get a response: \(error.localizedDescription)",
-                authorPersonaID: personaID,
-                authorName: personaName
+                authorAgentID: agentID,
+                authorName: agentName
             )
         }
 
@@ -2641,17 +2632,17 @@ final class ChatViewModel: ObservableObject, Identifiable {
         updateAvailability()
     }
 
-    private func addMentionedPersonas(matching mentionedHandles: Set<String>) {
-        let existingPersonaIDs = Set(groupParticipants.map(\.personaID))
-        let newPersonas = personaStore.personas.filter { persona in
-            !existingPersonaIDs.contains(persona.id)
-                && mentionedHandles.contains(PersonaMention.handle(for: persona.displayName).lowercased())
+    private func addMentionedAgents(matching mentionedHandles: Set<String>) {
+        let existingAgentIDs = Set(groupParticipants.map(\.agentID))
+        let newAgents = agentStore.agents.filter { agent in
+            !existingAgentIDs.contains(agent.id)
+                && mentionedHandles.contains(AgentMention.handle(for: agent.displayName).lowercased())
         }
 
-        guard !newPersonas.isEmpty else { return }
+        guard !newAgents.isEmpty else { return }
 
-        for persona in newPersonas {
-            let participant = StoredGroupChatParticipant(chatID: id, persona: persona)
+        for agent in newAgents {
+            let participant = StoredGroupChatParticipant(chatID: id, agent: agent)
             modelContext.insert(participant)
             groupParticipants.append(participant)
         }
@@ -2661,13 +2652,13 @@ final class ChatViewModel: ObservableObject, Identifiable {
         updateAvailability()
     }
 
-    private func addGroupParticipantIfNeeded(_ persona: Persona) {
+    private func addGroupParticipantIfNeeded(_ agent: Agent) {
         guard isGroupChat,
-              !groupParticipants.contains(where: { $0.personaID == persona.id }) else {
+              !groupParticipants.contains(where: { $0.agentID == agent.id }) else {
             return
         }
 
-        let participant = StoredGroupChatParticipant(chatID: id, persona: persona)
+        let participant = StoredGroupChatParticipant(chatID: id, agent: agent)
         modelContext.insert(participant)
         groupParticipants.append(participant)
         storedChat.updatedAt = .now
@@ -2675,10 +2666,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         updateAvailability()
     }
 
-    private func respondAsGroup(directlyMentionedPersonaIDs: Set<UUID>) async {
+    private func respondAsGroup(directlyMentionedAgentIDs: Set<UUID>) async {
         let orderedParticipants = groupParticipants.sorted { left, right in
-            let leftWasMentioned = directlyMentionedPersonaIDs.contains(left.personaID)
-            let rightWasMentioned = directlyMentionedPersonaIDs.contains(right.personaID)
+            let leftWasMentioned = directlyMentionedAgentIDs.contains(left.agentID)
+            let rightWasMentioned = directlyMentionedAgentIDs.contains(right.agentID)
             if leftWasMentioned != rightWasMentioned {
                 return leftWasMentioned
             }
@@ -2687,16 +2678,16 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
         for participant in orderedParticipants {
             guard !Task.isCancelled else { break }
-            respondingPersonaName = participant.personaName
+            respondingAgentName = participant.agentName
 
             do {
                 let response = try await groupResponse(
                     from: participant,
-                    wasDirectlyMentioned: directlyMentionedPersonaIDs.contains(participant.personaID)
+                    wasDirectlyMentioned: directlyMentionedAgentIDs.contains(participant.agentID)
                 )
-                let parsedResponse = PersonaMemoryHarness.parse(response)
-                personaStore.appendPersonaMemoryEntries(
-                    id: participant.personaID,
+                let parsedResponse = AgentMemoryHarness.parse(response)
+                agentStore.appendAgentMemoryEntries(
+                    id: participant.agentID,
                     entries: parsedResponse.memoryEntries
                 )
                 let trimmedResponse = parsedResponse.visibleText
@@ -2704,21 +2695,21 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     appendMessage(
                         role: .assistant,
                         text: trimmedResponse,
-                        authorPersonaID: participant.personaID,
-                        authorName: participant.personaName
+                        authorAgentID: participant.agentID,
+                        authorName: participant.agentName
                     )
                 }
             } catch {
                 appendMessage(
                     role: .assistant,
                     text: "I could not get a response: \(error.localizedDescription)",
-                    authorPersonaID: participant.personaID,
-                    authorName: participant.personaName
+                    authorAgentID: participant.agentID,
+                    authorName: participant.agentName
                 )
             }
         }
 
-        respondingPersonaName = nil
+        respondingAgentName = nil
         isResponding = false
         updateAvailability()
     }
@@ -2733,7 +2724,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             wasDirectlyMentioned: wasDirectlyMentioned
         )
 
-        switch localModelStore.backend(for: participant.personaModelIdentifier) {
+        switch localModelStore.backend(for: participant.agentModelIdentifier) {
         case .appleFoundation:
             let session = LanguageModelSession(instructions: systemInstructions)
             return try await session.respond(to: conversationPrompt).content
@@ -2745,7 +2736,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         case .missingLocalModel:
             throw OpenAICompatibleError.server(
                 statusCode: 0,
-                message: "This persona's local model is no longer configured."
+                message: "This agent's local model is no longer configured."
             )
         }
     }
@@ -2753,12 +2744,12 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private func groupSystemPrompt(for participant: StoredGroupChatParticipant) -> String {
         let individualInstructions = ChatViewModel.instructions(
             for: currentSoul(
-                for: participant.personaID,
-                fallback: participant.personaSoul
+                for: participant.agentID,
+                fallback: participant.agentSoul
             )
         )
-        let memoryInstructions = PersonaMemoryHarness.instructionSection(
-            memory: currentMemory(for: participant.personaID)
+        let memoryInstructions = AgentMemoryHarness.instructionSection(
+            memory: currentMemory(for: participant.agentID)
         )
         let trimmedGroupInstructions = groupSystemInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let groupInstructions = trimmedGroupInstructions.isEmpty
@@ -2766,9 +2757,9 @@ final class ChatViewModel: ObservableObject, Identifiable {
             : trimmedGroupInstructions
 
         return """
-        You are \(participant.personaName), a participant in an open group discussion.
+        You are \(participant.agentName), a participant in an open group discussion.
 
-        Individual persona instructions:
+        Individual agent instructions:
         \(individualInstructions)
 
         \(memoryInstructions)
@@ -2777,10 +2768,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         \(groupInstructions)
 
         Discussion behavior:
-        - You see the complete conversation between the user and every persona in the group.
-        - Messages labeled with another persona's name were written by that persona, not by you.
-        - You may respond to the user or to another persona when it adds something natural to the discussion.
-        - A direct @mention gives that comment extra emphasis, but it does not prevent other personas from replying.
+        - You see the complete conversation between the user and every agent in the group.
+        - Messages labeled with another agent's name were written by that agent, not by you.
+        - You may respond to the user or to another agent when it adds something natural to the discussion.
+        - A direct @mention gives that comment extra emphasis, but it does not prevent other agents from replying.
         - Do not prefix your reply with your name; the interface adds it for you.
         - If you have nothing useful to add, reply with exactly [[PASS]].
         """
@@ -2791,7 +2782,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         wasDirectlyMentioned: Bool
     ) -> String {
         let transcript = allStoredMessages().map { message in
-            let speaker = message.role == .user ? "User" : message.authorName ?? "Persona"
+            let speaker = message.role == .user ? "User" : message.authorName ?? "Agent"
             return "\(speaker): \(message.text)"
         }.joined(separator: "\n\n")
 
@@ -2805,7 +2796,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         \(transcript)
 
         \(emphasis)
-        Continue the discussion as \(participant.personaName), or return [[PASS]] if you would only repeat what has already been said.
+        Continue the discussion as \(participant.agentName), or return [[PASS]] if you would only repeat what has already been said.
         """
     }
 
@@ -2815,20 +2806,20 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
         \(storedConversationTranscript())
 
-        Reply to the latest user message as \(storedChat.personaName).
+        Reply to the latest user message as \(storedChat.agentName).
         """
     }
 
-    private func heartbeatSystemInstructions(for persona: Persona) -> String {
-        let personaInstructions = ChatViewModel.personaSystemInstructions(
-            personaName: persona.displayName,
-            soul: persona.soul,
-            memory: persona.memoryText
+    private func heartbeatSystemInstructions(for agent: Agent) -> String {
+        let agentInstructions = ChatViewModel.agentSystemInstructions(
+            agentName: agent.displayName,
+            soul: agent.soul,
+            memory: agent.memoryText
         )
 
         guard isGroupChat else {
             return """
-            \(personaInstructions)
+            \(agentInstructions)
 
             You are running a scheduled heartbeat for your private chat.
             Follow the heartbeat instruction using the conversation as context.
@@ -2843,14 +2834,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
             : trimmedGroupInstructions
 
         return """
-        \(personaInstructions)
+        \(agentInstructions)
 
         Group chat system instructions:
         \(groupInstructions)
 
         You are running a scheduled heartbeat for this group discussion.
-        You see the complete conversation between the user and every persona in the group.
-        Messages labeled with another persona's name were written by that persona, not by you.
+        You see the complete conversation between the user and every agent in the group.
+        Messages labeled with another agent's name were written by that agent, not by you.
         Follow the heartbeat instruction and post only when it adds something natural or useful.
         Do not prefix your reply with your name; the interface adds it for you.
         If there is nothing worth posting, reply with exactly [[PASS]].
@@ -2859,7 +2850,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     }
 
     private func heartbeatConversationPrompt(
-        personaName: String,
+        agentName: String,
         instruction: String,
         lastCompletedAt: Date?,
         referenceDate: Date
@@ -2885,7 +2876,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         Scheduled heartbeat instruction:
         \(instruction)
 
-        Decide whether to post as \(personaName). Return [[PASS]] if no message should be posted.
+        Decide whether to post as \(agentName). Return [[PASS]] if no message should be posted.
         """
     }
 
@@ -2898,7 +2889,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         return messages.map { message in
             let speaker = message.role == .user
                 ? "User"
-                : message.authorName ?? (isGroupChat ? "Persona" : storedChat.personaName)
+                : message.authorName ?? (isGroupChat ? "Agent" : storedChat.agentName)
             let age = Self.compactElapsedTime(from: message.createdAt, to: referenceDate)
             return "[\(age) ago] \(speaker): \(message.text)"
         }.joined(separator: "\n\n")
@@ -2917,17 +2908,17 @@ final class ChatViewModel: ObservableObject, Identifiable {
         allStoredMessages().map { message in
             let speaker = message.role == .user
                 ? "User"
-                : message.authorName ?? (isGroupChat ? "Persona" : storedChat.personaName)
+                : message.authorName ?? (isGroupChat ? "Agent" : storedChat.agentName)
             return "\(speaker): \(message.text)"
         }.joined(separator: "\n\n")
     }
 
-    private func currentMemory(for personaID: Persona.ID) -> String {
-        personaStore.persona(for: personaID)?.memoryText ?? ""
+    private func currentMemory(for agentID: Agent.ID) -> String {
+        agentStore.agent(for: agentID)?.memoryText ?? ""
     }
 
-    private func currentSoul(for personaID: Persona.ID, fallback: String) -> String {
-        personaStore.persona(for: personaID)?.soul ?? fallback
+    private func currentSoul(for agentID: Agent.ID, fallback: String) -> String {
+        agentStore.agent(for: agentID)?.soul ?? fallback
     }
 
     private func allStoredMessages() -> [StoredChatMessage] {
@@ -2967,14 +2958,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private func appendMessage(
         role: ChatRole,
         text: String,
-        authorPersonaID: UUID? = nil,
+        authorAgentID: UUID? = nil,
         authorName: String? = nil
     ) {
         let storedMessage = StoredChatMessage(
             chatID: id,
             role: role,
             text: text,
-            authorPersonaID: authorPersonaID,
+            authorAgentID: authorAgentID,
             authorName: authorName
         )
         modelContext.insert(storedMessage)
@@ -2992,19 +2983,19 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     private func updateAvailability() {
         if isGroupChat {
-            canSend = !personaStore.personas.isEmpty || !groupParticipants.isEmpty
+            canSend = !agentStore.agents.isEmpty || !groupParticipants.isEmpty
 
             if groupParticipants.isEmpty {
-                if let firstMention = availablePersonaMentions.first {
-                    availabilityMessage = "Mention \(firstMention) to add a persona to the discussion."
+                if let firstMention = availableAgentMentions.first {
+                    availabilityMessage = "Mention \(firstMention) to add an agent to the discussion."
                 } else {
-                    availabilityMessage = "Create a persona before starting this group discussion."
+                    availabilityMessage = "Create an agent before starting this group discussion."
                 }
             } else {
                 let count = groupParticipants.count
                 availabilityMessage = count == 1
-                    ? "1 persona is in this discussion."
-                    : "\(count) personas are in this discussion."
+                    ? "1 agent is in this discussion."
+                    : "\(count) agents are in this discussion."
             }
             return
         }
@@ -3064,18 +3055,18 @@ final class ChatViewModel: ObservableObject, Identifiable {
         """ : trimmedSoul
     }
 
-    private static func personaSystemInstructions(
-        personaName: String,
+    private static func agentSystemInstructions(
+        agentName: String,
         soul: String,
         memory: String
     ) -> String {
         """
-        Your persona name is \(personaName).
+        Your agent name is \(agentName).
 
-        Individual persona instructions:
+        Individual agent instructions:
         \(instructions(for: soul))
 
-        \(PersonaMemoryHarness.instructionSection(memory: memory))
+        \(AgentMemoryHarness.instructionSection(memory: memory))
         """
     }
 }
@@ -3084,7 +3075,7 @@ struct ChatMessage: Identifiable, Equatable {
     let id: UUID
     let role: ChatRole
     let text: String
-    let authorPersonaID: UUID?
+    let authorAgentID: UUID?
     let authorName: String?
     let createdAt: Date
 
@@ -3092,14 +3083,14 @@ struct ChatMessage: Identifiable, Equatable {
         id: UUID = UUID(),
         role: ChatRole,
         text: String,
-        authorPersonaID: UUID? = nil,
+        authorAgentID: UUID? = nil,
         authorName: String? = nil,
         createdAt: Date = .now
     ) {
         self.id = id
         self.role = role
         self.text = text
-        self.authorPersonaID = authorPersonaID
+        self.authorAgentID = authorAgentID
         self.authorName = authorName
         self.createdAt = createdAt
     }
@@ -3108,7 +3099,7 @@ struct ChatMessage: Identifiable, Equatable {
         id = storedMessage.id
         role = storedMessage.role
         text = storedMessage.text
-        authorPersonaID = storedMessage.authorPersonaID
+        authorAgentID = storedMessage.authorAgentID
         authorName = storedMessage.authorName ?? (storedMessage.role == .assistant ? fallbackAssistantName : nil)
         createdAt = storedMessage.createdAt
     }
@@ -3125,7 +3116,7 @@ enum ChatRole: String {
 
 struct ContentViewPreview: View {
     private let modelContainer: ModelContainer
-    private let personaStore: PersonaStore
+    private let agentStore: AgentStore
     private let textToSpeechToolStore: TextToSpeechToolStore
     private let chatStore: ChatStore
 
@@ -3133,8 +3124,8 @@ struct ContentViewPreview: View {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
             let container = try ModelContainer(
-                for: Persona.self,
-                PersonaHeartbeat.self,
+                for: Agent.self,
+                AgentHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
                 TextToSpeechTool.self,
@@ -3143,13 +3134,13 @@ struct ContentViewPreview: View {
                 StoredChatMessage.self,
                 configurations: configuration
             )
-            let personaStore = PersonaStore(modelContext: container.mainContext)
+            let agentStore = AgentStore(modelContext: container.mainContext)
             let localModelStore = LocalModelStore(modelContext: container.mainContext)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: container.mainContext)
             modelContainer = container
-            self.personaStore = personaStore
+            self.agentStore = agentStore
             self.textToSpeechToolStore = textToSpeechToolStore
-            chatStore = ChatStore(personaStore: personaStore, localModelStore: localModelStore, modelContext: container.mainContext)
+            chatStore = ChatStore(agentStore: agentStore, localModelStore: localModelStore, modelContext: container.mainContext)
         } catch {
             fatalError("Failed to create preview model container: \(error.localizedDescription)")
         }
@@ -3157,7 +3148,7 @@ struct ContentViewPreview: View {
 
     var body: some View {
         ContentView(
-            personaStore: personaStore,
+            agentStore: agentStore,
             textToSpeechToolStore: textToSpeechToolStore,
             chatStore: chatStore
         )

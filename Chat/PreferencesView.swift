@@ -7,7 +7,7 @@ import AppKit
 #endif
 
 enum PreferencesSection: String, CaseIterable, Identifiable {
-    case personas
+    case agents
     case models
     case textToSpeech
 
@@ -15,8 +15,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .personas:
-            return "Personas"
+        case .agents:
+            return "Agents"
         case .models:
             return "Models"
         case .textToSpeech:
@@ -26,7 +26,7 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
-        case .personas:
+        case .agents:
             return "person.2"
         case .models:
             return "cpu"
@@ -38,7 +38,7 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
 
 @MainActor
 final class PreferencesNavigation: ObservableObject {
-    @Published var selection: PreferencesSection = .personas
+    @Published var selection: PreferencesSection = .agents
 }
 
 enum OpenUITheme {
@@ -62,7 +62,7 @@ enum OpenUITheme {
 }
 
 struct PreferencesView: View {
-    @ObservedObject var personaStore: PersonaStore
+    @ObservedObject var agentStore: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var chatStore: ChatStore
@@ -74,9 +74,9 @@ struct PreferencesView: View {
 
             Group {
                 switch navigation.selection {
-                case .personas:
-                    PersonasPreferencesView(
-                        store: personaStore,
+                case .agents:
+                    AgentsPreferencesView(
+                        store: agentStore,
                         localModelStore: localModelStore,
                         textToSpeechToolStore: textToSpeechToolStore,
                         chatStore: chatStore
@@ -628,7 +628,7 @@ private struct LocalModelEditor: View {
 
             OpenUISettingsRow(
                 title: "Display name",
-                description: "The name shown in persona model menus."
+                description: "The name shown in agent model menus."
             ) {
                 TextField("Local model", text: name)
                     .openUIInput()
@@ -804,7 +804,7 @@ private struct LocalModelEditor: View {
 
 private struct PreferencesViewPreview: View {
     private let modelContainer: ModelContainer
-    private let personaStore: PersonaStore
+    private let agentStore: AgentStore
     private let localModelStore: LocalModelStore
     private let textToSpeechToolStore: TextToSpeechToolStore
     private let chatStore: ChatStore
@@ -814,8 +814,8 @@ private struct PreferencesViewPreview: View {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
             let container = try ModelContainer(
-                for: Persona.self,
-                PersonaHeartbeat.self,
+                for: Agent.self,
+                AgentHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
                 TextToSpeechTool.self,
@@ -834,7 +834,7 @@ private struct PreferencesViewPreview: View {
 
             for name in ["Joe", "Maya", "Rowan", "Sam"] {
                 context.insert(
-                    Persona(
+                    Agent(
                         name: name,
                         soul: "Be a thoughtful participant in the conversation.",
                         modelIdentifier: ChatModelIdentifier.localModelID(localModel.id)
@@ -843,15 +843,15 @@ private struct PreferencesViewPreview: View {
             }
             try context.save()
 
-            let personaStore = PersonaStore(modelContext: context)
+            let agentStore = AgentStore(modelContext: context)
             let localModelStore = LocalModelStore(modelContext: context)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: context)
             modelContainer = container
-            self.personaStore = personaStore
+            self.agentStore = agentStore
             self.localModelStore = localModelStore
             self.textToSpeechToolStore = textToSpeechToolStore
             chatStore = ChatStore(
-                personaStore: personaStore,
+                agentStore: agentStore,
                 localModelStore: localModelStore,
                 modelContext: context
             )
@@ -862,7 +862,7 @@ private struct PreferencesViewPreview: View {
 
     var body: some View {
         PreferencesView(
-            personaStore: personaStore,
+            agentStore: agentStore,
             localModelStore: localModelStore,
             textToSpeechToolStore: textToSpeechToolStore,
             chatStore: chatStore,

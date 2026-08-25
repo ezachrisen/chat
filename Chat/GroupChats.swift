@@ -10,55 +10,55 @@ enum ChatKind: String {
 final class StoredGroupChatParticipant: Identifiable {
     @Attribute(.unique) var id: UUID
     var chatID: UUID
-    var personaID: UUID
-    var personaName: String
-    var personaSoul: String
-    var personaModelIdentifier: String?
+    @Attribute(originalName: "personaID") var agentID: UUID
+    @Attribute(originalName: "personaName") var agentName: String
+    @Attribute(originalName: "personaSoul") var agentSoul: String
+    @Attribute(originalName: "personaModelIdentifier") var agentModelIdentifier: String?
     var createdAt: Date
 
     init(
         id: UUID = UUID(),
         chatID: UUID,
-        personaID: UUID,
-        personaName: String,
-        personaSoul: String,
-        personaModelIdentifier: String?,
+        agentID: UUID,
+        agentName: String,
+        agentSoul: String,
+        agentModelIdentifier: String?,
         createdAt: Date = .now
     ) {
         self.id = id
         self.chatID = chatID
-        self.personaID = personaID
-        self.personaName = personaName
-        self.personaSoul = personaSoul
-        self.personaModelIdentifier = personaModelIdentifier
+        self.agentID = agentID
+        self.agentName = agentName
+        self.agentSoul = agentSoul
+        self.agentModelIdentifier = agentModelIdentifier
         self.createdAt = createdAt
     }
 
-    convenience init(chatID: UUID, persona: Persona) {
+    convenience init(chatID: UUID, agent: Agent) {
         self.init(
             chatID: chatID,
-            personaID: persona.id,
-            personaName: persona.displayName,
-            personaSoul: persona.soul,
-            personaModelIdentifier: persona.selectedModelIdentifier
+            agentID: agent.id,
+            agentName: agent.displayName,
+            agentSoul: agent.soul,
+            agentModelIdentifier: agent.selectedModelIdentifier
         )
     }
 
     var mention: String {
-        PersonaMention.mention(for: personaName)
+        AgentMention.mention(for: agentName)
     }
 }
 
-enum PersonaMention {
-    static func mention(for personaName: String) -> String {
-        "@\(handle(for: personaName))"
+enum AgentMention {
+    static func mention(for agentName: String) -> String {
+        "@\(handle(for: agentName))"
     }
 
-    static func handle(for personaName: String) -> String {
-        let handle = personaName
+    static func handle(for agentName: String) -> String {
+        let handle = agentName
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .joined()
-        return handle.isEmpty ? "persona" : handle
+        return handle.isEmpty ? "agent" : handle
     }
 
     static func handles(in text: String) -> Set<String> {
@@ -74,8 +74,8 @@ enum PersonaMention {
     }
 }
 
-extension Persona {
+extension Agent {
     var mention: String {
-        PersonaMention.mention(for: displayName)
+        AgentMention.mention(for: displayName)
     }
 }

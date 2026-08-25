@@ -5,8 +5,8 @@ import SwiftData
 import AppKit
 #endif
 
-struct PersonasPreferencesView: View {
-    @ObservedObject var store: PersonaStore
+struct AgentsPreferencesView: View {
+    @ObservedObject var store: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var chatStore: ChatStore
@@ -15,40 +15,40 @@ struct PersonasPreferencesView: View {
     var body: some View {
         Group {
             if isPresentingEditor {
-                personaEditor
+                agentEditor
             } else {
-                personaList
+                agentList
             }
         }
         .background(OpenUITheme.background)
     }
 
-    private var personaList: some View {
+    private var agentList: some View {
         VStack(alignment: .leading, spacing: 24) {
             HStack(alignment: .center) {
-                Text("Personas")
+                Text("Agents")
                     .font(.system(size: 26, weight: .semibold))
                     .foregroundStyle(OpenUITheme.foreground)
 
                 Spacer()
 
                 Button {
-                    store.addPersona()
+                    store.addAgent()
                     isPresentingEditor = true
                 } label: {
-                    Label("Add Persona", systemImage: "plus")
+                    Label("Add Agent", systemImage: "plus")
                 }
                 .buttonStyle(OpenUIPrimaryButtonStyle())
             }
 
             VStack(spacing: 0) {
-                ForEach(Array(store.personas.enumerated()), id: \.element.id) { index, persona in
+                ForEach(Array(store.agents.enumerated()), id: \.element.id) { index, agent in
                     Button {
-                        store.selectedPersonaID = persona.id
+                        store.selectedAgentID = agent.id
                         isPresentingEditor = true
                     } label: {
                         HStack {
-                            Text(persona.displayName)
+                            Text(agent.displayName)
                                 .font(.system(size: 15, weight: .medium))
                                 .foregroundStyle(OpenUITheme.foreground)
                                 .lineLimit(1)
@@ -60,9 +60,9 @@ struct PersonasPreferencesView: View {
                         .frame(minHeight: 56)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Edit \(persona.displayName)")
+                    .accessibilityLabel("Edit \(agent.displayName)")
 
-                    if index < store.personas.count - 1 {
+                    if index < store.agents.count - 1 {
                         OpenUIDivider()
                     }
                 }
@@ -76,29 +76,29 @@ struct PersonasPreferencesView: View {
         .padding(.vertical, 36)
     }
 
-    private var personaEditor: some View {
+    private var agentEditor: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(spacing: 16) {
-                    Button("Personas") {
+                    Button("Agents") {
                         isPresentingEditor = false
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 26, weight: .bold))
                     .foregroundStyle(OpenUITheme.foregroundMuted)
-                    .accessibilityHint("Return to the persona list")
+                    .accessibilityHint("Return to the agent list")
 
                     Image(systemName: "chevron.right")
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(OpenUITheme.foregroundSubtle)
 
-                    Text(store.selectedPersona?.displayName ?? "Persona")
+                    Text(store.selectedAgent?.displayName ?? "Agent")
                         .font(.system(size: 26, weight: .semibold))
                         .foregroundStyle(OpenUITheme.foreground)
                         .lineLimit(1)
                 }
 
-                PersonaEditor(
+                AgentEditor(
                     store: store,
                     localModelStore: localModelStore,
                     textToSpeechToolStore: textToSpeechToolStore,
@@ -113,11 +113,11 @@ struct PersonasPreferencesView: View {
     }
 }
 
-private let minimumPersonaTextEditorHeight: CGFloat = 170
-private let maximumPersonaTextEditorHeight: CGFloat = 720
+private let minimumAgentTextEditorHeight: CGFloat = 170
+private let maximumAgentTextEditorHeight: CGFloat = 720
 
-struct PersonaEditor: View {
-    @ObservedObject var store: PersonaStore
+struct AgentEditor: View {
+    @ObservedObject var store: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var chatStore: ChatStore
@@ -126,86 +126,86 @@ struct PersonaEditor: View {
     @State private var draftMemory = ""
     @State private var memoryEditorHeight: CGFloat = 240
 
-    private var selectedPersona: Persona? {
-        store.selectedPersona
+    private var selectedAgent: Agent? {
+        store.selectedAgent
     }
 
-    private var personaName: Binding<String> {
+    private var agentName: Binding<String> {
         Binding {
-            selectedPersona?.name ?? ""
+            selectedAgent?.name ?? ""
         } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaName(id: personaID, name: newValue)
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentName(id: agentID, name: newValue)
         }
     }
 
-    private var personaModel: Binding<String> {
+    private var agentModel: Binding<String> {
         Binding {
-            selectedPersona?.selectedModelIdentifier ?? ChatModelIdentifier.appleFoundation
+            selectedAgent?.selectedModelIdentifier ?? ChatModelIdentifier.appleFoundation
         } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaModelIdentifier(id: personaID, modelIdentifier: newValue)
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentModelIdentifier(id: agentID, modelIdentifier: newValue)
         }
     }
 
     private var voiceTriggerPhrasesText: Binding<String> {
         Binding {
-            selectedPersona?.voiceTriggerPhrase ?? ""
+            selectedAgent?.voiceTriggerPhrase ?? ""
         } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaVoiceTriggerPhrases(id: personaID, phrasesText: newValue)
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentVoiceTriggerPhrases(id: agentID, phrasesText: newValue)
         }
     }
 
     private var textToSpeechToolID: Binding<TextToSpeechTool.ID?> {
         Binding {
-            selectedPersona?.textToSpeechToolID
+            selectedAgent?.textToSpeechToolID
         } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaTextToSpeechTool(id: personaID, toolID: newValue)
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentTextToSpeechTool(id: agentID, toolID: newValue)
         }
     }
 
     private var textToSpeechVoiceName: Binding<String> {
         Binding {
-            selectedPersona?.textToSpeechVoiceName ?? ""
+            selectedAgent?.textToSpeechVoiceName ?? ""
         } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaTextToSpeechVoiceName(id: personaID, voiceName: newValue)
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentTextToSpeechVoiceName(id: agentID, voiceName: newValue)
         }
     }
 
     private var textToSpeechVoiceModel: Binding<String> {
         Binding {
-            selectedPersona?.textToSpeechVoiceModel ?? ""
+            selectedAgent?.textToSpeechVoiceModel ?? ""
         } set: { newValue in
-            guard let personaID = selectedPersona?.id else { return }
-            store.updatePersonaTextToSpeechVoiceModel(id: personaID, voiceModel: newValue)
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentTextToSpeechVoiceModel(id: agentID, voiceModel: newValue)
         }
     }
 
     private var hasUnsavedSoulChanges: Bool {
-        draftSoul != selectedPersona?.soul
+        draftSoul != selectedAgent?.soul
     }
 
     private var hasUnsavedMemoryChanges: Bool {
-        draftMemory != selectedPersona?.memoryText
+        draftMemory != selectedAgent?.memoryText
     }
 
     var body: some View {
         Group {
-            if let selectedPersona {
-                editor(for: selectedPersona)
+            if let selectedAgent {
+                editor(for: selectedAgent)
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "person.crop.circle.badge.plus")
                         .font(.system(size: 26))
                         .foregroundStyle(OpenUITheme.accent)
 
-                    Text("Select or add a persona")
+                    Text("Select or add an agent")
                         .font(.system(size: 15, weight: .semibold))
 
-                    Text("Persona settings will appear here.")
+                    Text("Agent settings will appear here.")
                         .font(.system(size: 13))
                         .foregroundStyle(OpenUITheme.foregroundMuted)
                 }
@@ -213,13 +213,13 @@ struct PersonaEditor: View {
                     .openUICard()
             }
         }
-        .onAppear(perform: loadSelectedPersona)
-        .onChange(of: store.selectedPersonaID) {
-            loadSelectedPersona()
+        .onAppear(perform: loadSelectedAgent)
+        .onChange(of: store.selectedAgentID) {
+            loadSelectedAgent()
         }
     }
 
-    private func editor(for persona: Persona) -> some View {
+    private func editor(for agent: Agent) -> some View {
         VStack(alignment: .leading, spacing: 28) {
                 VStack(alignment: .leading, spacing: 10) {
                     OpenUISectionHeader(
@@ -231,7 +231,7 @@ struct PersonaEditor: View {
                             title: "Name",
                             description: "Used in chat labels and @mentions."
                         ) {
-                            TextField("Persona name", text: personaName)
+                            TextField("Agent name", text: agentName)
                                 .openUIInput()
                                 .frame(width: 320)
                         }
@@ -242,7 +242,7 @@ struct PersonaEditor: View {
                             title: "Default model",
                             description: "Heartbeats can override this selection individually."
                         ) {
-                            Picker("Model", selection: personaModel) {
+                            Picker("Model", selection: agentModel) {
                                 Text("Apple Foundation Model")
                                     .tag(ChatModelIdentifier.appleFoundation)
 
@@ -251,9 +251,9 @@ struct PersonaEditor: View {
                                         .tag(ChatModelIdentifier.localModelID(model.id))
                                 }
 
-                                if !isSelectedModelConfigured(persona.selectedModelIdentifier) {
+                                if !isSelectedModelConfigured(agent.selectedModelIdentifier) {
                                     Text("Missing local model")
-                                        .tag(persona.selectedModelIdentifier)
+                                        .tag(agent.selectedModelIdentifier)
                                 }
                             }
                             .labelsHidden()
@@ -271,7 +271,7 @@ struct PersonaEditor: View {
                     )
 
                     VStack(spacing: 0) {
-                        ResizablePersonaTextEditor(
+                        ResizableAgentTextEditor(
                             text: $draftSoul,
                             height: $soulEditorHeight,
                             resizeHelpText: "Resize Soul editor"
@@ -289,7 +289,7 @@ struct PersonaEditor: View {
 
                             if hasUnsavedSoulChanges {
                                 Button("Save Soul") {
-                                    store.updatePersonaSoul(id: persona.id, soul: draftSoul)
+                                    store.updateAgentSoul(id: agent.id, soul: draftSoul)
                                 }
                                 .buttonStyle(OpenUIPrimaryButtonStyle())
                             }
@@ -302,7 +302,7 @@ struct PersonaEditor: View {
                 VStack(alignment: .leading, spacing: 10) {
                     OpenUISectionHeader(
                         title: "Voice",
-                        description: "Configure voice input and text-to-speech output for this persona."
+                        description: "Configure voice input and text-to-speech output for this agent."
                     )
 
                     VStack(spacing: 0) {
@@ -317,7 +317,7 @@ struct PersonaEditor: View {
                                     .padding(6)
 
                                 if voiceTriggerPhrasesText.wrappedValue.isEmpty {
-                                    Text("Hey \(persona.displayName)\nWake up \(persona.displayName)")
+                                    Text("Hey \(agent.displayName)\nWake up \(agent.displayName)")
                                         .font(.system(size: 14))
                                         .foregroundStyle(OpenUITheme.foregroundSubtle)
                                         .padding(.horizontal, 12)
@@ -349,7 +349,7 @@ struct PersonaEditor: View {
                                         .tag(tool.id as TextToSpeechTool.ID?)
                                 }
 
-                                if let selectedToolID = persona.textToSpeechToolID,
+                                if let selectedToolID = agent.textToSpeechToolID,
                                    !textToSpeechToolStore.tools.contains(where: { $0.id == selectedToolID }) {
                                     Text("Missing tool")
                                         .tag(selectedToolID as TextToSpeechTool.ID?)
@@ -388,11 +388,11 @@ struct PersonaEditor: View {
                 VStack(alignment: .leading, spacing: 10) {
                     OpenUISectionHeader(
                         title: "Memory",
-                        description: "You can edit all memory; the persona can only append new entries."
+                        description: "You can edit all memory; the agent can only append new entries."
                     )
 
                     VStack(spacing: 0) {
-                        ResizablePersonaTextEditor(
+                        ResizableAgentTextEditor(
                             text: $draftMemory,
                             height: $memoryEditorHeight,
                             resizeHelpText: "Resize Memory editor"
@@ -410,7 +410,7 @@ struct PersonaEditor: View {
 
                             if hasUnsavedMemoryChanges {
                                 Button("Save Memory") {
-                                    store.updatePersonaMemory(id: persona.id, memory: draftMemory)
+                                    store.updateAgentMemory(id: agent.id, memory: draftMemory)
                                 }
                                 .buttonStyle(OpenUIPrimaryButtonStyle())
                             }
@@ -424,20 +424,20 @@ struct PersonaEditor: View {
                     HStack(alignment: .center, spacing: 16) {
                         OpenUISectionHeader(
                             title: "Heartbeats",
-                            description: "Run recurring persona instructions while Chat is open."
+                            description: "Run recurring agent instructions while Chat is open."
                         )
 
                         Spacer()
 
                         Button {
-                            store.addHeartbeat(to: persona.id)
+                            store.addHeartbeat(to: agent.id)
                         } label: {
                             Label("Add heartbeat", systemImage: "plus")
                         }
                         .buttonStyle(OpenUISecondaryButtonStyle())
                     }
 
-                    if store.heartbeats(for: persona.id).isEmpty {
+                    if store.heartbeats(for: agent.id).isEmpty {
                         VStack(spacing: 8) {
                             Image(systemName: "waveform.path.ecg")
                                 .font(.system(size: 22))
@@ -446,7 +446,7 @@ struct PersonaEditor: View {
                             Text("No heartbeats configured")
                                 .font(.system(size: 14, weight: .medium))
 
-                            Text("Add one to let this persona check in on a schedule.")
+                            Text("Add one to let this agent check in on a schedule.")
                                 .font(.system(size: 13))
                                 .foregroundStyle(OpenUITheme.foregroundMuted)
                         }
@@ -455,8 +455,8 @@ struct PersonaEditor: View {
                         .openUICard()
                     } else {
                         VStack(spacing: 16) {
-                            ForEach(store.heartbeats(for: persona.id)) { heartbeat in
-                                PersonaHeartbeatEditor(
+                            ForEach(store.heartbeats(for: agent.id)) { heartbeat in
+                                AgentHeartbeatEditor(
                                     heartbeat: heartbeat,
                                     store: store,
                                     localModelStore: localModelStore,
@@ -470,19 +470,19 @@ struct PersonaEditor: View {
         .frame(maxWidth: 720, alignment: .topLeading)
     }
 
-    private func loadSelectedPersona() {
-        guard let selectedPersona else {
+    private func loadSelectedAgent() {
+        guard let selectedAgent else {
             draftSoul = ""
             draftMemory = ""
             return
         }
 
-        load(selectedPersona)
+        load(selectedAgent)
     }
 
-    private func load(_ persona: Persona) {
-        draftSoul = persona.soul
-        draftMemory = persona.memoryText
+    private func load(_ agent: Agent) {
+        draftSoul = agent.soul
+        draftMemory = agent.memoryText
     }
 
     private func isSelectedModelConfigured(_ identifier: String) -> Bool {
@@ -492,9 +492,9 @@ struct PersonaEditor: View {
     }
 }
 
-struct PersonaHeartbeatEditor: View {
-    let heartbeat: PersonaHeartbeat
-    @ObservedObject var store: PersonaStore
+struct AgentHeartbeatEditor: View {
+    let heartbeat: AgentHeartbeat
+    @ObservedObject var store: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var chatStore: ChatStore
 
@@ -532,7 +532,7 @@ struct PersonaHeartbeatEditor: View {
                 Text("Instruction")
                     .font(.system(size: 14, weight: .medium))
 
-                Text("Tell the persona what to consider when this heartbeat runs.")
+                Text("Tell the agent what to consider when this heartbeat runs.")
                     .font(.system(size: 13))
                     .foregroundStyle(OpenUITheme.foregroundMuted)
 
@@ -553,10 +553,10 @@ struct PersonaHeartbeatEditor: View {
 
             OpenUISettingsRow(
                 title: "Model",
-                description: "Override the persona's default for this heartbeat."
+                description: "Override the agent's default for this heartbeat."
             ) {
                 Picker("Model", selection: modelIdentifier) {
-                    Text("Persona default (\(personaDefaultModelName))")
+                    Text("Agent default (\(agentDefaultModelName))")
                         .tag("")
 
                     Section("Override") {
@@ -650,7 +650,7 @@ struct PersonaHeartbeatEditor: View {
             } else {
                 OpenUIDivider()
 
-                Text("The persona may post a reply, append memory, or pass.")
+                Text("The agent may post a reply, append memory, or pass.")
                     .font(.system(size: 12))
                     .foregroundStyle(OpenUITheme.foregroundSubtle)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -693,11 +693,11 @@ struct PersonaHeartbeatEditor: View {
         )
     }
 
-    private var personaDefaultModelName: String {
-        guard let persona = store.persona(for: heartbeat.personaID) else {
-            return "Missing persona"
+    private var agentDefaultModelName: String {
+        guard let agent = store.agent(for: heartbeat.agentID) else {
+            return "Missing agent"
         }
-        return localModelStore.displayName(for: persona.selectedModelIdentifier)
+        return localModelStore.displayName(for: agent.selectedModelIdentifier)
     }
 
     private func isModelConfigured(_ identifier: String) -> Bool {
@@ -732,7 +732,7 @@ struct PersonaHeartbeatEditor: View {
     }
 }
 
-struct ResizablePersonaTextEditor: View {
+struct ResizableAgentTextEditor: View {
     @Binding var text: String
     @Binding var height: CGFloat
     let resizeHelpText: String
@@ -756,8 +756,8 @@ struct ResizablePersonaTextEditor: View {
                                 let startHeight = dragStartHeight ?? height
                                 dragStartHeight = startHeight
                                 height = min(
-                                    max(startHeight + value.translation.height, minimumPersonaTextEditorHeight),
-                                    maximumPersonaTextEditorHeight
+                                    max(startHeight + value.translation.height, minimumAgentTextEditorHeight),
+                                    maximumAgentTextEditorHeight
                                 )
                             }
                             .onEnded { _ in
@@ -862,13 +862,13 @@ struct ResizeGrip: View {
     }
 }
 
-#Preview("Personas Preferences") {
-    PersonasPreferencesViewPreview()
+#Preview("Agents Preferences") {
+    AgentsPreferencesViewPreview()
 }
 
-private struct PersonasPreferencesViewPreview: View {
+private struct AgentsPreferencesViewPreview: View {
     private let modelContainer: ModelContainer
-    private let personaStore: PersonaStore
+    private let agentStore: AgentStore
     private let localModelStore: LocalModelStore
     private let textToSpeechToolStore: TextToSpeechToolStore
     private let chatStore: ChatStore
@@ -877,8 +877,8 @@ private struct PersonasPreferencesViewPreview: View {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
             let container = try ModelContainer(
-                for: Persona.self,
-                PersonaHeartbeat.self,
+                for: Agent.self,
+                AgentHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
                 TextToSpeechTool.self,
@@ -903,7 +903,7 @@ private struct PersonasPreferencesViewPreview: View {
 
             for name in ["Joe", "Maya", "Rowan", "Sam"] {
                 context.insert(
-                    Persona(
+                    Agent(
                         name: name,
                         soul: "Be a thoughtful participant in the conversation.",
                         modelIdentifier: ChatModelIdentifier.localModelID(localModel.id)
@@ -912,26 +912,26 @@ private struct PersonasPreferencesViewPreview: View {
             }
             try context.save()
 
-            let personaStore = PersonaStore(modelContext: context)
+            let agentStore = AgentStore(modelContext: context)
             let localModelStore = LocalModelStore(modelContext: context)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: context)
             modelContainer = container
-            self.personaStore = personaStore
+            self.agentStore = agentStore
             self.localModelStore = localModelStore
             self.textToSpeechToolStore = textToSpeechToolStore
             chatStore = ChatStore(
-                personaStore: personaStore,
+                agentStore: agentStore,
                 localModelStore: localModelStore,
                 modelContext: context
             )
         } catch {
-            fatalError("Failed to create Personas preferences preview: \(error.localizedDescription)")
+            fatalError("Failed to create Agents preferences preview: \(error.localizedDescription)")
         }
     }
 
     var body: some View {
-        PersonasPreferencesView(
-            store: personaStore,
+        AgentsPreferencesView(
+            store: agentStore,
             localModelStore: localModelStore,
             textToSpeechToolStore: textToSpeechToolStore,
             chatStore: chatStore
