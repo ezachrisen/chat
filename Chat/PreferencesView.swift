@@ -9,6 +9,7 @@ import AppKit
 enum PreferencesSection: String, CaseIterable, Identifiable {
     case agents
     case models
+    case skills
     case textToSpeech
 
     var id: Self { self }
@@ -19,6 +20,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return "Agents"
         case .models:
             return "Models"
+        case .skills:
+            return "Skills"
         case .textToSpeech:
             return "Text to Speech"
         }
@@ -30,6 +33,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return "person.2"
         case .models:
             return "cpu"
+        case .skills:
+            return "book"
         case .textToSpeech:
             return "waveform"
         }
@@ -65,6 +70,8 @@ struct PreferencesView: View {
     @ObservedObject var agentStore: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
+    @ObservedObject var skillCatalog: SkillCatalog
+    @ObservedObject var replyFilterStore: ReplyFilterStore
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var navigation: PreferencesNavigation
 
@@ -79,10 +86,13 @@ struct PreferencesView: View {
                         store: agentStore,
                         localModelStore: localModelStore,
                         textToSpeechToolStore: textToSpeechToolStore,
+                        skillCatalog: skillCatalog,
                         chatStore: chatStore
                     )
                 case .models:
-                    ModelPreferencesView(store: localModelStore)
+                    ModelPreferencesView(store: localModelStore, replyFilterStore: replyFilterStore)
+                case .skills:
+                    SkillPreferencesView(catalog: skillCatalog)
                 case .textToSpeech:
                     TextToSpeechPreferencesView(store: textToSpeechToolStore)
                 }
@@ -395,6 +405,7 @@ struct OpenUIDangerButtonStyle: ButtonStyle {
 
 struct ModelPreferencesView: View {
     @ObservedObject var store: LocalModelStore
+    @ObservedObject var replyFilterStore: ReplyFilterStore
 
     var body: some View {
         ScrollView {
@@ -402,7 +413,7 @@ struct ModelPreferencesView: View {
                 HStack(alignment: .top, spacing: 24) {
                     OpenUIPageHeader(
                         title: "Models",
-                        description: "Configure local servers that expose OpenAI-compatible models and chat completions APIs."
+                        description: "Configure local servers and the reply filters that strip hidden control text from each model."
                     )
 
                     Spacer()
@@ -414,6 +425,8 @@ struct ModelPreferencesView: View {
                     }
                     .buttonStyle(OpenUIPrimaryButtonStyle())
                 }
+
+                AppleFoundationModelEditor(replyFilterStore: replyFilterStore)
 
                 if store.localModels.isEmpty {
                     VStack(spacing: 12) {
@@ -436,7 +449,11 @@ struct ModelPreferencesView: View {
                 } else {
                     VStack(spacing: 16) {
                         ForEach(store.localModels) { model in
-                            LocalModelEditor(model: model, store: store)
+                            LocalModelEditor(
+                                model: model,
+                                store: store,
+                                replyFilterStore: replyFilterStore
+                            )
                         }
                     }
                 }
@@ -584,9 +601,82 @@ private struct TextToSpeechToolEditor: View {
     }
 }
 
+private struct AppleFoundationModelEditor: View {
+    @ObservedObject var replyFilterStore: ReplyFilterStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: "applelogo")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(OpenUITheme.accent)
+                    .frame(width: 34, height: 34)
+                    .background(OpenUITheme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Apple Foundation Model")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(OpenUITheme.foreground)
+
+                    Text("On-device Apple Intelligence")
+                        .font(.system(size: 12))
+                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                }
+
+                Spacer()
+            }
+            .padding(16)
+
+            OpenUIDivider()
+
+            ReplyFilterPatternsEditor(
+                modelIdentifier: ChatModelIdentifier.appleFoundation,
+                store: replyFilterStore
+            )
+        }
+        .openUICard()
+    }
+}
+
+private struct ReplyFilterPatternsEditor: View {
+    let modelIdentifier: String
+    @ObservedObject var store: ReplyFilterStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Reply filters")
+                .font(.system(size: 14, weight: .medium))
+
+            Text("One regular expression per line. Matches are removed from the visible reply. Lines starting with # are ignored.")
+                .font(.system(size: 13))
+                .foregroundStyle(OpenUITheme.foregroundMuted)
+
+            TextEditor(text: patternsText)
+                .font(.system(size: 13, design: .monospaced))
+                .frame(minHeight: 92, maxHeight: 160)
+                .padding(8)
+                .scrollContentBackground(.hidden)
+                .background(OpenUITheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(OpenUITheme.border, lineWidth: 1)
+                }
+        }
+        .padding(16)
+    }
+
+    private var patternsText: Binding<String> {
+        Binding(
+            get: { store.patternsText(for: modelIdentifier) },
+            set: { store.updatePatternsText(for: modelIdentifier, text: $0) }
+        )
+    }
+}
+
 private struct LocalModelEditor: View {
     let model: LocalModel
     @ObservedObject var store: LocalModelStore
+    @ObservedObject var replyFilterStore: ReplyFilterStore
     @State private var bearerToken = ""
     @State private var availableModelIDs: [String] = []
     @State private var isLoadingModels = false
@@ -733,6 +823,13 @@ private struct LocalModelEditor: View {
                         .stroke(OpenUITheme.warningBorder, lineWidth: 1)
                 }
             }
+
+            OpenUIDivider()
+
+            ReplyFilterPatternsEditor(
+                modelIdentifier: ChatModelIdentifier.localModelID(model.id),
+                store: replyFilterStore
+            )
         }
         .openUICard()
         .onAppear {
@@ -807,6 +904,8 @@ private struct PreferencesViewPreview: View {
     private let agentStore: AgentStore
     private let localModelStore: LocalModelStore
     private let textToSpeechToolStore: TextToSpeechToolStore
+    private let skillCatalog: SkillCatalog
+    private let replyFilterStore: ReplyFilterStore
     private let chatStore: ChatStore
     private let navigation = PreferencesNavigation()
 
@@ -818,6 +917,7 @@ private struct PreferencesViewPreview: View {
                 AgentHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
+                ReplyFilterSet.self,
                 TextToSpeechTool.self,
                 StoredChat.self,
                 StoredGroupChatParticipant.self,
@@ -846,13 +946,19 @@ private struct PreferencesViewPreview: View {
             let agentStore = AgentStore(modelContext: context)
             let localModelStore = LocalModelStore(modelContext: context)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: context)
+            let skillCatalog = SkillCatalog()
+            let replyFilterStore = ReplyFilterStore(modelContext: context)
             modelContainer = container
             self.agentStore = agentStore
             self.localModelStore = localModelStore
             self.textToSpeechToolStore = textToSpeechToolStore
+            self.skillCatalog = skillCatalog
+            self.replyFilterStore = replyFilterStore
             chatStore = ChatStore(
                 agentStore: agentStore,
                 localModelStore: localModelStore,
+                skillCatalog: skillCatalog,
+                replyFilterStore: replyFilterStore,
                 modelContext: context
             )
         } catch {
@@ -865,6 +971,8 @@ private struct PreferencesViewPreview: View {
             agentStore: agentStore,
             localModelStore: localModelStore,
             textToSpeechToolStore: textToSpeechToolStore,
+            skillCatalog: skillCatalog,
+            replyFilterStore: replyFilterStore,
             chatStore: chatStore,
             navigation: navigation
         )

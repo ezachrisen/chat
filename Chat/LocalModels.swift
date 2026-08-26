@@ -159,6 +159,15 @@ final class LocalModelStore: ObservableObject {
 
     func remove(_ model: LocalModel) {
         LocalModelCredentials.deleteToken(for: model.id)
+        let identifier = ChatModelIdentifier.localModelID(model.id)
+        let descriptor = FetchDescriptor<ReplyFilterSet>(
+            predicate: #Predicate { $0.modelIdentifier == identifier }
+        )
+        if let filters = try? modelContext.fetch(descriptor) {
+            for set in filters {
+                modelContext.delete(set)
+            }
+        }
         modelContext.delete(model)
         saveChanges()
         loadModels()
@@ -304,157 +313,4 @@ private extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
     }
-}
-
-enum OpenAICompatibleError: LocalizedError {
-    case invalidEndpoint
-    case invalidResponse
-    case noModels
-    case server(statusCode: Int, message: String)
-
-    var errorDescription: String? {
-        switch self {
-        case .invalidEndpoint:
-            return "The local model server URL is invalid."
-        case .invalidResponse:
-            return "The local model returned an unexpected response."
-        case .noModels:
-            return "The server did not report any models."
-        case .server(_, let message):
-            return message
-        }
-    }
-}
-
-struct OpenAICompatibleClient: Sendable {
-    private let configuration: LocalModelConfiguration
-
-    init(configuration: LocalModelConfiguration) {
-        self.configuration = configuration
-    }
-
-    func listModels() async throws -> [String] {
-        var request = makeRequest(url: try configuration.modelsURL())
-        request.httpMethod = "GET"
-        request.timeoutInterval = 10
-
-        let data = try await perform(request)
-        let response = try JSONDecoder().decode(OpenAIModelsResponse.self, from: data)
-        let modelIDs = Set(
-            response.data
-                .map(\.id)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-        )
-
-        guard !modelIDs.isEmpty else {
-            throw OpenAICompatibleError.noModels
-        }
-
-        return modelIDs.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-    }
-
-    func respond(systemPrompt: String, messages: [ChatMessage]) async throws -> String {
-        try await respond(
-            systemPrompt: systemPrompt,
-            apiMessages: messages.map {
-                OpenAIChatMessage(role: $0.role.rawValue, content: $0.text)
-            }
-        )
-    }
-
-    func respond(systemPrompt: String, prompt: String) async throws -> String {
-        try await respond(
-            systemPrompt: systemPrompt,
-            apiMessages: [OpenAIChatMessage(role: "user", content: prompt)]
-        )
-    }
-
-    private func respond(systemPrompt: String, apiMessages: [OpenAIChatMessage]) async throws -> String {
-        var request = makeRequest(url: try configuration.chatCompletionsURL())
-        request.httpMethod = "POST"
-
-        let requestBody = OpenAIChatCompletionRequest(
-            model: configuration.modelID.trimmingCharacters(in: .whitespacesAndNewlines),
-            messages: [OpenAIChatMessage(role: "system", content: systemPrompt)] + apiMessages
-        )
-        request.httpBody = try JSONEncoder().encode(requestBody)
-
-        let data = try await perform(request)
-        let completion = try JSONDecoder().decode(OpenAIChatCompletionResponse.self, from: data)
-        guard let content = completion.choices.first?.message.content?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !content.isEmpty else {
-            throw OpenAICompatibleError.invalidResponse
-        }
-
-        return content
-    }
-
-    private func makeRequest(url: URL) -> URLRequest {
-        var request = URLRequest(url: url)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        if let bearerToken = configuration.bearerToken {
-            request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
-        }
-
-        return request
-    }
-
-    private func perform(_ request: URLRequest) async throws -> Data {
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw OpenAICompatibleError.invalidResponse
-        }
-
-        guard (200...299).contains(httpResponse.statusCode) else {
-            let errorPayload = try? JSONDecoder().decode(OpenAIErrorResponse.self, from: data)
-            let fallbackMessage = String(data: data, encoding: .utf8) ?? "The local model server returned an error."
-            throw OpenAICompatibleError.server(
-                statusCode: httpResponse.statusCode,
-                message: errorPayload?.error.message ?? fallbackMessage
-            )
-        }
-
-        return data
-    }
-}
-
-private struct OpenAIModelsResponse: Decodable {
-    struct Model: Decodable {
-        let id: String
-    }
-
-    let data: [Model]
-}
-
-private struct OpenAIChatCompletionRequest: Encodable {
-    let model: String
-    let messages: [OpenAIChatMessage]
-}
-
-private struct OpenAIChatMessage: Codable {
-    let role: String
-    let content: String
-}
-
-private struct OpenAIChatCompletionResponse: Decodable {
-    struct Choice: Decodable {
-        struct Message: Decodable {
-            let content: String?
-        }
-
-        let message: Message
-    }
-
-    let choices: [Choice]
-}
-
-private struct OpenAIErrorResponse: Decodable {
-    struct APIError: Decodable {
-        let message: String
-    }
-
-    let error: APIError
 }

@@ -18,6 +18,7 @@ enum ChatModelContainer {
             AgentHeartbeat.self,
             HeartbeatRun.self,
             LocalModel.self,
+            ReplyFilterSet.self,
             TextToSpeechTool.self,
             StoredChat.self,
             StoredGroupChatParticipant.self,

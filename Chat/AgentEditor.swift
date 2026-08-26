@@ -9,6 +9,7 @@ struct AgentsPreferencesView: View {
     @ObservedObject var store: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
+    @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var chatStore: ChatStore
     @State private var isPresentingEditor = false
 
@@ -102,6 +103,7 @@ struct AgentsPreferencesView: View {
                     store: store,
                     localModelStore: localModelStore,
                     textToSpeechToolStore: textToSpeechToolStore,
+                    skillCatalog: skillCatalog,
                     chatStore: chatStore
                 )
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -120,6 +122,7 @@ struct AgentEditor: View {
     @ObservedObject var store: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
+    @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var chatStore: ChatStore
     @State private var draftSoul = ""
     @State private var soulEditorHeight: CGFloat = 360
@@ -213,7 +216,10 @@ struct AgentEditor: View {
                     .openUICard()
             }
         }
-        .onAppear(perform: loadSelectedAgent)
+        .onAppear {
+            loadSelectedAgent()
+            skillCatalog.reload()
+        }
         .onChange(of: store.selectedAgentID) {
             loadSelectedAgent()
         }
@@ -387,6 +393,82 @@ struct AgentEditor: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     OpenUISectionHeader(
+                        title: "Tools",
+                        description: "Off until you enable them. The agent can only call tools that are on."
+                    )
+
+                    VStack(spacing: 0) {
+                        ForEach(Array(AgentToolID.allCases.enumerated()), id: \.element.id) { index, toolID in
+                            OpenUISettingsRow(
+                                title: toolID.title,
+                                description: toolID.description
+                            ) {
+                                Toggle(
+                                    toolID.title,
+                                    isOn: toolEnabled(toolID)
+                                )
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                                .tint(OpenUITheme.accent)
+                                .disabled(selectedAgent == nil)
+                            }
+
+                            if index < AgentToolID.allCases.count - 1 {
+                                OpenUIDivider()
+                            }
+                        }
+                    }
+                    .openUICard()
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    OpenUISectionHeader(
+                        title: "Skills",
+                        description: "Off until you enable them here. A skill must also be on in Settings."
+                    )
+
+                    if skillCatalog.enabledSkills.isEmpty {
+                        VStack(spacing: 8) {
+                            Text("No skills are enabled")
+                                .font(.system(size: 14, weight: .medium))
+
+                            Text("Turn on a skill in Settings → Skills, then it will appear here.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(OpenUITheme.foregroundMuted)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 28)
+                        .openUICard()
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(Array(skillCatalog.enabledSkills.enumerated()), id: \.element.id) { index, skill in
+                                OpenUISettingsRow(
+                                    title: skill.name,
+                                    description: skill.description.isEmpty
+                                        ? "No description in SKILL.md."
+                                        : skill.description
+                                ) {
+                                    Toggle(
+                                        skill.name,
+                                        isOn: skillEnabled(skill.name)
+                                    )
+                                    .toggleStyle(.switch)
+                                    .labelsHidden()
+                                    .tint(OpenUITheme.accent)
+                                    .disabled(selectedAgent == nil)
+                                }
+
+                                if index < skillCatalog.enabledSkills.count - 1 {
+                                    OpenUIDivider()
+                                }
+                            }
+                        }
+                        .openUICard()
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    OpenUISectionHeader(
                         title: "Memory",
                         description: "You can edit all memory; the agent can only append new entries."
                     )
@@ -488,6 +570,24 @@ struct AgentEditor: View {
     private func isSelectedModelConfigured(_ identifier: String) -> Bool {
         identifier == ChatModelIdentifier.appleFoundation || localModelStore.localModels.contains {
             ChatModelIdentifier.localModelID($0.id) == identifier
+        }
+    }
+
+    private func toolEnabled(_ toolID: AgentToolID) -> Binding<Bool> {
+        Binding {
+            selectedAgent?.isToolEnabled(toolID) ?? false
+        } set: { newValue in
+            guard let agentID = selectedAgent?.id else { return }
+            store.setTool(toolID, enabled: newValue, for: agentID)
+        }
+    }
+
+    private func skillEnabled(_ skillID: String) -> Binding<Bool> {
+        Binding {
+            selectedAgent?.isSkillEnabled(skillID) ?? false
+        } set: { newValue in
+            guard let agentID = selectedAgent?.id else { return }
+            store.setSkill(skillID, enabled: newValue, for: agentID)
         }
     }
 }
@@ -871,6 +971,7 @@ private struct AgentsPreferencesViewPreview: View {
     private let agentStore: AgentStore
     private let localModelStore: LocalModelStore
     private let textToSpeechToolStore: TextToSpeechToolStore
+    private let skillCatalog: SkillCatalog
     private let chatStore: ChatStore
 
     init() {
@@ -881,6 +982,7 @@ private struct AgentsPreferencesViewPreview: View {
                 AgentHeartbeat.self,
                 HeartbeatRun.self,
                 LocalModel.self,
+                ReplyFilterSet.self,
                 TextToSpeechTool.self,
                 StoredChat.self,
                 StoredGroupChatParticipant.self,
@@ -915,13 +1017,18 @@ private struct AgentsPreferencesViewPreview: View {
             let agentStore = AgentStore(modelContext: context)
             let localModelStore = LocalModelStore(modelContext: context)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: context)
+            let skillCatalog = SkillCatalog()
+            let replyFilterStore = ReplyFilterStore(modelContext: context)
             modelContainer = container
             self.agentStore = agentStore
             self.localModelStore = localModelStore
             self.textToSpeechToolStore = textToSpeechToolStore
+            self.skillCatalog = skillCatalog
             chatStore = ChatStore(
                 agentStore: agentStore,
                 localModelStore: localModelStore,
+                skillCatalog: skillCatalog,
+                replyFilterStore: replyFilterStore,
                 modelContext: context
             )
         } catch {
@@ -934,6 +1041,7 @@ private struct AgentsPreferencesViewPreview: View {
             store: agentStore,
             localModelStore: localModelStore,
             textToSpeechToolStore: textToSpeechToolStore,
+            skillCatalog: skillCatalog,
             chatStore: chatStore
         )
         .modelContainer(modelContainer)

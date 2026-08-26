@@ -2,14 +2,19 @@
 
 This document describes the context the chat harness sends to a model for normal replies and scheduled heartbeats. Keep it updated whenever persistence, prompt construction, memory handling, message loading, or orchestration changes.
 
-Implementation snapshot: August 24, 2026.
+Implementation snapshot: August 25, 2026.
 
 Primary implementation:
 
-- `Chat/ContentView.swift`: persistence, turn orchestration, and prompt construction
-- `Chat/LocalModels.swift`: OpenAI-compatible request construction
+- `Chat/ModelClient.swift`: Apple Foundation and OpenAI-compatible model calls, including tool loops
+- `Chat/ModelPrompts.swift`: system and conversation prompt construction
+- `Chat/AgentMemory.swift`: memory protocol sent to models and parsed from replies
+- `Chat/SkillCatalog.swift`: `~/.chat/skills` discovery and global enablement
+- `Chat/SkillTools.swift`: `ReadSkillFileTool` and `ExecuteSkillScript`, confined to a skill folder
+- `Chat/ChatViewModel.swift`: turn orchestration
+- `Chat/LocalModels.swift`: local model CRUD and backend selection
 - `Chat/GroupChats.swift`: group participants and `@mention` parsing
-- `Chat/AgentHeartbeats.swift`: memory protocol, heartbeat persistence, and scheduling
+- `Chat/AgentHeartbeats.swift`: heartbeat persistence and scheduling
 
 ## Agent state and snapshot boundaries
 
@@ -20,6 +25,7 @@ An agent has:
 - Persistent memory
 - A selected model
 - Optional text-to-speech settings: a configured tool, voice name, and voice model
+- Per-agent enablement of model tools and skills
 - Zero or more heartbeat schedules
 
 Text-to-speech settings are live agent configuration and are not included in model prompts. While voice mode is active, each visible assistant response is sent to the responding agent's selected command-line tool using its configured voice name and voice model, then the generated WAV file is played.
@@ -50,7 +56,12 @@ Individual agent instructions:
 <individual instructions or default>
 
 <memory section and memory rules>
+
+Available skills:
+- <skill name>: <skill description>
 ```
+
+The skills section is omitted when no skills are enabled both globally in Settings and for that agent. Enabled skills are listed by YAML `name` and `description` from `SKILL.md`. The model can read files with `ReadSkillFileTool(skill_name, file_name)` and run scripts with `ExecuteSkillScript(skill_name, script_name, arguments)`. Paths are confined to that skill's folder under `~/.chat/skills`.
 
 Ordinary group replies use an equivalent structure inside the group-specific system prompt.
 
