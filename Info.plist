@@ -23,6 +23,10 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSUserNotificationAlertStyle</key>
+	<string>banner</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Chat reads your calendars so an agent can look up events you allow it to see.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Chat uses the microphone to transcribe your voice into a message.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

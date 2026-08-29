@@ -16,6 +16,23 @@ enum ModelPrompts {
         return trimmed.isEmpty ? defaultGroupInstructions : trimmed
     }
 
+    static func currentDateTimeSection(now: Date = .now) -> String {
+        let timeZone = TimeZone.current
+
+        let readable = DateFormatter()
+        readable.locale = Locale.current
+        readable.timeZone = timeZone
+        readable.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm:ss a zzz"
+
+        let iso = ISO8601DateFormatter()
+        iso.timeZone = timeZone
+        iso.formatOptions = [.withInternetDateTime]
+
+        return """
+        Current date and time: \(readable.string(from: now)) (\(iso.string(from: now)), \(timeZone.identifier))
+        """
+    }
+
     static func agentSystemInstructions(
         agentName: String,
         soul: String,
@@ -25,11 +42,30 @@ enum ModelPrompts {
         """
         Your agent name is \(agentName).
 
+        \(currentDateTimeSection())
+
         Individual agent instructions:
         \(individualInstructions(soul: soul))
 
         \(AgentMemoryHarness.instructionSection(memory: memory))
         \(skillsPrompt)
+        """
+    }
+
+    static func toolsPrompt(enabledIDs: Set<String>) -> String {
+        let enabled = AgentToolID.allCases.filter { enabledIDs.contains($0.rawValue) }
+        guard !enabled.isEmpty else { return "" }
+
+        let lines = enabled.map { tool in
+            "- \(tool.rawValue): \(tool.toolDescription)"
+        }.joined(separator: "\n")
+
+        return """
+
+        Available tools:
+        \(lines)
+
+        Call a tool by its exact name when the instruction requires it. You may call multiple tools in sequence. Describing a tool or putting its intended output in your reply does not invoke it.
         """
     }
 
@@ -62,6 +98,8 @@ enum ModelPrompts {
         """
         You are \(agentName), a participant in an open group discussion.
 
+        \(currentDateTimeSection())
+
         Individual agent instructions:
         \(individualInstructions(soul: soul))
 
@@ -91,7 +129,7 @@ enum ModelPrompts {
             : "The latest user message does not directly mention you. You may still respond if it feels natural and useful."
 
         return """
-        Here is the complete group conversation so far:
+        Here is the group conversation so far:
 
         \(transcript)
 
@@ -102,11 +140,36 @@ enum ModelPrompts {
 
     static func directConversationPrompt(agentName: String, transcript: String) -> String {
         """
-        Here is the complete private conversation so far:
+        Here is the private conversation so far:
 
         \(transcript)
 
         Reply to the latest user message as \(agentName).
+        """
+    }
+
+    static func withDigest(_ digest: String, recent: String) -> String {
+        let trimmed = digest.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return recent }
+        let recentText = recent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        Earlier in this conversation (summarized):
+        \(trimmed)
+
+        Recent messages:
+        \(recentText.isEmpty ? "(none)" : recentText)
+        """
+    }
+
+    static func digestSystemSection(_ digest: String) -> String {
+        let trimmed = digest.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return """
+
+        Earlier in this conversation (summarized):
+        \(trimmed)
+
+        Recent messages follow as native chat turns.
         """
     }
 
@@ -130,8 +193,10 @@ enum ModelPrompts {
             \(agentInstructions)
 
             You are running a scheduled heartbeat for your private chat.
-            Follow the heartbeat instruction using the conversation as context.
-            If there is nothing worth posting, reply with exactly [[PASS]].
+            This run is standalone. You do not have the chat transcript or prior messages.
+            Follow the heartbeat instruction, including any tool calls it requires.
+            Tool calls are not chat messages.
+            If nothing should be posted to the chat, reply with exactly [[PASS]] after you finish any required tools.
             You may still append memory even when you pass.
             """
         }
@@ -143,11 +208,11 @@ enum ModelPrompts {
         \(resolvedGroupInstructions(groupInstructions))
 
         You are running a scheduled heartbeat for this group discussion.
-        You see the complete conversation between the user and every agent in the group.
-        Messages labeled with another agent's name were written by that agent, not by you.
-        Follow the heartbeat instruction and post only when it adds something natural or useful.
+        This run is standalone. You do not have the chat transcript or prior messages.
+        Follow the heartbeat instruction, including any tool calls it requires.
+        Tool calls are not chat messages.
         Do not prefix your reply with your name; the interface adds it for you.
-        If there is nothing worth posting, reply with exactly [[PASS]].
+        If nothing should be posted to the chat, reply with exactly [[PASS]] after you finish any required tools.
         You may still append memory even when you pass.
         """
     }
@@ -155,10 +220,7 @@ enum ModelPrompts {
     static func heartbeatConversationPrompt(
         agentName: String,
         instruction: String,
-        isGroupChat: Bool,
-        transcript: String,
         lastCompletedAt: Date?,
-        unansweredMessageCount: Int,
         referenceDate: Date
     ) -> String {
         let lastCompletionDescription: String
@@ -169,18 +231,15 @@ enum ModelPrompts {
         }
 
         return """
-        Here is the complete \(isGroupChat ? "group" : "private") conversation so far:
-        Message ages are relative to the start of this heartbeat run.
-
-        \(transcript)
+        This is a standalone scheduled heartbeat. You do not have the chat transcript.
 
         Time since this heartbeat last completed: \(lastCompletionDescription).
-        Number of unanswered messages in this chat: \(unansweredMessageCount).
 
         Scheduled heartbeat instruction:
         \(instruction)
 
-        Decide whether to post as \(agentName). Return [[PASS]] if no message should be posted.
+        Follow that instruction completely, including any tools it names.
+        Then decide whether to post as \(agentName). Return [[PASS]] if no chat message should be posted.
         """
     }
 
@@ -195,32 +254,6 @@ enum ModelPrompts {
                 : message.authorName ?? (isGroupChat ? "Agent" : fallbackAgentName)
             return "\(speaker): \(message.text)"
         }.joined(separator: "\n\n")
-    }
-
-    static func heartbeatTranscript(
-        messages: [StoredChatMessage],
-        isGroupChat: Bool,
-        fallbackAgentName: String,
-        relativeTo referenceDate: Date
-    ) -> String {
-        guard !messages.isEmpty else { return "(No messages yet.)" }
-
-        return messages.map { message in
-            let speaker = message.role == .user
-                ? "User"
-                : message.authorName ?? (isGroupChat ? "Agent" : fallbackAgentName)
-            let age = compactElapsedTime(from: message.createdAt, to: referenceDate)
-            return "[\(age) ago] \(speaker): \(message.text)"
-        }.joined(separator: "\n\n")
-    }
-
-    static func unansweredMessageCount(in messages: [StoredChatMessage]) -> Int {
-        var count = 0
-        for message in messages.reversed() {
-            guard message.role != .user else { break }
-            count += 1
-        }
-        return count
     }
 
     static func isPassResponse(_ response: String) -> Bool {

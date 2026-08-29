@@ -29,13 +29,15 @@ enum ReplySanitizer {
         let parsed = AgentMemoryHarness.parse(response)
         let wasPass = ModelPrompts.isPassResponse(parsed.visibleText)
         var visible = apply(patterns, to: parsed.visibleText)
-        visible = visible
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        visible = visible.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        visible = visible.trimmingCharacters(in: .whitespacesAndNewlines)
         let isPass = wasPass || ModelPrompts.isPassResponse(visible)
+        if isPass || visible.isEmpty {
+            visible = ""
+        }
         return (
             AgentModelOutput(
-                visibleText: isPass ? "" : visible,
+                visibleText: visible,
                 memoryEntries: parsed.memoryEntries
             ),
             isPass

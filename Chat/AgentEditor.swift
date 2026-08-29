@@ -11,6 +11,7 @@ struct AgentsPreferencesView: View {
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var chatStore: ChatStore
+    @ObservedObject var heartbeatScheduler: HeartbeatScheduler
     @State private var isPresentingEditor = false
 
     var body: some View {
@@ -104,7 +105,8 @@ struct AgentsPreferencesView: View {
                     localModelStore: localModelStore,
                     textToSpeechToolStore: textToSpeechToolStore,
                     skillCatalog: skillCatalog,
-                    chatStore: chatStore
+                    chatStore: chatStore,
+                    heartbeatScheduler: heartbeatScheduler
                 )
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -124,6 +126,8 @@ struct AgentEditor: View {
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var chatStore: ChatStore
+    @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+    @ObservedObject private var calendarDirectory = CalendarDirectory.shared
     @State private var draftSoul = ""
     @State private var soulEditorHeight: CGFloat = 360
     @State private var draftMemory = ""
@@ -219,9 +223,11 @@ struct AgentEditor: View {
         .onAppear {
             loadSelectedAgent()
             skillCatalog.reload()
+            prepareCalendarsIfNeeded()
         }
         .onChange(of: store.selectedAgentID) {
             loadSelectedAgent()
+            prepareCalendarsIfNeeded()
         }
     }
 
@@ -399,22 +405,30 @@ struct AgentEditor: View {
 
                     VStack(spacing: 0) {
                         ForEach(Array(AgentToolID.allCases.enumerated()), id: \.element.id) { index, toolID in
-                            OpenUISettingsRow(
-                                title: toolID.title,
-                                description: toolID.description
-                            ) {
-                                Toggle(
-                                    toolID.title,
-                                    isOn: toolEnabled(toolID)
-                                )
-                                .toggleStyle(.switch)
-                                .labelsHidden()
-                                .tint(OpenUITheme.accent)
-                                .disabled(selectedAgent == nil)
-                            }
+                            VStack(spacing: 0) {
+                                OpenUISettingsRow(
+                                    title: toolID.title,
+                                    description: toolID.description
+                                ) {
+                                    Toggle(
+                                        toolID.title,
+                                        isOn: toolEnabled(toolID)
+                                    )
+                                    .toggleStyle(.switch)
+                                    .labelsHidden()
+                                    .tint(OpenUITheme.accent)
+                                    .disabled(selectedAgent == nil)
+                                }
 
-                            if index < AgentToolID.allCases.count - 1 {
-                                OpenUIDivider()
+                                if toolID == .readCalendarEvents,
+                                   selectedAgent?.isToolEnabled(.readCalendarEvents) == true {
+                                    OpenUIDivider()
+                                    calendarAccessPanel
+                                }
+
+                                if index < AgentToolID.allCases.count - 1 {
+                                    OpenUIDivider()
+                                }
                             }
                         }
                     }
@@ -465,6 +479,27 @@ struct AgentEditor: View {
                         }
                         .openUICard()
                     }
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    OpenUISectionHeader(
+                        title: "Diagnostics",
+                        description: "Optional logs for inspecting prompts and tool traces."
+                    )
+
+                    VStack(spacing: 0) {
+                        OpenUISettingsRow(
+                            title: "Debug log",
+                            description: "Store the full model prompt and intermediate output for this agent’s chats and heartbeats. Off by default — this is a lot of data."
+                        ) {
+                            Toggle("Debug log", isOn: debugLogEnabled)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                                .tint(OpenUITheme.accent)
+                                .disabled(selectedAgent == nil)
+                        }
+                    }
+                    .openUICard()
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -542,7 +577,8 @@ struct AgentEditor: View {
                                     heartbeat: heartbeat,
                                     store: store,
                                     localModelStore: localModelStore,
-                                    chatStore: chatStore
+                                    chatStore: chatStore,
+                                    heartbeatScheduler: heartbeatScheduler
                                 )
                             }
                         }
@@ -579,7 +615,139 @@ struct AgentEditor: View {
         } set: { newValue in
             guard let agentID = selectedAgent?.id else { return }
             store.setTool(toolID, enabled: newValue, for: agentID)
+            if toolID == .readCalendarEvents, newValue {
+                Task { await calendarDirectory.prepare() }
+            }
         }
+    }
+
+    private var calendarAccessAll: Binding<Bool> {
+        Binding {
+            selectedAgent?.allowsAllCalendars ?? true
+        } set: { newValue in
+            guard let agentID = selectedAgent?.id else { return }
+            store.setCalendarAccessAll(
+                newValue,
+                selecting: newValue ? [] : calendarDirectory.calendars.map(\.id),
+                for: agentID
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var calendarAccessPanel: some View {
+        OpenUISettingsRow(
+            title: "Calendars",
+            description: calendarAccessDescription
+        ) {
+            HStack(spacing: 10) {
+                if calendarDirectory.isRequestingAccess {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
+                Picker("Calendars", selection: calendarAccessAll) {
+                    Text("All").tag(true)
+                    Text("Selected").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 200)
+                .disabled(selectedAgent == nil)
+            }
+        }
+
+        if let message = calendarDirectory.accessMessage {
+            OpenUIDivider()
+            OpenUISettingsRow(
+                title: "Calendar access",
+                description: message
+            ) {
+                if calendarDirectory.canRequestAccess {
+                    Button("Allow") {
+                        Task { await calendarDirectory.prepare() }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+
+        if calendarAccessAll.wrappedValue == false, calendarDirectory.hasFullAccess {
+            if calendarDirectory.calendars.isEmpty {
+                OpenUIDivider()
+                OpenUISettingsRow(
+                    title: "No calendars",
+                    description: "No calendars were found on this Mac."
+                ) {
+                    EmptyView()
+                }
+            } else {
+                ForEach(calendarDirectory.calendars) { calendar in
+                    OpenUIDivider()
+                    OpenUISettingsRow(
+                        title: calendar.title,
+                        description: calendar.subtitle.isEmpty
+                            ? "Stored as calendar ID \(calendar.calendarIdentifier)."
+                            : calendar.subtitle
+                    ) {
+                        HStack(spacing: 10) {
+                            Circle()
+                                .fill(
+                                    Color(
+                                        red: calendar.colorRed,
+                                        green: calendar.colorGreen,
+                                        blue: calendar.colorBlue
+                                    )
+                                )
+                                .frame(width: 8, height: 8)
+                            Toggle(
+                                calendar.title,
+                                isOn: calendarAllowed(calendar.calendarIdentifier)
+                            )
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                            .tint(OpenUITheme.accent)
+                            .disabled(selectedAgent == nil)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var calendarAccessDescription: String {
+        if selectedAgent?.allowsAllCalendars ?? true {
+            if calendarDirectory.hasFullAccess {
+                let count = calendarDirectory.calendars.count
+                if count == 1 {
+                    return "This agent can read the 1 calendar Chat can access."
+                }
+                return "This agent can read all \(count) calendars Chat can access."
+            }
+            return "This agent can read every calendar Chat is allowed to access."
+        }
+        let selectedCount = selectedAgent?.allowedCalendarIDs.count ?? 0
+        if selectedCount == 0 {
+            return "No calendars are selected. The agent will not be able to read events until you pick at least one."
+        }
+        if selectedCount == 1 {
+            return "This agent can read 1 selected calendar. Names are shown here; the agent uses calendar IDs."
+        }
+        return "This agent can read \(selectedCount) selected calendars. Names are shown here; the agent uses calendar IDs."
+    }
+
+    private func calendarAllowed(_ calendarID: String) -> Binding<Bool> {
+        Binding {
+            selectedAgent?.allowedCalendarIDs.contains(calendarID) ?? false
+        } set: { newValue in
+            guard let agentID = selectedAgent?.id else { return }
+            store.setAllowedCalendarID(calendarID, enabled: newValue, for: agentID)
+        }
+    }
+
+    private func prepareCalendarsIfNeeded() {
+        guard selectedAgent?.isToolEnabled(.readCalendarEvents) == true else { return }
+        Task { await calendarDirectory.prepare() }
     }
 
     private func skillEnabled(_ skillID: String) -> Binding<Bool> {
@@ -590,13 +758,51 @@ struct AgentEditor: View {
             store.setSkill(skillID, enabled: newValue, for: agentID)
         }
     }
+
+    private var debugLogEnabled: Binding<Bool> {
+        Binding {
+            selectedAgent?.isDebugLogEnabled ?? false
+        } set: { newValue in
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentDebugLog(id: agentID, enabled: newValue)
+        }
+    }
 }
 
 struct AgentHeartbeatEditor: View {
+    private static let executionHistoryLimit = 50
+
     let heartbeat: AgentHeartbeat
     @ObservedObject var store: AgentStore
     @ObservedObject var localModelStore: LocalModelStore
     @ObservedObject var chatStore: ChatStore
+    @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+    @Query private var executions: [HeartbeatRun]
+
+    init(
+        heartbeat: AgentHeartbeat,
+        store: AgentStore,
+        localModelStore: LocalModelStore,
+        chatStore: ChatStore,
+        heartbeatScheduler: HeartbeatScheduler
+    ) {
+        self.heartbeat = heartbeat
+        _store = ObservedObject(wrappedValue: store)
+        _localModelStore = ObservedObject(wrappedValue: localModelStore)
+        _chatStore = ObservedObject(wrappedValue: chatStore)
+        _heartbeatScheduler = ObservedObject(wrappedValue: heartbeatScheduler)
+        let heartbeatID = heartbeat.id
+        var descriptor = FetchDescriptor<HeartbeatRun>(
+            predicate: #Predicate { $0.heartbeatID == heartbeatID },
+            sortBy: [SortDescriptor(\.completedAt, order: .reverse)]
+        )
+        descriptor.fetchLimit = Self.executionHistoryLimit
+        _executions = Query(descriptor)
+    }
+
+    private var runningHeartbeat: RunningHeartbeat? {
+        heartbeatScheduler.runningHeartbeats.first { $0.id == heartbeat.id }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -698,11 +904,20 @@ struct AgentHeartbeatEditor: View {
 
             OpenUISettingsRow(
                 title: "Post to",
-                description: "Select the private or group chat that receives posts."
+                description: "Heartbeats post to this agent's default chat unless you pick another chat."
             ) {
                 Picker("Post to", selection: destination) {
-                    Text("Private chat")
+                    Text("Default chat")
                         .tag("private")
+
+                    if !extraDirectChats.isEmpty {
+                        Section("Other chats") {
+                            ForEach(extraDirectChats) { chat in
+                                Text(chat.title)
+                                    .tag("direct.\(chat.id.uuidString)")
+                            }
+                        }
+                    }
 
                     if !chatStore.groupChats.isEmpty {
                         Section("Group chats") {
@@ -711,6 +926,13 @@ struct AgentHeartbeatEditor: View {
                                     .tag("group.\(chat.id.uuidString)")
                             }
                         }
+                    }
+
+                    if heartbeat.targetKind == .privateChat,
+                       let targetChatID = heartbeat.targetChatID,
+                       !extraDirectChats.contains(where: { $0.id == targetChatID }) {
+                        Text("Missing private chat")
+                            .tag("direct.\(targetChatID.uuidString)")
                     }
 
                     if heartbeat.targetKind == .groupChat,
@@ -725,37 +947,41 @@ struct AgentHeartbeatEditor: View {
                 .frame(width: 300)
             }
 
-            if let lastError = heartbeat.lastError {
-                OpenUIDivider()
+            OpenUIDivider()
 
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "exclamationmark.triangle")
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Executions")
+                    .font(.system(size: 14, weight: .medium))
 
-                    Text(lastError)
+                Text("Each run is recorded even if the agent posts nothing. Open a run to view tools and the debug log.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(OpenUITheme.foregroundMuted)
+
+                if runningHeartbeat != nil || !executions.isEmpty {
+                    VStack(spacing: 0) {
+                        if let runningHeartbeat {
+                            HeartbeatRunningExecutionRow(startedAt: runningHeartbeat.startedAt)
+                            if !executions.isEmpty {
+                                OpenUIDivider()
+                            }
+                        }
+
+                        ForEach(Array(executions.enumerated()), id: \.element.id) { index, run in
+                            if index > 0 {
+                                OpenUIDivider()
+                            }
+                            HeartbeatExecutionRow(run: run)
+                        }
+                    }
+                    .padding(.top, 4)
+                } else {
+                    Text("No executions yet. The agent may post a reply, append memory, or pass.")
                         .font(.system(size: 13))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .padding(.top, 4)
                 }
-                .foregroundStyle(OpenUITheme.warningForeground)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-                .background(OpenUITheme.warningBackground)
-            } else if let lastCompletedAt = heartbeat.lastCompletedAt {
-                OpenUIDivider()
-
-                Text("Last completed \(lastCompletedAt.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.system(size: 12))
-                    .foregroundStyle(OpenUITheme.foregroundSubtle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(14)
-            } else {
-                OpenUIDivider()
-
-                Text("The agent may post a reply, append memory, or pass.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(OpenUITheme.foregroundSubtle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(14)
             }
+            .padding(16)
         }
         .openUICard()
     }
@@ -793,6 +1019,10 @@ struct AgentHeartbeatEditor: View {
         )
     }
 
+    private var extraDirectChats: [ChatViewModel] {
+        chatStore.extraChats(for: heartbeat.agentID)
+    }
+
     private var agentDefaultModelName: String {
         guard let agent = store.agent(for: heartbeat.agentID) else {
             return "Missing agent"
@@ -808,27 +1038,119 @@ struct AgentHeartbeatEditor: View {
 
     private var destination: Binding<String> {
         Binding {
-            guard heartbeat.targetKind == .groupChat,
-                  let targetChatID = heartbeat.targetChatID else {
+            guard let targetChatID = heartbeat.targetChatID else {
                 return "private"
             }
-            return "group.\(targetChatID.uuidString)"
+            if heartbeat.targetKind == .groupChat {
+                return "group.\(targetChatID.uuidString)"
+            }
+            return "direct.\(targetChatID.uuidString)"
         } set: { newValue in
-            guard newValue.hasPrefix("group."),
-                  let targetChatID = UUID(uuidString: String(newValue.dropFirst("group.".count))) else {
+            if newValue.hasPrefix("group."),
+               let targetChatID = UUID(uuidString: String(newValue.dropFirst("group.".count))) {
+                store.updateHeartbeatDestination(
+                    heartbeat,
+                    targetKind: .groupChat,
+                    targetChatID: targetChatID
+                )
+                return
+            }
+            if newValue.hasPrefix("direct."),
+               let targetChatID = UUID(uuidString: String(newValue.dropFirst("direct.".count))) {
                 store.updateHeartbeatDestination(
                     heartbeat,
                     targetKind: .privateChat,
-                    targetChatID: nil
+                    targetChatID: targetChatID
                 )
                 return
             }
             store.updateHeartbeatDestination(
                 heartbeat,
-                targetKind: .groupChat,
-                targetChatID: targetChatID
+                targetKind: .privateChat,
+                targetChatID: nil
             )
         }
+    }
+}
+
+private struct HeartbeatRunningExecutionRow: View {
+    let startedAt: Date
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 16)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Running")
+                    .font(.system(size: 13, weight: .medium))
+
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(elapsedText(at: context.date))
+                        .font(.system(size: 12).monospacedDigit())
+                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func elapsedText(at date: Date) -> String {
+        let elapsedSeconds = max(0, Int(date.timeIntervalSince(startedAt)))
+        let minutes = elapsedSeconds / 60
+        let seconds = elapsedSeconds % 60
+        return String(format: "Elapsed %d:%02d", minutes, seconds)
+    }
+}
+
+private struct HeartbeatExecutionRow: View {
+    let run: HeartbeatRun
+
+    @Environment(\.modelContext) private var modelContext
+    @State private var turn: GenerationTurn?
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: run.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(run.succeeded ? Color(red: 22 / 255, green: 163 / 255, blue: 74 / 255) : OpenUITheme.warningForeground)
+                .frame(width: 16)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(run.completedAt.formatted(date: .abbreviated, time: .shortened))
+                    .font(.system(size: 13, weight: .medium))
+
+                Text(run.errorMessage ?? run.actionSummary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(run.succeeded ? OpenUITheme.foregroundMuted : OpenUITheme.warningForeground)
+                    .lineLimit(2)
+
+                Text(HeartbeatRun.metricsLine(duration: run.formattedDuration, tokens: run.formattedTokenUsage))
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(OpenUITheme.foregroundSubtle)
+                    .help(run.tokenUsageHelp ?? "Duration of this heartbeat run")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let turn {
+                GenerationInspectorButton(turn: turn)
+            }
+        }
+        .padding(.vertical, 10)
+        .task(id: run.id) {
+            loadTurn()
+        }
+    }
+
+    private func loadTurn() {
+        guard let turnID = run.generationTurnID else {
+            turn = nil
+            return
+        }
+        turn = GenerationQuery.fetchTurn(id: turnID, in: modelContext)
     }
 }
 
@@ -973,22 +1295,12 @@ private struct AgentsPreferencesViewPreview: View {
     private let textToSpeechToolStore: TextToSpeechToolStore
     private let skillCatalog: SkillCatalog
     private let chatStore: ChatStore
+    private let heartbeatScheduler: HeartbeatScheduler
 
     init() {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
-            let container = try ModelContainer(
-                for: Agent.self,
-                AgentHeartbeat.self,
-                HeartbeatRun.self,
-                LocalModel.self,
-                ReplyFilterSet.self,
-                TextToSpeechTool.self,
-                StoredChat.self,
-                StoredGroupChatParticipant.self,
-                StoredChatMessage.self,
-                configurations: configuration
-            )
+            let container = try ChatModelContainer.make(configuration: configuration)
             let context = container.mainContext
             let localModel = LocalModel(
                 name: "Studio Qwen",
@@ -1031,6 +1343,7 @@ private struct AgentsPreferencesViewPreview: View {
                 replyFilterStore: replyFilterStore,
                 modelContext: context
             )
+            heartbeatScheduler = HeartbeatScheduler(agentStore: agentStore, chatStore: chatStore)
         } catch {
             fatalError("Failed to create Agents preferences preview: \(error.localizedDescription)")
         }
@@ -1042,7 +1355,8 @@ private struct AgentsPreferencesViewPreview: View {
             localModelStore: localModelStore,
             textToSpeechToolStore: textToSpeechToolStore,
             skillCatalog: skillCatalog,
-            chatStore: chatStore
+            chatStore: chatStore,
+            heartbeatScheduler: heartbeatScheduler
         )
         .modelContainer(modelContainer)
         .frame(width: 900, height: 680)

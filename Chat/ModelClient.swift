@@ -1,26 +1,70 @@
 import Foundation
 import FoundationModels
 
+struct TokenUsage: Sendable, Equatable {
+    var promptTokens: Int
+    var completionTokens: Int
+
+    static let zero = TokenUsage(promptTokens: 0, completionTokens: 0)
+
+    var totalTokens: Int { promptTokens + completionTokens }
+
+    var isEmpty: Bool {
+        promptTokens == 0 && completionTokens == 0
+    }
+
+    mutating func add(_ other: TokenUsage) {
+        promptTokens += other.promptTokens
+        completionTokens += other.completionTokens
+    }
+}
+
+struct ModelGenerationResult: Sendable {
+    var finalText: String
+    var reasoningTexts: [String]
+    var intermediateAssistantTexts: [String]
+    var openAIRoundCount: Int
+    var tokenUsage: TokenUsage = .zero
+    var debug: ModelDebugCapture?
+}
+
+struct ModelDebugCapture: Sendable {
+    var appleTranscriptSummary: String?
+    var openAIMessagesJSON: String?
+}
+
+struct ModelGenerationError: LocalizedError {
+    var underlying: Error
+    var partial: ModelGenerationResult?
+
+    var errorDescription: String? {
+        underlying.localizedDescription
+    }
+}
+
 enum ModelClient {
     static func complete(
         using backend: ChatBackend,
         systemPrompt: String,
         prompt: String,
         tools: AgentToolBox? = nil,
+        captureDebug: Bool = false,
         missingLocalModelMessage: String
-    ) async throws -> String {
+    ) async throws -> ModelGenerationResult {
         switch backend {
         case .appleFoundation:
-            let session = LanguageModelSession(
-                tools: tools?.appleTools ?? [],
-                instructions: systemPrompt
+            return try await completeApple(
+                systemPrompt: systemPrompt,
+                prompt: prompt,
+                tools: tools,
+                captureDebug: captureDebug
             )
-            return try await session.respond(to: prompt).content
         case .openAICompatible(let configuration):
             return try await OpenAICompatibleClient(configuration: configuration).respond(
                 systemPrompt: systemPrompt,
                 prompt: prompt,
-                tools: tools
+                tools: tools,
+                captureDebug: captureDebug
             )
         case .missingLocalModel:
             throw OpenAICompatibleError.server(statusCode: 0, message: missingLocalModelMessage)
@@ -33,8 +77,9 @@ enum ModelClient {
         messages: [ChatMessage],
         appleFoundationPrompt: String,
         tools: AgentToolBox? = nil,
+        captureDebug: Bool = false,
         missingLocalModelMessage: String
-    ) async throws -> String {
+    ) async throws -> ModelGenerationResult {
         switch backend {
         case .appleFoundation:
             return try await complete(
@@ -42,17 +87,74 @@ enum ModelClient {
                 systemPrompt: systemPrompt,
                 prompt: appleFoundationPrompt,
                 tools: tools,
+                captureDebug: captureDebug,
                 missingLocalModelMessage: missingLocalModelMessage
             )
         case .openAICompatible(let configuration):
             return try await OpenAICompatibleClient(configuration: configuration).respond(
                 systemPrompt: systemPrompt,
                 messages: messages,
-                tools: tools
+                tools: tools,
+                captureDebug: captureDebug
             )
         case .missingLocalModel:
             throw OpenAICompatibleError.server(statusCode: 0, message: missingLocalModelMessage)
         }
+    }
+
+    private static func completeApple(
+        systemPrompt: String,
+        prompt: String,
+        tools: AgentToolBox?,
+        captureDebug: Bool
+    ) async throws -> ModelGenerationResult {
+        let session = LanguageModelSession(
+            tools: tools?.appleTools ?? [],
+            instructions: systemPrompt
+        )
+        do {
+            let content = try await session.respond(to: prompt).content
+            return appleResult(from: session, content: content, captureDebug: captureDebug)
+        } catch {
+            throw ModelGenerationError(
+                underlying: error,
+                partial: appleResult(from: session, content: "", captureDebug: captureDebug)
+            )
+        }
+    }
+
+    private static func appleResult(
+        from session: LanguageModelSession,
+        content: String,
+        captureDebug: Bool
+    ) -> ModelGenerationResult {
+        let usage = TokenUsage(
+            promptTokens: session.usage.input.totalTokenCount,
+            completionTokens: session.usage.output.totalTokenCount
+        )
+        guard captureDebug else {
+            return ModelGenerationResult(
+                finalText: content,
+                reasoningTexts: [],
+                intermediateAssistantTexts: [],
+                openAIRoundCount: 0,
+                tokenUsage: usage,
+                debug: nil
+            )
+        }
+
+        let captured = AppleTranscriptCapture.capture(session.transcript)
+        return ModelGenerationResult(
+            finalText: content,
+            reasoningTexts: captured.reasoningTexts,
+            intermediateAssistantTexts: captured.intermediateAssistantTexts,
+            openAIRoundCount: 0,
+            tokenUsage: usage,
+            debug: ModelDebugCapture(
+                appleTranscriptSummary: captured.summary,
+                openAIMessagesJSON: nil
+            )
+        )
     }
 
     @MainActor
@@ -135,84 +237,131 @@ struct OpenAICompatibleClient: Sendable {
     func respond(
         systemPrompt: String,
         messages: [ChatMessage],
-        tools: AgentToolBox? = nil
-    ) async throws -> String {
+        tools: AgentToolBox? = nil,
+        captureDebug: Bool = false
+    ) async throws -> ModelGenerationResult {
         try await respond(
             systemPrompt: systemPrompt,
             apiMessages: messages.map {
                 OpenAIChatMessage(role: $0.role.rawValue, content: $0.text)
             },
-            tools: tools
+            tools: tools,
+            captureDebug: captureDebug
         )
     }
 
     func respond(
         systemPrompt: String,
         prompt: String,
-        tools: AgentToolBox? = nil
-    ) async throws -> String {
+        tools: AgentToolBox? = nil,
+        captureDebug: Bool = false
+    ) async throws -> ModelGenerationResult {
         try await respond(
             systemPrompt: systemPrompt,
             apiMessages: [OpenAIChatMessage(role: "user", content: prompt)],
-            tools: tools
+            tools: tools,
+            captureDebug: captureDebug
         )
     }
 
     private func respond(
         systemPrompt: String,
         apiMessages: [OpenAIChatMessage],
-        tools: AgentToolBox?
-    ) async throws -> String {
+        tools: AgentToolBox?,
+        captureDebug: Bool
+    ) async throws -> ModelGenerationResult {
         var messages = [OpenAIChatMessage(role: "system", content: systemPrompt)] + apiMessages
         let openAITools = tools?.isEmpty == false ? tools?.openAITools : nil
         var remainingRounds = 8
+        var roundIndex = 0
+        var intermediateAssistantTexts: [String] = []
+        var tokenUsage = TokenUsage.zero
 
-        while remainingRounds > 0 {
-            remainingRounds -= 1
-            let completion = try await completeOnce(messages: messages, tools: openAITools)
-            let message = completion.choices.first?.message
-            let toolCalls = message?.toolCalls ?? []
-
-            if !toolCalls.isEmpty, let tools {
-                messages.append(
-                    OpenAIChatMessage(
-                        role: "assistant",
-                        content: message?.content,
-                        toolCalls: toolCalls
+        func result(finalText: String) -> ModelGenerationResult {
+            ModelGenerationResult(
+                finalText: finalText,
+                reasoningTexts: [],
+                intermediateAssistantTexts: intermediateAssistantTexts,
+                openAIRoundCount: roundIndex,
+                tokenUsage: tokenUsage,
+                debug: captureDebug
+                    ? ModelDebugCapture(
+                        appleTranscriptSummary: nil,
+                        openAIMessagesJSON: encodeMessages(messages)
                     )
-                )
-                for call in toolCalls {
-                    let output: String
-                    do {
-                        output = try await tools.execute(
-                            name: call.function.name,
-                            argumentsJSON: call.function.arguments
-                        )
-                    } catch {
-                        output = error.localizedDescription
+                    : nil
+            )
+        }
+
+        do {
+            while remainingRounds > 0 {
+                remainingRounds -= 1
+                let currentRound = roundIndex
+                roundIndex += 1
+                tools?.recorder?.roundProvider = { currentRound }
+
+                let completion = try await completeOnce(messages: messages, tools: openAITools)
+                tokenUsage.add(completion.usage?.tokenUsage ?? .zero)
+                let message = completion.choices.first?.message
+                let toolCalls = message?.toolCalls ?? []
+
+                if !toolCalls.isEmpty, let tools {
+                    if let content = message?.content?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !content.isEmpty {
+                        intermediateAssistantTexts.append(content)
                     }
                     messages.append(
                         OpenAIChatMessage(
-                            role: "tool",
-                            content: output,
-                            toolCallID: call.id
+                            role: "assistant",
+                            content: message?.content,
+                            toolCalls: toolCalls
                         )
                     )
+                    for call in toolCalls {
+                        let output: String
+                        do {
+                            output = try await tools.execute(
+                                name: call.function.name,
+                                argumentsJSON: call.function.arguments
+                            )
+                        } catch {
+                            output = error.localizedDescription
+                        }
+                        messages.append(
+                            OpenAIChatMessage(
+                                role: "tool",
+                                content: output,
+                                toolCallID: call.id
+                            )
+                        )
+                    }
+                    continue
                 }
-                continue
+
+                guard let content = message?.content?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !content.isEmpty else {
+                    throw OpenAICompatibleError.invalidResponse
+                }
+                messages.append(OpenAIChatMessage(role: "assistant", content: content))
+                return result(finalText: content)
             }
 
-            guard let content = message?.content?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !content.isEmpty else {
-                throw OpenAICompatibleError.invalidResponse
-            }
-            return content
+            throw OpenAICompatibleError.server(
+                statusCode: 0,
+                message: "The model exceeded the maximum number of tool calls."
+            )
+        } catch let error as ModelGenerationError {
+            throw error
+        } catch {
+            throw ModelGenerationError(underlying: error, partial: result(finalText: ""))
         }
+    }
 
-        throw OpenAICompatibleError.server(
-            statusCode: 0,
-            message: "The model exceeded the maximum number of tool calls."
-        )
+    private func encodeMessages(_ messages: [OpenAIChatMessage]) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(messages) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     private func completeOnce(
@@ -359,7 +508,27 @@ private struct OpenAIChatCompletionResponse: Decodable {
         let message: Message
     }
 
+    struct Usage: Decodable {
+        var promptTokens: Int?
+        var completionTokens: Int?
+        var totalTokens: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case promptTokens = "prompt_tokens"
+            case completionTokens = "completion_tokens"
+            case totalTokens = "total_tokens"
+        }
+
+        var tokenUsage: TokenUsage {
+            TokenUsage(
+                promptTokens: promptTokens ?? 0,
+                completionTokens: completionTokens ?? max(0, (totalTokens ?? 0) - (promptTokens ?? 0))
+            )
+        }
+    }
+
     let choices: [Choice]
+    var usage: Usage?
 }
 
 private struct OpenAIErrorResponse: Decodable {
@@ -368,4 +537,75 @@ private struct OpenAIErrorResponse: Decodable {
     }
 
     let error: APIError
+}
+
+private enum AppleTranscriptCapture {
+    struct Capture {
+        var reasoningTexts: [String]
+        var intermediateAssistantTexts: [String]
+        var summary: String
+    }
+
+    static func capture(_ transcript: Transcript) -> Capture {
+        var reasoningTexts: [String] = []
+        var responseTexts: [String] = []
+        var lines: [String] = []
+
+        for entry in transcript {
+            switch entry {
+            case .instructions:
+                lines.append("instructions")
+            case .prompt:
+                lines.append("prompt")
+            case .toolCalls(let calls):
+                let names = calls.map(\.toolName).joined(separator: " ")
+                lines.append(names.isEmpty ? "toolCalls" : "toolCalls \(names)")
+            case .toolOutput(let output):
+                let chars = text(from: output.segments).count
+                lines.append("toolOutput \(output.toolName) (chars=\(chars))")
+            case .response(let response):
+                let content = text(from: response.segments)
+                responseTexts.append(content)
+                lines.append("response (chars=\(content.count))")
+            default:
+                appendReasoningIfAvailable(entry, reasoningTexts: &reasoningTexts, lines: &lines)
+            }
+        }
+
+        return Capture(
+            reasoningTexts: reasoningTexts,
+            intermediateAssistantTexts: Array(responseTexts.dropLast()),
+            summary: lines.joined(separator: "\n")
+        )
+    }
+
+    private static func appendReasoningIfAvailable(
+        _ entry: Transcript.Entry,
+        reasoningTexts: inout [String],
+        lines: inout [String]
+    ) {
+        if #available(macOS 27.0, *) {
+            if case .reasoning(let reasoning) = entry {
+                let content = text(from: reasoning.segments)
+                if !content.isEmpty {
+                    reasoningTexts.append(content)
+                }
+                lines.append("reasoning (chars=\(content.count))")
+                return
+            }
+        }
+        lines.append("unknown")
+    }
+
+    private static func text(from segments: [Transcript.Segment]) -> String {
+        segments.compactMap { segment in
+            switch segment {
+            case .text(let textSegment):
+                return textSegment.content
+            default:
+                return nil
+            }
+        }
+        .joined()
+    }
 }

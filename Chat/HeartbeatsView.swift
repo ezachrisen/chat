@@ -1,4 +1,5 @@
 import Foundation
+import SwiftData
 import SwiftUI
 
 struct HeartbeatCommands: Commands {
@@ -82,6 +83,11 @@ struct HeartbeatsView: View {
                     } else {
                         ForEach(agentStore.heartbeatRuns) { run in
                             CompletedHeartbeatRow(run: run)
+                                .onAppear {
+                                    if run.id == agentStore.heartbeatRuns.last?.id {
+                                        agentStore.loadOlderHeartbeatRuns()
+                                    }
+                                }
                         }
                     }
                 }
@@ -250,27 +256,32 @@ private struct RunningHeartbeatRow: View {
 
 private struct CompletedHeartbeatRow: View {
     let run: HeartbeatRun
+    @Environment(\.modelContext) private var modelContext
     @State private var isExpanded = false
+    @State private var invocations: [ToolInvocationDisplay] = []
+    @State private var payload: GenerationDebugPayload?
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 14) {
                 HeartbeatDetailField(title: "Action", text: run.actionSummary)
+                HeartbeatDetailField(title: "Duration", text: run.formattedDuration)
+                if let tokens = run.formattedTokenUsage {
+                    HeartbeatDetailField(
+                        title: "Tokens",
+                        text: run.tokenUsageHelp ?? tokens
+                    )
+                }
 
                 if let errorMessage = run.errorMessage {
                     HeartbeatDetailField(title: "Error", text: errorMessage, isError: true)
                 }
 
-                HeartbeatTextBlock(
-                    title: "Model input",
-                    text: run.modelInput.isEmpty
-                        ? "No model input was constructed."
-                        : run.modelInput
-                )
-                HeartbeatTextBlock(
-                    title: "Model output",
-                    text: run.modelOutput ?? "No model output was received."
-                )
+                if !invocations.isEmpty {
+                    GenerationToolCallList(invocations: invocations)
+                }
+
+                debugContent
             }
             .padding(.top, 10)
             .padding(.leading, 28)
@@ -286,11 +297,18 @@ private struct CompletedHeartbeatRow: View {
                     .lineLimit(1)
                     .frame(width: 120, alignment: .leading)
 
-                Text(run.instruction)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(run.instruction)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text(run.actionSummary)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 Text(run.destination)
                     .foregroundStyle(.secondary)
@@ -298,15 +316,21 @@ private struct CompletedHeartbeatRow: View {
                     .truncationMode(.tail)
                     .frame(width: 170, alignment: .leading)
 
-                Text(
-                    run.completedAt.formatted(
-                        .dateTime
-                            .month(.abbreviated)
-                            .day()
-                            .hour()
-                            .minute()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(
+                        run.completedAt.formatted(
+                            .dateTime
+                                .month(.abbreviated)
+                                .day()
+                                .hour()
+                                .minute()
+                        )
                     )
-                )
+                    Text(HeartbeatRun.metricsLine(duration: run.formattedDuration, tokens: run.formattedTokenUsage))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .help(run.tokenUsageHelp ?? "Duration of this heartbeat run")
+                }
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -315,6 +339,43 @@ private struct CompletedHeartbeatRow: View {
             }
             .frame(minHeight: 28)
         }
+        .onChange(of: isExpanded) { _, expanded in
+            if expanded {
+                loadDetails()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var debugContent: some View {
+        if !run.modelInput.isEmpty || run.modelOutput != nil {
+            GenerationTextBlock(
+                title: "Model input",
+                text: run.modelInput.isEmpty
+                    ? "No model input was constructed."
+                    : run.modelInput
+            )
+            GenerationTextBlock(
+                title: "Model output",
+                text: run.modelOutput ?? "No model output was received."
+            )
+        } else if let payload {
+            GenerationDebugSections(payload: payload)
+        } else {
+            Text("Debug log was off for this run.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func loadDetails() {
+        guard let turnID = run.generationTurnID else {
+            invocations = []
+            payload = nil
+            return
+        }
+        invocations = GenerationQuery.fetchToolCalls(forTurn: turnID, in: modelContext).map(ToolInvocationDisplay.init)
+        payload = GenerationQuery.fetchDebugPayload(forTurn: turnID, in: modelContext)
     }
 }
 
@@ -331,30 +392,6 @@ private struct HeartbeatDetailField: View {
             Text(text)
                 .foregroundStyle(isError ? .red : .primary)
                 .textSelection(.enabled)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct HeartbeatTextBlock: View {
-    let title: String
-    let text: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            ScrollView {
-                Text(text)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-            }
-            .frame(maxHeight: 220)
-            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

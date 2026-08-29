@@ -11,9 +11,24 @@ final class ChatViewModel: ObservableObject, Identifiable {
     var agentID: Agent.ID { storedChat.agentID }
     var agentName: String { storedChat.agentName }
     var isGroupChat: Bool { storedChat.kind == .group }
+    var isDefaultChat: Bool { storedChat.isDefaultChat == true }
+    var canDelete: Bool { !isDefaultChat }
+    var canRename: Bool { !isDefaultChat }
     var updatedAt: Date { storedChat.updatedAt }
+    var displayTitle: String {
+        if isDefaultChat {
+            return agentStore.agent(for: agentID)?.displayName ?? storedChat.agentName
+        }
+        return title
+    }
     var heartbeatDestinationDescription: String {
-        "\(isGroupChat ? "Group chat" : "Private chat") “\(title)”"
+        if isGroupChat {
+            return "Group chat “\(title)”"
+        }
+        if isDefaultChat {
+            return "Default chat"
+        }
+        return "Private chat “\(title)”"
     }
 
     @Published var draft = ""
@@ -24,6 +39,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     @Published private(set) var isLoadingOlderMessages = false
     @Published private(set) var hasOlderMessages: Bool
     @Published private(set) var isResponding = false
+    @Published private(set) var isCompacting = false
     @Published private(set) var respondingAgentName: String?
     @Published private(set) var availabilityMessage = ""
     @Published private(set) var canSend = false
@@ -38,6 +54,27 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     var canSubmitDraft: Bool {
         canSend && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var rendersMarkdown: Bool {
+        storedChat.rendersMarkdown ?? true
+    }
+
+    func setRendersMarkdown(_ enabled: Bool) {
+        storedChat.rendersMarkdown = enabled
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    var compactionStatus: ConversationCompactionStatus {
+        let summary = (storedChat.compactedSummary ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ConversationCompactionStatus(
+            summary: summary,
+            compactedAt: storedChat.compactedAt,
+            coveredMessageCount: storedChat.compactedMessageCount,
+            estimatedTokens: ConversationCompaction.estimateTokens(summary)
+        )
     }
 
     init(
@@ -99,31 +136,67 @@ final class ChatViewModel: ObservableObject, Identifiable {
         isLoadingOlderMessages = true
         defer { isLoadingOlderMessages = false }
 
-        let oldestMessageDate = oldestMessage.createdAt
-        var descriptor = FetchDescriptor<StoredChatMessage>(
-            predicate: #Predicate { message in
-                message.chatID == id && message.createdAt < oldestMessageDate
-            },
-            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
-        )
-        descriptor.fetchLimit = ChatViewModel.messageBatchSize
-
-        do {
-            let fallbackAssistantName = isGroupChat ? nil : storedChat.agentName
-            let olderMessages = try modelContext.fetch(descriptor).reversed().map {
-                ChatMessage(storedMessage: $0, fallbackAssistantName: fallbackAssistantName)
-            }
-            hasOlderMessages = olderMessages.count == ChatViewModel.messageBatchSize
-            messages.insert(contentsOf: olderMessages, at: 0)
-        } catch {
-            hasOlderMessages = false
+        let fallbackAssistantName = isGroupChat ? nil : storedChat.agentName
+        let olderMessages = ActiveChatMessages.fetch(
+            chatID: id,
+            clearedThroughMessageID: storedChat.clearedThroughMessageID,
+            olderThan: oldestMessage.createdAt,
+            limit: ChatViewModel.messageBatchSize,
+            in: modelContext
+        ).map {
+            ChatMessage(storedMessage: $0, fallbackAssistantName: fallbackAssistantName)
         }
+        hasOlderMessages = olderMessages.count == ChatViewModel.messageBatchSize
+        messages.insert(contentsOf: olderMessages, at: 0)
     }
 
     func rename(to title: String) {
+        guard canRename else { return }
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallbackTitle = isGroupChat ? "Untitled chat" : "New chat"
         updateTitle(trimmedTitle.isEmpty ? fallbackTitle : trimmedTitle)
+    }
+
+    func resetActiveHistory() {
+        guard !isResponding, !isCompacting else { return }
+
+        let allMessages = ActiveChatMessages.fetchAll(chatID: id, in: modelContext)
+        if let lastMessage = allMessages.last {
+            storedChat.clearedThroughMessageID = lastMessage.id
+        }
+        storedChat.compactedSummary = nil
+        storedChat.compactedThroughMessageID = nil
+        storedChat.compactedAt = nil
+        storedChat.compactedMessageCount = nil
+        storedChat.updatedAt = .now
+        messages = []
+        hasOlderMessages = false
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func deletePersistedRecords() {
+        let chatID = id
+        for message in ActiveChatMessages.fetchAll(chatID: chatID, in: modelContext) {
+            modelContext.delete(message)
+        }
+        let participantDescriptor = FetchDescriptor<StoredGroupChatParticipant>(
+            predicate: #Predicate { participant in
+                participant.chatID == chatID
+            }
+        )
+        if let participants = try? modelContext.fetch(participantDescriptor) {
+            for participant in participants {
+                modelContext.delete(participant)
+            }
+        }
+        modelContext.delete(storedChat)
+        saveChanges()
+    }
+
+    func setDefaultChat(_ isDefault: Bool) {
+        storedChat.isDefaultChat = isDefault
+        saveChanges()
     }
 
     func updateGroupSystemInstructions(_ instructions: String) {
@@ -202,25 +275,28 @@ final class ChatViewModel: ObservableObject, Identifiable {
             }
 
             draft = ""
-            appendMessage(role: .user, text: prompt)
+            let userMessage = appendMessage(role: .user, text: prompt)
             isResponding = true
 
             Task {
-                await respondAsGroup(directlyMentionedAgentIDs: directlyMentionedAgentIDs)
+                await respondAsGroup(
+                    userMessageID: userMessage.id,
+                    directlyMentionedAgentIDs: directlyMentionedAgentIDs
+                )
             }
             return
         }
 
-        if title == "New chat" {
+        if title == "New chat", !isDefaultChat {
             updateTitle(String(prompt.prefix(48)))
         }
 
         draft = ""
-        appendMessage(role: .user, text: prompt)
+        let userMessage = appendMessage(role: .user, text: prompt)
         isResponding = true
 
         Task {
-            await respond()
+            await respond(userMessageID: userMessage.id)
         }
     }
 
@@ -230,36 +306,58 @@ final class ChatViewModel: ObservableObject, Identifiable {
         modelIdentifier: String,
         lastCompletedAt: Date?,
         referenceDate: Date,
-        onModelInput: ((String) -> Void)? = nil,
+        runID: UUID,
+        turnID: UUID,
+        recorder: ToolCallRecorder,
+        debugCaptureEnabled: Bool,
+        onDebugPrompt: ((String, String) -> Void)? = nil,
         onModelResponseAccepted: (() -> Void)? = nil
     ) async throws -> HeartbeatModelExchange {
-        if Task.isCancelled {
-            throw HeartbeatModelFailure(
+        let backend = localModelStore.backend(for: modelIdentifier)
+        func failure(
+            message: String,
+            wasAborted: Bool,
+            partial: ModelGenerationResult? = nil,
+            systemPrompt: String = "",
+            conversationPrompt: String = ""
+        ) -> HeartbeatModelFailure {
+            HeartbeatModelFailure(
                 modelInput: "",
-                modelOutput: nil,
-                message: "Aborted by user.",
-                wasAborted: true
+                modelOutput: partial?.finalText,
+                message: message,
+                wasAborted: wasAborted,
+                runID: runID,
+                turnID: turnID,
+                chatID: id,
+                debugCaptureEnabled: debugCaptureEnabled,
+                toolInvocations: recorder.snapshot(),
+                debug: debugCaptureEnabled
+                    ? GenerationDebugPayloadDraft(
+                        systemPrompt: systemPrompt,
+                        conversationPrompt: conversationPrompt,
+                        result: partial ?? ModelGenerationResult(
+                            finalText: "",
+                            reasoningTexts: [],
+                            intermediateAssistantTexts: [],
+                            openAIRoundCount: 0,
+                            debug: nil
+                        )
+                    )
+                    : nil,
+                backendRawValue: backend.persistenceName,
+                tokenUsage: partial?.tokenUsage ?? .zero
             )
         }
 
-        guard !isResponding else {
-            throw HeartbeatExecutionError.chatBusy
+        if Task.isCancelled {
+            throw failure(message: "Aborted by user.", wasAborted: true)
         }
 
         if isGroupChat {
             addGroupParticipantIfNeeded(agent)
         }
 
-        isResponding = true
-        respondingAgentName = agent.displayName
-        defer {
-            respondingAgentName = nil
-            isResponding = false
-            updateAvailability()
-        }
-
-        let storedMessages = allStoredMessages()
-        let generation = generationSupport(for: agent)
+        let generation = generationSupport(for: agent, recorder: recorder)
         let systemInstructions = ModelPrompts.heartbeatSystemInstructions(
             agentName: agent.displayName,
             soul: agent.soul,
@@ -271,49 +369,40 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let conversationPrompt = ModelPrompts.heartbeatConversationPrompt(
             agentName: agent.displayName,
             instruction: instruction,
-            isGroupChat: isGroupChat,
-            transcript: ModelPrompts.heartbeatTranscript(
-                messages: storedMessages,
-                isGroupChat: isGroupChat,
-                fallbackAgentName: storedChat.agentName,
-                relativeTo: referenceDate
-            ),
             lastCompletedAt: lastCompletedAt,
-            unansweredMessageCount: ModelPrompts.unansweredMessageCount(in: storedMessages),
             referenceDate: referenceDate
         )
-        let modelInput = """
-        SYSTEM
-        \(systemInstructions)
+        if debugCaptureEnabled {
+            onDebugPrompt?(systemInstructions, conversationPrompt)
+        }
 
-        USER
-        \(conversationPrompt)
-        """
-        onModelInput?(modelInput)
-
-        let response: String
+        let result: ModelGenerationResult
         do {
-            response = try await ModelClient.complete(
-                using: localModelStore.backend(for: modelIdentifier),
+            result = try await ModelClient.complete(
+                using: backend,
                 systemPrompt: systemInstructions,
                 prompt: conversationPrompt,
                 tools: generation.tools,
+                captureDebug: debugCaptureEnabled,
                 missingLocalModelMessage: "The selected local model is no longer configured."
             )
             try Task.checkCancellation()
         } catch {
-            let wasAborted = Task.isCancelled || error is CancellationError
-            throw HeartbeatModelFailure(
-                modelInput: modelInput,
-                modelOutput: nil,
-                message: wasAborted ? "Aborted by user." : error.localizedDescription,
-                wasAborted: wasAborted
+            let generationError = error as? ModelGenerationError
+            let underlying = generationError?.underlying ?? error
+            let wasAborted = Task.isCancelled || underlying is CancellationError
+            throw failure(
+                message: wasAborted ? "Aborted by user." : underlying.localizedDescription,
+                wasAborted: wasAborted,
+                partial: generationError?.partial,
+                systemPrompt: systemInstructions,
+                conversationPrompt: conversationPrompt
             )
         }
         onModelResponseAccepted?()
 
         let parsedResponse = sanitizedReply(
-            response,
+            result.finalText,
             modelIdentifier: modelIdentifier
         )
         agentStore.appendAgentMemoryEntries(
@@ -323,23 +412,30 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
         let visibleText = parsedResponse.output.visibleText
         let passed = parsedResponse.isPass
-        let posted = !visibleText.isEmpty && !passed
+        let posted = shouldPostAssistantReply(visibleText)
+        var assistantMessageID: UUID?
         if posted {
-            appendMessage(
+            let assistantMessage = appendMessage(
                 role: .assistant,
                 text: visibleText,
                 authorAgentID: agent.id,
-                authorName: agent.displayName
+                authorName: agent.displayName,
+                save: false
             )
+            assistantMessageID = assistantMessage.id
         }
 
         var actions: [String] = []
+        let status: GenerationStatus
         if posted {
             actions.append("Posted to \(heartbeatDestinationDescription).")
+            status = .posted
         } else if passed {
             actions.append("The model passed, so no chat message was posted.")
+            status = .passed
         } else {
             actions.append("The model returned no visible text, so no chat message was posted.")
+            status = .emptyVisible
         }
 
         let memoryCount = parsedResponse.output.memoryEntries.count
@@ -348,65 +444,119 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
 
         return HeartbeatModelExchange(
-            modelInput: modelInput,
-            modelOutput: response,
-            actionSummary: actions.joined(separator: " ")
+            modelInput: "",
+            modelOutput: result.finalText,
+            actionSummary: actions.joined(separator: " "),
+            runID: runID,
+            turnID: turnID,
+            chatID: id,
+            debugCaptureEnabled: debugCaptureEnabled,
+            generationStatus: status,
+            assistantMessageID: assistantMessageID,
+            visibleReplyPreview: posted ? visibleText : nil,
+            memoryEntryCount: memoryCount,
+            backendRawValue: backend.persistenceName,
+            toolInvocations: recorder.snapshot(),
+            debug: debugCaptureEnabled
+                ? GenerationDebugPayloadDraft(
+                    systemPrompt: systemInstructions,
+                    conversationPrompt: conversationPrompt,
+                    result: result
+                )
+                : nil,
+            tokenUsage: result.tokenUsage
         )
     }
 
-    private func respond() async {
-        do {
-            let storedMessages = allStoredMessages()
-            let generation = generationSupport(for: agentStore.agent(for: storedChat.agentID))
-            let systemInstructions = ModelPrompts.agentSystemInstructions(
-                agentName: storedChat.agentName,
-                soul: currentSoul(
-                    for: storedChat.agentID,
-                    fallback: storedChat.agentSoul
-                ),
-                memory: currentMemory(for: storedChat.agentID),
-                skillsPrompt: generation.skillsPrompt
-            )
-            let appleFoundationPrompt = ModelPrompts.directConversationPrompt(
-                agentName: storedChat.agentName,
-                transcript: ModelPrompts.conversationTranscript(
-                    messages: storedMessages,
+    private func respond(userMessageID: UUID) async {
+        let startedAt = Date()
+        let agent = agentStore.agent(for: storedChat.agentID)
+        let debugCaptureEnabled = agent?.isDebugLogEnabled == true
+        let recorder = ToolCallRecorder()
+        let generation = generationSupport(for: agent, recorder: recorder)
+        let storedMessages = allStoredMessages()
+        let systemInstructions = ModelPrompts.agentSystemInstructions(
+            agentName: storedChat.agentName,
+            soul: currentSoul(
+                for: storedChat.agentID,
+                fallback: storedChat.agentSoul
+            ),
+            memory: currentMemory(for: storedChat.agentID),
+            skillsPrompt: generation.skillsPrompt
+        )
+        let prepared = await prepareConversation(
+            messages: storedMessages,
+            backend: backend,
+            systemPrompt: systemInstructions,
+            toolsEnabled: !generation.tools.isEmpty
+        )
+        let appleFoundationPrompt = ModelPrompts.directConversationPrompt(
+            agentName: storedChat.agentName,
+            transcript: ModelPrompts.withDigest(
+                prepared.digestText,
+                recent: ModelPrompts.conversationTranscript(
+                    messages: prepared.tail,
                     isGroupChat: false,
                     fallbackAgentName: storedChat.agentName
                 )
             )
-            let response = try await ModelClient.complete(
+        )
+        let recordedSystemPrompt: String
+        if case .openAICompatible = backend {
+            recordedSystemPrompt = systemInstructions + ModelPrompts.digestSystemSection(prepared.digestText)
+        } else {
+            recordedSystemPrompt = systemInstructions
+        }
+
+        do {
+            let result = try await ModelClient.complete(
                 using: backend,
-                systemPrompt: systemInstructions,
-                messages: storedMessages.map {
+                systemPrompt: recordedSystemPrompt,
+                messages: prepared.tail.map {
                     ChatMessage(storedMessage: $0, fallbackAssistantName: storedChat.agentName)
                 },
                 appleFoundationPrompt: appleFoundationPrompt,
                 tools: generation.tools,
+                captureDebug: debugCaptureEnabled,
                 missingLocalModelMessage: "This chat's local model is no longer configured. Choose a configured model for the agent and start a new chat."
             )
             let parsedResponse = sanitizedReply(
-                response,
+                result.finalText,
                 modelIdentifier: storedChat.agentModelIdentifier
             )
             agentStore.appendAgentMemoryEntries(
                 id: storedChat.agentID,
                 entries: parsedResponse.output.memoryEntries
             )
-            if !parsedResponse.output.visibleText.isEmpty, !parsedResponse.isPass {
-                appendMessage(
-                    role: .assistant,
-                    text: parsedResponse.output.visibleText,
-                    authorAgentID: agentID,
-                    authorName: agentName
-                )
-            }
+            persistChatTurn(
+                kind: .direct,
+                userMessageID: userMessageID,
+                agentID: storedChat.agentID,
+                agentName: storedChat.agentName,
+                modelIdentifier: storedChat.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation,
+                backend: backend,
+                startedAt: startedAt,
+                parsedResponse: parsedResponse,
+                result: result,
+                systemPrompt: recordedSystemPrompt,
+                conversationPrompt: appleFoundationPrompt,
+                debugCaptureEnabled: debugCaptureEnabled,
+                recorder: recorder
+            )
         } catch {
-            appendMessage(
-                role: .assistant,
-                text: "I could not get a response: \(error.localizedDescription)",
-                authorAgentID: agentID,
-                authorName: agentName
+            persistFailedChatTurn(
+                kind: .direct,
+                userMessageID: userMessageID,
+                agentID: storedChat.agentID,
+                agentName: storedChat.agentName,
+                modelIdentifier: storedChat.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation,
+                backend: backend,
+                startedAt: startedAt,
+                error: error,
+                systemPrompt: recordedSystemPrompt,
+                conversationPrompt: appleFoundationPrompt,
+                debugCaptureEnabled: debugCaptureEnabled,
+                recorder: recorder
             )
         }
 
@@ -448,7 +598,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         updateAvailability()
     }
 
-    private func respondAsGroup(directlyMentionedAgentIDs: Set<UUID>) async {
+    private func respondAsGroup(
+        userMessageID: UUID,
+        directlyMentionedAgentIDs: Set<UUID>
+    ) async {
         let orderedParticipants = groupParticipants.sorted { left, right in
             let leftWasMentioned = directlyMentionedAgentIDs.contains(left.agentID)
             let rightWasMentioned = directlyMentionedAgentIDs.contains(right.agentID)
@@ -461,35 +614,56 @@ final class ChatViewModel: ObservableObject, Identifiable {
         for participant in orderedParticipants {
             guard !Task.isCancelled else { break }
             respondingAgentName = participant.agentName
+            let startedAt = Date()
+            let agent = agentStore.agent(for: participant.agentID)
+            let debugCaptureEnabled = agent?.isDebugLogEnabled == true
+            let recorder = ToolCallRecorder()
+            let backend = localModelStore.backend(for: participant.agentModelIdentifier)
 
             do {
-                let response = try await groupResponse(
+                let generated = try await groupResponse(
                     from: participant,
-                    wasDirectlyMentioned: directlyMentionedAgentIDs.contains(participant.agentID)
+                    wasDirectlyMentioned: directlyMentionedAgentIDs.contains(participant.agentID),
+                    recorder: recorder,
+                    captureDebug: debugCaptureEnabled
                 )
                 let parsedResponse = sanitizedReply(
-                    response,
+                    generated.result.finalText,
                     modelIdentifier: participant.agentModelIdentifier
                 )
                 agentStore.appendAgentMemoryEntries(
                     id: participant.agentID,
                     entries: parsedResponse.output.memoryEntries
                 )
-                let trimmedResponse = parsedResponse.output.visibleText
-                if !trimmedResponse.isEmpty, !parsedResponse.isPass {
-                    appendMessage(
-                        role: .assistant,
-                        text: trimmedResponse,
-                        authorAgentID: participant.agentID,
-                        authorName: participant.agentName
-                    )
-                }
+                persistChatTurn(
+                    kind: .group,
+                    userMessageID: userMessageID,
+                    agentID: participant.agentID,
+                    agentName: participant.agentName,
+                    modelIdentifier: participant.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation,
+                    backend: backend,
+                    startedAt: startedAt,
+                    parsedResponse: parsedResponse,
+                    result: generated.result,
+                    systemPrompt: generated.systemPrompt,
+                    conversationPrompt: generated.conversationPrompt,
+                    debugCaptureEnabled: debugCaptureEnabled,
+                    recorder: recorder
+                )
             } catch {
-                appendMessage(
-                    role: .assistant,
-                    text: "I could not get a response: \(error.localizedDescription)",
-                    authorAgentID: participant.agentID,
-                    authorName: participant.agentName
+                persistFailedChatTurn(
+                    kind: .group,
+                    userMessageID: userMessageID,
+                    agentID: participant.agentID,
+                    agentName: participant.agentName,
+                    modelIdentifier: participant.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation,
+                    backend: backend,
+                    startedAt: startedAt,
+                    error: error,
+                    systemPrompt: (error as? GroupGenerationError)?.systemPrompt ?? "",
+                    conversationPrompt: (error as? GroupGenerationError)?.conversationPrompt ?? "",
+                    debugCaptureEnabled: debugCaptureEnabled,
+                    recorder: recorder
                 )
             }
         }
@@ -499,12 +673,35 @@ final class ChatViewModel: ObservableObject, Identifiable {
         updateAvailability()
     }
 
+    private struct GroupGeneration {
+        var result: ModelGenerationResult
+        var systemPrompt: String
+        var conversationPrompt: String
+    }
+
+    private struct GroupGenerationError: LocalizedError {
+        var underlying: Error
+        var systemPrompt: String
+        var conversationPrompt: String
+        var partial: ModelGenerationResult?
+
+        var errorDescription: String? {
+            underlying.localizedDescription
+        }
+    }
+
     private func groupResponse(
         from participant: StoredGroupChatParticipant,
-        wasDirectlyMentioned: Bool
-    ) async throws -> String {
+        wasDirectlyMentioned: Bool,
+        recorder: ToolCallRecorder,
+        captureDebug: Bool
+    ) async throws -> GroupGeneration {
         let storedMessages = allStoredMessages()
-        let generation = generationSupport(for: agentStore.agent(for: participant.agentID))
+        let generation = generationSupport(
+            for: agentStore.agent(for: participant.agentID),
+            recorder: recorder
+        )
+        let backend = localModelStore.backend(for: participant.agentModelIdentifier)
         let systemInstructions = ModelPrompts.groupSystemPrompt(
             agentName: participant.agentName,
             soul: currentSoul(
@@ -515,28 +712,205 @@ final class ChatViewModel: ObservableObject, Identifiable {
             groupInstructions: groupSystemInstructions,
             skillsPrompt: generation.skillsPrompt
         )
+        let prepared = await prepareConversation(
+            messages: storedMessages,
+            backend: backend,
+            systemPrompt: systemInstructions,
+            toolsEnabled: !generation.tools.isEmpty
+        )
         let conversationPrompt = ModelPrompts.groupConversationPrompt(
             agentName: participant.agentName,
-            transcript: ModelPrompts.conversationTranscript(
-                messages: storedMessages,
-                isGroupChat: true,
-                fallbackAgentName: storedChat.agentName
+            transcript: ModelPrompts.withDigest(
+                prepared.digestText,
+                recent: ModelPrompts.conversationTranscript(
+                    messages: prepared.tail,
+                    isGroupChat: true,
+                    fallbackAgentName: storedChat.agentName
+                )
             ),
             wasDirectlyMentioned: wasDirectlyMentioned
         )
 
-        return try await ModelClient.complete(
-            using: localModelStore.backend(for: participant.agentModelIdentifier),
-            systemPrompt: systemInstructions,
-            prompt: conversationPrompt,
-            tools: generation.tools,
-            missingLocalModelMessage: "This agent's local model is no longer configured."
+        do {
+            let result = try await ModelClient.complete(
+                using: backend,
+                systemPrompt: systemInstructions,
+                prompt: conversationPrompt,
+                tools: generation.tools,
+                captureDebug: captureDebug,
+                missingLocalModelMessage: "This agent's local model is no longer configured."
+            )
+            return GroupGeneration(
+                result: result,
+                systemPrompt: systemInstructions,
+                conversationPrompt: conversationPrompt
+            )
+        } catch {
+            let generationError = error as? ModelGenerationError
+            throw GroupGenerationError(
+                underlying: generationError?.underlying ?? error,
+                systemPrompt: systemInstructions,
+                conversationPrompt: conversationPrompt,
+                partial: generationError?.partial
+            )
+        }
+    }
+
+    private func generationSupport(
+        for agent: Agent?,
+        recorder: ToolCallRecorder? = nil
+    ) -> (tools: AgentToolBox, skillsPrompt: String) {
+        let tools = AgentToolBox.make(agent: agent, catalog: skillCatalog, recorder: recorder)
+        return (
+            tools,
+            ModelPrompts.toolsPrompt(enabledIDs: tools.enabledToolIDs)
+                + ModelPrompts.skillsPrompt(for: tools.runtime.skills)
         )
     }
 
-    private func generationSupport(for agent: Agent?) -> (tools: AgentToolBox, skillsPrompt: String) {
-        let tools = AgentToolBox.make(agent: agent, catalog: skillCatalog)
-        return (tools, ModelPrompts.skillsPrompt(for: tools.runtime.skills))
+    private func persistChatTurn(
+        kind: GenerationKind,
+        userMessageID: UUID,
+        agentID: UUID,
+        agentName: String,
+        modelIdentifier: String,
+        backend: ChatBackend,
+        startedAt: Date,
+        parsedResponse: (output: AgentModelOutput, isPass: Bool),
+        result: ModelGenerationResult,
+        systemPrompt: String,
+        conversationPrompt: String,
+        debugCaptureEnabled: Bool,
+        recorder: ToolCallRecorder
+    ) {
+        let visibleText = parsedResponse.output.visibleText
+        var assistantMessageID: UUID?
+        let status: GenerationStatus
+        let actionSummary: String
+        if shouldPostAssistantReply(visibleText) {
+            let assistantMessage = appendMessage(
+                role: .assistant,
+                text: visibleText,
+                authorAgentID: agentID,
+                authorName: agentName,
+                save: false
+            )
+            assistantMessageID = assistantMessage.id
+            status = .posted
+            actionSummary = "Posted."
+        } else if parsedResponse.isPass {
+            status = .passed
+            actionSummary = "Passed."
+        } else {
+            status = .emptyVisible
+            actionSummary = "Empty visible reply."
+        }
+
+        GenerationStore.recordTurn(
+            draft: GenerationTurnDraft(
+                kind: kind,
+                chatID: id,
+                userMessageID: userMessageID,
+                assistantMessageID: assistantMessageID,
+                agentID: agentID,
+                agentName: agentName,
+                modelIdentifier: modelIdentifier,
+                backendRawValue: backend.persistenceName,
+                startedAt: startedAt,
+                completedAt: .now,
+                status: status,
+                actionSummary: actionSummary,
+                visibleReplyPreview: GenerationStore.visibleReplyPreview(from: assistantMessageID == nil ? nil : visibleText),
+                memoryEntryCount: parsedResponse.output.memoryEntries.count,
+                debugCaptureEnabled: debugCaptureEnabled
+            ),
+            invocations: recorder.snapshot(),
+            debug: debugCaptureEnabled
+                ? GenerationDebugPayloadDraft(
+                    systemPrompt: systemPrompt,
+                    conversationPrompt: conversationPrompt,
+                    result: result
+                )
+                : nil,
+            in: modelContext
+        )
+        saveChanges()
+    }
+
+    private func persistFailedChatTurn(
+        kind: GenerationKind,
+        userMessageID: UUID,
+        agentID: UUID,
+        agentName: String,
+        modelIdentifier: String,
+        backend: ChatBackend,
+        startedAt: Date,
+        error: Error,
+        systemPrompt: String,
+        conversationPrompt: String,
+        debugCaptureEnabled: Bool,
+        recorder: ToolCallRecorder
+    ) {
+        let groupError = error as? GroupGenerationError
+        let generationError = error as? ModelGenerationError
+        let underlying = groupError?.underlying ?? generationError?.underlying ?? error
+        let wasAborted = underlying is CancellationError || Task.isCancelled
+        let message = wasAborted ? "Aborted." : underlying.localizedDescription
+        var assistantMessageID: UUID?
+        let status: GenerationStatus
+        if wasAborted {
+            status = .aborted
+        } else {
+            let assistantMessage = appendMessage(
+                role: .assistant,
+                text: "I could not get a response: \(message)",
+                authorAgentID: agentID,
+                authorName: agentName,
+                save: false
+            )
+            assistantMessageID = assistantMessage.id
+            status = .failed
+        }
+
+        let partial = groupError?.partial ?? generationError?.partial
+        GenerationStore.recordTurn(
+            draft: GenerationTurnDraft(
+                kind: kind,
+                chatID: id,
+                userMessageID: userMessageID,
+                assistantMessageID: assistantMessageID,
+                agentID: agentID,
+                agentName: agentName,
+                modelIdentifier: modelIdentifier,
+                backendRawValue: backend.persistenceName,
+                startedAt: startedAt,
+                completedAt: .now,
+                status: status,
+                actionSummary: message,
+                errorMessage: wasAborted ? nil : message,
+                visibleReplyPreview: GenerationStore.visibleReplyPreview(
+                    from: assistantMessageID == nil ? nil : "I could not get a response: \(message)"
+                ),
+                memoryEntryCount: 0,
+                debugCaptureEnabled: debugCaptureEnabled
+            ),
+            invocations: recorder.snapshot(),
+            debug: debugCaptureEnabled
+                ? GenerationDebugPayloadDraft(
+                    systemPrompt: systemPrompt,
+                    conversationPrompt: conversationPrompt,
+                    result: partial ?? ModelGenerationResult(
+                        finalText: "",
+                        reasoningTexts: [],
+                        intermediateAssistantTexts: [],
+                        openAIRoundCount: 0,
+                        debug: nil
+                    )
+                )
+                : nil,
+            in: modelContext
+        )
+        saveChanges()
     }
 
     private func sanitizedReply(_ response: String, modelIdentifier: String?) -> (output: AgentModelOutput, isPass: Bool) {
@@ -548,6 +922,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         )
     }
 
+    private func shouldPostAssistantReply(_ text: String) -> Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private func currentMemory(for agentID: Agent.ID) -> String {
         agentStore.agent(for: agentID)?.memoryText ?? ""
     }
@@ -556,22 +934,67 @@ final class ChatViewModel: ObservableObject, Identifiable {
         agentStore.agent(for: agentID)?.soul ?? fallback
     }
 
-    private func allStoredMessages() -> [StoredChatMessage] {
-        let descriptor = FetchDescriptor<StoredChatMessage>(
-            predicate: #Predicate { message in
-                message.chatID == id
-            },
-            sortBy: [SortDescriptor(\.createdAt)]
+    func compactConversation() async {
+        guard !isCompacting else { return }
+        isCompacting = true
+        defer { isCompacting = false }
+
+        let messages = allStoredMessages()
+        let generation = generationSupport(for: agentStore.agent(for: storedChat.agentID))
+        let systemInstructions = ModelPrompts.agentSystemInstructions(
+            agentName: storedChat.agentName,
+            soul: currentSoul(for: storedChat.agentID, fallback: storedChat.agentSoul),
+            memory: currentMemory(for: storedChat.agentID),
+            skillsPrompt: generation.skillsPrompt
         )
-        return (try? modelContext.fetch(descriptor)) ?? []
+        _ = await prepareConversation(
+            messages: messages,
+            backend: backend,
+            systemPrompt: systemInstructions,
+            toolsEnabled: !generation.tools.isEmpty,
+            aggressive: true
+        )
+        objectWillChange.send()
     }
 
+    private func prepareConversation(
+        messages: [StoredChatMessage],
+        backend: ChatBackend,
+        systemPrompt: String,
+        toolsEnabled: Bool,
+        relativeTo: Date? = nil,
+        aggressive: Bool = false
+    ) async -> ConversationCompaction.Prepared {
+        await ConversationCompaction.prepare(
+            chat: storedChat,
+            messages: messages,
+            backend: backend,
+            systemPrompt: systemPrompt,
+            toolsEnabled: toolsEnabled,
+            isGroupChat: isGroupChat,
+            fallbackAgentName: storedChat.agentName,
+            relativeTo: relativeTo,
+            aggressive: aggressive,
+            in: modelContext
+        )
+    }
+
+    private func allStoredMessages() -> [StoredChatMessage] {
+        ActiveChatMessages.fetch(
+            chatID: id,
+            clearedThroughMessageID: storedChat.clearedThroughMessageID,
+            in: modelContext
+        )
+    }
+
+    @discardableResult
     private func appendMessage(
         role: ChatRole,
         text: String,
         authorAgentID: UUID? = nil,
-        authorName: String? = nil
-    ) {
+        authorName: String? = nil,
+        save: Bool = true
+    ) -> StoredChatMessage {
         let storedMessage = StoredChatMessage(
             chatID: id,
             role: role,
@@ -581,8 +1004,11 @@ final class ChatViewModel: ObservableObject, Identifiable {
         )
         modelContext.insert(storedMessage)
         storedChat.updatedAt = .now
-        saveChanges()
+        if save {
+            saveChanges()
+        }
         messages.append(ChatMessage(storedMessage: storedMessage))
+        return storedMessage
     }
 
     private func updateTitle(_ newTitle: String) {

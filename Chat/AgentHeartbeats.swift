@@ -8,12 +8,9 @@ enum HeartbeatTargetKind: String {
 }
 
 enum HeartbeatExecutionError: LocalizedError {
-    static let busyDestinationRetryDelay: TimeInterval = 60
-
     case agentMissing
     case emptyInstruction
     case targetMissing
-    case chatBusy
 
     var errorDescription: String? {
         switch self {
@@ -23,17 +20,6 @@ enum HeartbeatExecutionError: LocalizedError {
             return "Add an instruction before enabling this heartbeat."
         case .targetMissing:
             return "The selected destination no longer exists."
-        case .chatBusy:
-            return "The destination chat is already generating a response."
-        }
-    }
-
-    var retryDelay: TimeInterval? {
-        switch self {
-        case .chatBusy:
-            return Self.busyDestinationRetryDelay
-        case .agentMissing, .emptyInstruction, .targetMissing:
-            return nil
         }
     }
 }
@@ -107,6 +93,9 @@ final class HeartbeatRun: Identifiable {
     var modelOutput: String?
     var actionSummary: String
     var errorMessage: String?
+    var generationTurnID: UUID?
+    var promptTokenCount: Int?
+    var completionTokenCount: Int?
 
     init(
         id: UUID = UUID(),
@@ -120,7 +109,10 @@ final class HeartbeatRun: Identifiable {
         modelInput: String,
         modelOutput: String?,
         actionSummary: String,
-        errorMessage: String?
+        errorMessage: String?,
+        generationTurnID: UUID? = nil,
+        promptTokenCount: Int? = nil,
+        completionTokenCount: Int? = nil
     ) {
         self.id = id
         self.heartbeatID = heartbeatID
@@ -134,10 +126,54 @@ final class HeartbeatRun: Identifiable {
         self.modelOutput = modelOutput
         self.actionSummary = actionSummary
         self.errorMessage = errorMessage
+        self.generationTurnID = generationTurnID
+        self.promptTokenCount = promptTokenCount
+        self.completionTokenCount = completionTokenCount
     }
 
     var succeeded: Bool {
         errorMessage == nil
+    }
+
+    var duration: TimeInterval {
+        max(0, completedAt.timeIntervalSince(startedAt))
+    }
+
+    var formattedDuration: String {
+        Self.formatDuration(duration)
+    }
+
+    var totalTokenCount: Int? {
+        guard promptTokenCount != nil || completionTokenCount != nil else { return nil }
+        return (promptTokenCount ?? 0) + (completionTokenCount ?? 0)
+    }
+
+    var formattedTokenUsage: String? {
+        guard let totalTokenCount else { return nil }
+        return "\(totalTokenCount.formatted()) tok"
+    }
+
+    var tokenUsageHelp: String? {
+        guard let promptTokenCount, let completionTokenCount else { return formattedTokenUsage }
+        return "\(promptTokenCount.formatted()) prompt · \(completionTokenCount.formatted()) completion"
+    }
+
+    static func formatDuration(_ interval: TimeInterval) -> String {
+        let total = max(0, interval)
+        if total < 10 {
+            return String(format: "%.1fs", total)
+        }
+        if total < 60 {
+            return String(format: "%.0fs", total)
+        }
+        let minutes = Int(total) / 60
+        let seconds = Int(total.rounded(.towardZero)) % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+
+    static func metricsLine(duration: String, tokens: String?) -> String {
+        guard let tokens else { return duration }
+        return "\(duration) · \(tokens)"
     }
 }
 
@@ -152,6 +188,20 @@ struct HeartbeatExecutionReport {
     let actionSummary: String
     let errorMessage: String?
     let retryDelay: TimeInterval?
+    let runID: UUID
+    let turnID: UUID
+    let chatID: UUID?
+    let debugCaptureEnabled: Bool
+    let generationStatus: GenerationStatus
+    let assistantMessageID: UUID?
+    let visibleReplyPreview: String?
+    let memoryEntryCount: Int
+    let modelIdentifier: String
+    let backendRawValue: String
+    let toolInvocations: [CapturedToolInvocation]
+    let debug: GenerationDebugPayloadDraft?
+    var promptTokenCount: Int? = nil
+    var completionTokenCount: Int? = nil
 }
 
 struct RunningHeartbeat: Identifiable {
@@ -161,12 +211,26 @@ struct RunningHeartbeat: Identifiable {
     let instruction: String
     let destination: String
     let startedAt: Date
+    var chatID: UUID?
+    var debugCaptureEnabled: Bool
 }
 
 struct HeartbeatModelExchange {
     let modelInput: String
     let modelOutput: String
     let actionSummary: String
+    let runID: UUID
+    let turnID: UUID
+    let chatID: UUID
+    let debugCaptureEnabled: Bool
+    let generationStatus: GenerationStatus
+    let assistantMessageID: UUID?
+    let visibleReplyPreview: String?
+    let memoryEntryCount: Int
+    let backendRawValue: String
+    let toolInvocations: [CapturedToolInvocation]
+    let debug: GenerationDebugPayloadDraft?
+    var tokenUsage: TokenUsage = .zero
 }
 
 struct HeartbeatModelFailure: LocalizedError {
@@ -174,10 +238,36 @@ struct HeartbeatModelFailure: LocalizedError {
     let modelOutput: String?
     let message: String
     let wasAborted: Bool
+    var runID: UUID
+    var turnID: UUID
+    var chatID: UUID?
+    var debugCaptureEnabled: Bool
+    var toolInvocations: [CapturedToolInvocation]
+    var debug: GenerationDebugPayloadDraft?
+    var backendRawValue: String
+    var tokenUsage: TokenUsage = .zero
 
     var errorDescription: String? {
         message
     }
+}
+
+enum HeartbeatSlotOutcome {
+    case running
+    case timedOut
+}
+
+struct HeartbeatExecutionSlot {
+    var token: UUID
+    var task: Task<Void, Never>
+    var runID: UUID
+    var turnID: UUID
+    var recorder: ToolCallRecorder
+    var chatID: UUID?
+    var debugCaptureEnabled: Bool
+    var debugSystemPrompt: String?
+    var debugConversationPrompt: String?
+    var outcome: HeartbeatSlotOutcome
 }
 
 @MainActor
@@ -189,9 +279,8 @@ final class HeartbeatScheduler: ObservableObject {
     private let agentStore: AgentStore
     private let chatStore: ChatStore
     private var schedulerTask: Task<Void, Never>?
-    private var executionTasks: [AgentHeartbeat.ID: (token: UUID, task: Task<Void, Never>)] = [:]
+    private var executionTasks: [AgentHeartbeat.ID: HeartbeatExecutionSlot] = [:]
     private var timeoutTasks: [AgentHeartbeat.ID: (token: UUID, task: Task<Void, Never>)] = [:]
-    private var runningModelInputs: [AgentHeartbeat.ID: String] = [:]
 
     init(agentStore: AgentStore, chatStore: ChatStore) {
         self.agentStore = agentStore
@@ -270,13 +359,19 @@ final class HeartbeatScheduler: ObservableObject {
         }
 
         let executionToken = UUID()
+        let runID = UUID()
+        let turnID = UUID()
+        let recorder = ToolCallRecorder()
+        let debugCaptureEnabled = agentStore.agent(for: heartbeat.agentID)?.isDebugLogEnabled == true
         let runningHeartbeat = RunningHeartbeat(
             id: heartbeat.id,
             agentID: heartbeat.agentID,
             agentName: agentStore.agent(for: heartbeat.agentID)?.displayName ?? "Deleted agent",
             instruction: heartbeat.instruction.trimmingCharacters(in: .whitespacesAndNewlines),
             destination: chatStore.heartbeatDestinationDescription(for: heartbeat),
-            startedAt: .now
+            startedAt: .now,
+            chatID: nil,
+            debugCaptureEnabled: debugCaptureEnabled
         )
         runningHeartbeats.append(runningHeartbeat)
 
@@ -284,9 +379,25 @@ final class HeartbeatScheduler: ObservableObject {
             guard let self else { return }
             let report = await chatStore.executeHeartbeat(
                 heartbeat,
-                onModelInput: { modelInput in
-                    guard self.executionTasks[heartbeat.id]?.token == executionToken else { return }
-                    self.runningModelInputs[heartbeat.id] = modelInput
+                runID: runID,
+                turnID: turnID,
+                recorder: recorder,
+                debugCaptureEnabled: debugCaptureEnabled,
+                onDestinationChat: { chatID in
+                    guard var slot = self.executionTasks[heartbeat.id],
+                          slot.token == executionToken else { return }
+                    slot.chatID = chatID
+                    self.executionTasks[heartbeat.id] = slot
+                    if let index = self.runningHeartbeats.firstIndex(where: { $0.id == heartbeat.id }) {
+                        self.runningHeartbeats[index].chatID = chatID
+                    }
+                },
+                onDebugPrompt: { systemPrompt, conversationPrompt in
+                    guard var slot = self.executionTasks[heartbeat.id],
+                          slot.token == executionToken else { return }
+                    slot.debugSystemPrompt = systemPrompt
+                    slot.debugConversationPrompt = conversationPrompt
+                    self.executionTasks[heartbeat.id] = slot
                 },
                 onModelResponseAccepted: {
                     guard self.executionTasks[heartbeat.id]?.token == executionToken else { return }
@@ -294,7 +405,10 @@ final class HeartbeatScheduler: ObservableObject {
                     self.timeoutTasks[heartbeat.id] = nil
                 }
             )
-            guard executionTasks[heartbeat.id]?.token == executionToken else { return }
+            guard executionTasks[heartbeat.id]?.token == executionToken,
+                  executionTasks[heartbeat.id]?.outcome == .running else {
+                return
+            }
 
             timeoutTasks[heartbeat.id]?.task.cancel()
             timeoutTasks[heartbeat.id] = nil
@@ -304,10 +418,20 @@ final class HeartbeatScheduler: ObservableObject {
                 report: report
             )
             executionTasks[heartbeat.id] = nil
-            runningModelInputs[heartbeat.id] = nil
             runningHeartbeats.removeAll { $0.id == heartbeat.id }
         }
-        executionTasks[heartbeat.id] = (executionToken, task)
+        executionTasks[heartbeat.id] = HeartbeatExecutionSlot(
+            token: executionToken,
+            task: task,
+            runID: runID,
+            turnID: turnID,
+            recorder: recorder,
+            chatID: nil,
+            debugCaptureEnabled: debugCaptureEnabled,
+            debugSystemPrompt: nil,
+            debugConversationPrompt: nil,
+            outcome: .running
+        )
 
         let timeoutTask = Task { [weak self] in
             do {
@@ -327,18 +451,37 @@ final class HeartbeatScheduler: ObservableObject {
         _ heartbeatID: AgentHeartbeat.ID,
         executionToken: UUID
     ) {
-        guard let execution = executionTasks[heartbeatID],
-              execution.token == executionToken,
+        guard var slot = executionTasks[heartbeatID],
+              slot.token == executionToken,
+              slot.outcome == .running,
               let runningHeartbeat = runningHeartbeats.first(where: { $0.id == heartbeatID }) else {
             return
         }
 
-        execution.task.cancel()
+        slot.outcome = .timedOut
+        executionTasks[heartbeatID] = slot
+        slot.task.cancel()
+        let invocations = slot.recorder.snapshot()
         executionTasks[heartbeatID] = nil
         timeoutTasks[heartbeatID] = nil
         runningHeartbeats.removeAll { $0.id == heartbeatID }
 
         let completionDate = Date()
+        let modelIdentifier = agentStore.heartbeats.first(where: { $0.id == heartbeatID }).map {
+            $0.modelIdentifier ?? agentStore.agent(for: $0.agentID)?.selectedModelIdentifier ?? ""
+        } ?? ""
+        let backendRawValue = chatStore.backendPersistenceName(for: modelIdentifier)
+        let debug: GenerationDebugPayloadDraft?
+        if slot.debugCaptureEnabled {
+            debug = GenerationDebugPayloadDraft(
+                systemPrompt: slot.debugSystemPrompt ?? "",
+                conversationPrompt: slot.debugConversationPrompt ?? "",
+                rawModelOutput: ""
+            )
+        } else {
+            debug = nil
+        }
+
         agentStore.rescheduleHeartbeatAfterTimeout(id: heartbeatID, at: completionDate)
         agentStore.recordHeartbeatCompletion(
             heartbeatID: heartbeatID,
@@ -349,13 +492,26 @@ final class HeartbeatScheduler: ObservableObject {
                 destination: runningHeartbeat.destination,
                 startedAt: runningHeartbeat.startedAt,
                 completedAt: completionDate,
-                modelInput: runningModelInputs[heartbeatID] ?? "",
+                modelInput: "",
                 modelOutput: nil,
                 actionSummary: "Timed out after 5 minutes. No chat message was posted.",
                 errorMessage: "Timed out after 5 minutes.",
-                retryDelay: nil
+                retryDelay: nil,
+                runID: slot.runID,
+                turnID: slot.turnID,
+                chatID: slot.chatID,
+                debugCaptureEnabled: slot.debugCaptureEnabled,
+                generationStatus: .timedOut,
+                assistantMessageID: nil,
+                visibleReplyPreview: nil,
+                memoryEntryCount: 0,
+                modelIdentifier: modelIdentifier,
+                backendRawValue: backendRawValue,
+                toolInvocations: invocations,
+                debug: debug,
+                promptTokenCount: nil,
+                completionTokenCount: nil
             )
         )
-        runningModelInputs[heartbeatID] = nil
     }
 }

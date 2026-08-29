@@ -2,7 +2,7 @@
 
 This document describes the context the chat harness sends to a model for normal replies and scheduled heartbeats. Keep it updated whenever persistence, prompt construction, memory handling, message loading, or orchestration changes.
 
-Implementation snapshot: August 25, 2026.
+Implementation snapshot: August 27, 2026.
 
 Primary implementation:
 
@@ -10,7 +10,8 @@ Primary implementation:
 - `Chat/ModelPrompts.swift`: system and conversation prompt construction
 - `Chat/AgentMemory.swift`: memory protocol sent to models and parsed from replies
 - `Chat/SkillCatalog.swift`: `~/.chat/skills` discovery and global enablement
-- `Chat/SkillTools.swift`: `ReadSkillFileTool` and `ExecuteSkillScript`, confined to a skill folder
+- `Chat/SkillTools.swift`: `ReadSkillFileTool`, `ExecuteSkillScript`, `SendNotification`, and `ReadCalendarEvents`
+- `Chat/CalendarAccess.swift`: EventKit calendar listing and event reads, scoped by per-agent calendar IDs
 - `Chat/ChatViewModel.swift`: turn orchestration
 - `Chat/LocalModels.swift`: local model CRUD and backend selection
 - `Chat/GroupChats.swift`: group participants and `@mention` parsing
@@ -52,16 +53,27 @@ For direct replies and heartbeats, the base agent system prompt is:
 ```text
 Your agent name is <agent name>.
 
+Current date and time: <weekday, month day, year at local time with zone abbreviation> (<ISO 8601 with offset>, <time zone identifier>)
+
 Individual agent instructions:
 <individual instructions or default>
 
 <memory section and memory rules>
 
+Available tools:
+- <ToolName>: <tool description>
+
 Available skills:
 - <skill name>: <skill description>
 ```
 
+The tools section is omitted when the agent has no tools enabled. Each enabled tool is listed by its exact call name. The model is told that describing a tool or putting its intended output in a reply does not invoke it, and that it may call multiple tools in sequence.
+
+`ReadCalendarEvents(start, end, calendar_ids)` reads EventKit events in an ISO 8601 date range. `calendar_ids` is an optional comma-separated list of calendar identifiers, not names; omitting it queries every calendar the user allowed for that agent (All, or a stored ID allowlist). The tool returns labeled text: a calendar ID+name directory, then one `event:` record per event. Timed `start`/`end` values are converted in-process to the Mac’s current time zone and formatted as localized date-times with a zone abbreviation (for example PDT); the header names that zone (`America/Los_Angeles (PDT, UTC-7)`). All-day events stay calendar dates in the event’s own zone so they do not shift a day. The payload omits EventKit identifiers, lat/long, alarms, creation/modification timestamps, default `confirmed`/`busy` flags, and per-event original time zones. Attachments are omitted. Notes longer than 250 characters are truncated. The allowlist is live agent configuration and is not included in the system prompt.
+
 The skills section is omitted when no skills are enabled both globally in Settings and for that agent. Enabled skills are listed by YAML `name` and `description` from `SKILL.md`. The model can read files with `ReadSkillFileTool(skill_name, file_name)` and run scripts with `ExecuteSkillScript(skill_name, script_name, arguments)`. Paths are confined to that skill's folder under `~/.chat/skills`.
+
+The current date and time are taken from the device clock in the Mac’s current time zone at the start of each generation (direct replies, group replies, and heartbeats).
 
 Ordinary group replies use an equivalent structure inside the group-specific system prompt.
 
@@ -103,19 +115,29 @@ The harness removes every complete memory block from the visible reply and appen
 
 If the output contains only memory blocks, memory is updated without posting a chat message.
 
+## Default chats and extra chats
+
+Each agent has one **default direct chat**. It is created with the agent, always appears in the sidebar as the agent's avatar and name, and cannot be deleted. Extra direct chats with the same agent are created from the agent's context menu (`New chat`) and are listed indented under that row, showing only the chat title.
+
+Heartbeats whose destination is the agent's private chat post to that default chat unless a specific extra chat is selected. Resetting a chat records `clearedThroughMessageID` on `StoredChat`: messages through that id stay in the database but are omitted from the visible transcript and from model context. Reset also clears the chat's compaction digest and watermark so the prior session is not summarized into the next one.
+
 ## Direct chats
 
-All direct-chat model context now comes from persisted messages rather than the UI's lazy-loaded message array.
+All direct-chat model context now comes from persisted messages rather than the UI's lazy-loaded message array. After a reset, that fetch includes only messages after `clearedThroughMessageID`.
 
 ### Apple Foundation Model
 
 A new `LanguageModelSession` is created for each reply. Its instructions are the effective agent system instructions with current memory.
 
-The app fetches every persisted chat message in chronological order and flattens it into this prompt:
+The app fetches persisted chat messages in chronological order and flattens the **tail** (messages after the chat's compaction watermark) into this prompt. If a stored digest exists, it is prepended:
 
 ```text
-Here is the complete private conversation so far:
+Here is the private conversation so far:
 
+Earlier in this conversation (summarized):
+<digest>
+
+Recent messages:
 User: <user message>
 
 <agent name>: <assistant message>
@@ -123,13 +145,13 @@ User: <user message>
 Reply to the latest user message as <agent name>.
 ```
 
-The newly submitted user message is persisted before this transcript is built. The app-generated greeting and any heartbeat posts are therefore included.
+The newly submitted user message is persisted before this transcript is built. Extra direct chats insert an app-generated greeting; an agent's default chat does not. Greeting and heartbeat posts that belong to the active session are included. The visible chat transcript is never rewritten; reset hides earlier rows instead of deleting them.
 
-No Apple session is reused between turns. All conversational memory comes from the persisted transcript and agent memory included in the current request.
+No Apple session is reused between turns. All conversational memory comes from the digest plus tail and agent memory included in the current request.
 
 ### OpenAI-compatible model
 
-The harness fetches every persisted direct-chat message in chronological order and sends native chat-completion roles:
+The harness sends native chat-completion roles for the **tail** only. The digest is appended to the system message when present:
 
 ```json
 {
@@ -151,7 +173,19 @@ The harness fetches every persisted direct-chat message in chronological order a
 }
 ```
 
-Every persisted user and assistant message is included. Author IDs and names are not sent in the native message entries because a direct chat has one agent.
+Author IDs and names are not sent in the native message entries because a direct chat has one agent.
+
+## Conversation compaction
+
+The visible `StoredChatMessage` log is never rewritten in place. Reset and extra-chat deletion are the exceptions to “never deleted from the UI”: reset hides rows via `clearedThroughMessageID` without deleting them; deleting an extra or group chat removes that chat and its messages. Default chats cannot be deleted. Each chat stores an optional rolling digest (`compactedSummary`) and a watermark (`compactedThroughMessageID`). Compaction only sees the active session (messages after `clearedThroughMessageID`).
+
+Before a direct reply or group participant reply, the harness budgets the destination model's context window (Apple `contextSize` at runtime, or the local model's configured token limit, default 8192). It keeps as much recent verbatim history as fits after system instructions, memory, tools, and a reply reserve. Messages that no longer fit are folded into the digest with the on-device Apple Foundation Model: existing digest + overflow span → replacement digest covering the whole span through the new watermark. Long overflow is chunked to fit the summarizer's own window, then merged.
+
+If Apple Intelligence is unavailable or summarization throws, those overflow messages are omitted from the **prompt only** for that turn.
+
+A Compact button on the chat (and Developer → Compact conversation) runs the same path with a smaller tail budget.
+
+Compaction is serialized per chat. The digest is chat-local and is not written to agent memory.
 
 ## Group chats
 
@@ -188,6 +222,8 @@ Each participant receives:
 
 ```text
 You are <agent name>, a participant in an open group discussion.
+
+Current date and time: <weekday, month day, year at local time with zone abbreviation> (<ISO 8601 with offset>, <time zone identifier>)
 
 Individual agent instructions:
 <current individual instructions or default>
@@ -262,7 +298,7 @@ The in-app scheduler checks for due heartbeats every 15 seconds while Chat is ru
 
 Heartbeat execution is globally single-flight: the scheduler starts at most one heartbeat at a time, regardless of agent or destination. When multiple heartbeats are due together, it chooses the earliest scheduled date; ties favor the heartbeat that ran least recently, then creation order. This prevents equal schedules from starving one another.
 
-Once one heartbeat has started, every other heartbeat that becomes due is deferred to the current time plus its own interval. The running heartbeat may itself be a scheduled run, a busy-destination retry, or a manual invocation. A deferral does not call a model, update last-run or last-completed time, or create an audit record.
+Once one heartbeat has started, every other heartbeat that becomes due is deferred to the current time plus its own interval. The running heartbeat may itself be a scheduled run or a manual invocation. A deferral does not call a model, update last-run or last-completed time, or create an audit record.
 
 Missed intervals are not replayed. If the app was closed past the due time, the heartbeat runs once after the next scheduler check and then resumes its normal interval.
 
@@ -278,11 +314,11 @@ Every execution has a five-minute timeout. At five minutes the scheduler removes
 
 ### Destination selection
 
-For `Private chat`, the heartbeat targets the agent's most recently updated direct chat. If none exists, the harness creates one without changing the user's current sidebar selection.
+For `Private chat` with no specific chat selected, the heartbeat targets the agent's default direct chat. If none exists, the harness creates it without changing the user's current sidebar selection. A heartbeat can instead target a specific extra direct chat; if that chat is missing, the run fails without posting.
 
 For `Group chat`, the heartbeat targets the selected persisted group chat. The agent is added to that group's participants if needed.
 
-If the destination chat is already generating a response, the heartbeat records an error and does not post, then schedules a retry for 60 seconds after the failed attempt completed. The busy attempt is a completed audit record. The retry is an ordinary pending heartbeat, so another running heartbeat can defer it by the retrying heartbeat's configured interval.
+A heartbeat runs in the background of its destination chat. It does not take the chat's responding lock, show a thinking indicator, or prevent the user from sending. The destination may generate a user-turn reply at the same time; whichever finishes first posts first. Heartbeats do not receive the chat transcript, digest, or unanswered-message count. Each run is standalone: agent instructions, memory, tools, skills, the current date and time, and the heartbeat instruction.
 
 ### Heartbeat model selection and system context
 
@@ -294,39 +330,34 @@ A private heartbeat adds these system instructions after the base agent prompt:
 
 ```text
 You are running a scheduled heartbeat for your private chat.
-Follow the heartbeat instruction using the conversation as context.
-If there is nothing worth posting, reply with exactly [[PASS]].
+This run is standalone. You do not have the chat transcript or prior messages.
+Follow the heartbeat instruction, including any tool calls it requires.
+Tool calls are not chat messages.
+If nothing should be posted to the chat, reply with exactly [[PASS]] after you finish any required tools.
 You may still append memory even when you pass.
 ```
 
-A group heartbeat also receives current group instructions and the group discussion rules before the heartbeat behavior instructions.
+A group heartbeat also receives current group instructions. It does not receive the group transcript or the ordinary group discussion rules that depend on seeing other speakers.
 
 ### Heartbeat conversation prompt
 
-Every persisted message in the destination chat is flattened into one prompt:
+The destination chat is not compacted or included. The user prompt is only the heartbeat instruction plus the age of the prior completed attempt:
 
 ```text
-Here is the complete <group or private> conversation so far:
-Message ages are relative to the start of this heartbeat run.
-
-[8m ago] User: <user message>
-
-[2m ago] <agent name>: <assistant message>
+This is a standalone scheduled heartbeat. You do not have the chat transcript.
 
 Time since this heartbeat last completed: 1h ago.
-Number of unanswered messages in this chat: 1.
 
 Scheduled heartbeat instruction:
 <heartbeat instruction>
 
-Decide whether to post as <agent name>. Return [[PASS]] if no message should be posted.
+Follow that instruction completely, including any tools it names.
+Then decide whether to post as <agent name>. Return [[PASS]] if no chat message should be posted.
 ```
 
-For both backends, the heartbeat transcript is supplied as one prompt. Apple uses a new `LanguageModelSession`; OpenAI-compatible models receive one `system` and one `user` message.
+For both backends this is one prompt. Apple uses a new `LanguageModelSession`; OpenAI-compatible models receive one `system` and one `user` message.
 
-Message ages and the prior-completion age use a compact, truncated representation: seconds, minutes, hours, days, weeks, 30-day months, or 365-day years. All ages use the heartbeat's start time as one consistent reference point. A heartbeat with no prior completed attempt receives `never`. “Completed” includes a post, pass, empty response, generation or destination error, user abort, and timeout; skipping a scheduled occurrence does not count as completion.
-
-The unanswered-message count is the number of consecutive non-user messages at the end of the persisted chat. It resets to zero when the user sends a message. In a group chat it counts messages from every agent, not only the agent running the heartbeat. If the user has never sent a message, all existing agent messages—including an initial direct-chat greeting—are counted. This lets a heartbeat instruction suppress another post when one or more agent messages are still awaiting a user reply.
+The prior-completion age uses a compact, truncated representation: seconds, minutes, hours, days, weeks, 30-day months, or 365-day years, measured from the heartbeat's start time. A heartbeat with no prior completed attempt receives `never`. “Completed” includes a post, pass, empty response, generation or destination error, user abort, and timeout; skipping a scheduled occurrence does not count as completion.
 
 ### Heartbeat result handling
 
@@ -356,7 +387,8 @@ Memory blocks are removed before this check, so an agent can append memory and p
 ## Values not sent as conversational context
 
 - Chat titles, except that heartbeat destination labels are shown only in the UI
-- Absolute message timestamps or message IDs; heartbeat prompts receive compact relative message ages
+- Absolute message timestamps or message IDs
+- The destination chat transcript, digest, or unanswered-message count; heartbeat prompts do not include prior chat messages
 - Agent IDs
 - Heartbeat scheduling metadata other than the compact age of the prior completed attempt
 - The complete list of silent group participants
@@ -370,9 +402,9 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 
 ### High priority
 
-1. **There is no context-window budgeting.** Every persisted message and the complete memory text are sent on every relevant request. Long chats or large memories can exceed model context limits. There is no token counting, truncation, or summarization.
+1. **Memory text is not compacted.** Agent memory is still sent in full on every request. A large memory block can consume the context budget even after transcript compaction. Token counts use a character heuristic, not the Apple tokenizer.
 
-2. **Flattened transcripts have weak role and trust boundaries.** Apple direct turns, all group turns, and all heartbeats use plain `Name: text` transcripts inside one prompt. Users and agents can imitate speaker labels or prompt-like instructions, and prior turns lose native role structure.
+2. **Flattened transcripts have weak role and trust boundaries.** Apple direct turns and all group turns use plain `Name: text` transcripts inside one prompt. Users and agents can imitate speaker labels or prompt-like instructions, and prior turns lose native role structure. Heartbeats no longer receive a transcript.
 
 3. **The memory protocol is marker-based.** A malformed or incomplete marker becomes visible text. A model can append low-quality, duplicated, or misleading memory, and there is no confirmation, provenance, size limit, or deduplication.
 

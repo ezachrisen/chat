@@ -28,6 +28,8 @@ struct SkillRuntime: Sendable {
 enum AgentToolID: String, CaseIterable, Identifiable {
     case readSkillFile = "ReadSkillFileTool"
     case executeSkillScript = "ExecuteSkillScript"
+    case sendNotification = "SendNotification"
+    case readCalendarEvents = "ReadCalendarEvents"
 
     var id: String { rawValue }
 
@@ -37,6 +39,10 @@ enum AgentToolID: String, CaseIterable, Identifiable {
             return "Read skill file"
         case .executeSkillScript:
             return "Execute skill script"
+        case .sendNotification:
+            return "Send notification"
+        case .readCalendarEvents:
+            return "Read calendar events"
         }
     }
 
@@ -46,6 +52,10 @@ enum AgentToolID: String, CaseIterable, Identifiable {
             return "Read a file inside an enabled skill folder, such as SKILL.md."
         case .executeSkillScript:
             return "Run a script inside an enabled skill folder and return stdout and stderr."
+        case .sendNotification:
+            return "Show a macOS notification with a title and body."
+        case .readCalendarEvents:
+            return "Read events from the Mac calendars you allow for this agent."
         }
     }
 
@@ -55,6 +65,10 @@ enum AgentToolID: String, CaseIterable, Identifiable {
             return "Read a file from an installed skill. file_name is relative to the skill folder (for example SKILL.md). Paths may not escape the skill folder."
         case .executeSkillScript:
             return "Execute a script from an installed skill. script_name is relative to the skill folder. Optional arguments is a whitespace-separated string. The working directory is the skill folder. Paths may not escape the skill folder."
+        case .sendNotification:
+            return "Send a macOS notification. You must call this tool to notify the user; writing the message in your chat reply does not send a notification. body is required. title is optional and defaults to the agent name."
+        case .readCalendarEvents:
+            return "Read calendar events between start and end. start and end are ISO 8601 dates or date-times (for example 2026-08-01 or 2026-08-01T09:00:00). Optional calendar_ids is a comma-separated list of calendar IDs, not names. Omit calendar_ids to query every calendar this agent is allowed to read. Timed start and end times in the result are already converted to the user's current time zone, which is named in the result; all-day events are calendar dates. When talking to the user, use those local times and name the time zone. Notes longer than 250 characters are truncated."
         }
     }
 }

@@ -14,6 +14,13 @@ final class StoredChat: Identifiable {
     var title: String
     var createdAt: Date
     var updatedAt: Date
+    var compactedSummary: String?
+    var compactedThroughMessageID: UUID?
+    var compactedAt: Date?
+    var compactedMessageCount: Int?
+    var rendersMarkdown: Bool?
+    var isDefaultChat: Bool?
+    var clearedThroughMessageID: UUID?
 
     init(
         id: UUID = UUID(),
@@ -25,7 +32,14 @@ final class StoredChat: Identifiable {
         groupSystemInstructions: String? = nil,
         title: String = "New chat",
         createdAt: Date = .now,
-        updatedAt: Date = .now
+        updatedAt: Date = .now,
+        compactedSummary: String? = nil,
+        compactedThroughMessageID: UUID? = nil,
+        compactedAt: Date? = nil,
+        compactedMessageCount: Int? = nil,
+        rendersMarkdown: Bool? = nil,
+        isDefaultChat: Bool? = nil,
+        clearedThroughMessageID: UUID? = nil
     ) {
         self.id = id
         self.agentID = agentID
@@ -37,6 +51,13 @@ final class StoredChat: Identifiable {
         self.title = title
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.compactedSummary = compactedSummary
+        self.compactedThroughMessageID = compactedThroughMessageID
+        self.compactedAt = compactedAt
+        self.compactedMessageCount = compactedMessageCount
+        self.rendersMarkdown = rendersMarkdown
+        self.isDefaultChat = isDefaultChat
+        self.clearedThroughMessageID = clearedThroughMessageID
     }
 
     var kind: ChatKind {
@@ -89,6 +110,7 @@ final class ChatStore: ObservableObject {
     private let localModelStore: LocalModelStore
     private let skillCatalog: SkillCatalog
     private let replyFilterStore: ReplyFilterStore
+    private var agentsCancellable: AnyCancellable?
 
     var selectedChat: ChatViewModel? {
         guard let selectedChatID else { return nil }
@@ -108,41 +130,50 @@ final class ChatStore: ObservableObject {
         self.skillCatalog = skillCatalog
         self.replyFilterStore = replyFilterStore
         loadChats()
+        ensureDefaultChats(for: agentStore.agents)
+        selectedChatID = chats.first?.id
 
-        if chats.isEmpty, let agent = agentStore.agents.first {
-            startChat(with: agent)
-        } else {
-            selectedChatID = chats.first?.id
-        }
+        agentsCancellable = agentStore.$agents
+            .sink { [weak self] agents in
+                self?.ensureDefaultChats(for: agents)
+            }
     }
 
     func startChat(with agent: Agent) {
-        let chat = makeDirectChat(with: agent)
+        _ = defaultChat(for: agent.id) ?? makeDirectChat(with: agent, isDefault: true)
+        let chat = makeDirectChat(with: agent, isDefault: false)
         selectedChatID = chat.id
     }
 
-    private func makeDirectChat(with agent: Agent) -> ChatViewModel {
+    @discardableResult
+    private func makeDirectChat(with agent: Agent, isDefault: Bool) -> ChatViewModel {
         let storedChat = StoredChat(
             agentID: agent.id,
             agentName: agent.displayName,
             agentSoul: agent.soul,
-            agentModelIdentifier: agent.selectedModelIdentifier
+            agentModelIdentifier: agent.selectedModelIdentifier,
+            title: isDefault ? agent.displayName : "New chat",
+            isDefaultChat: isDefault
         )
         modelContext.insert(storedChat)
 
-        let greeting = StoredChatMessage(
-            chatID: storedChat.id,
-            role: .assistant,
-            text: "New chat with \(agent.displayName). What would you like to ask?",
-            authorAgentID: agent.id,
-            authorName: agent.displayName
-        )
-        modelContext.insert(greeting)
+        var storedMessages: [StoredChatMessage] = []
+        if !isDefault {
+            let greeting = StoredChatMessage(
+                chatID: storedChat.id,
+                role: .assistant,
+                text: "New chat with \(agent.displayName). What would you like to ask?",
+                authorAgentID: agent.id,
+                authorName: agent.displayName
+            )
+            modelContext.insert(greeting)
+            storedMessages = [greeting]
+        }
         saveChanges()
 
         let chat = ChatViewModel(
             storedChat: storedChat,
-            storedMessages: [greeting],
+            storedMessages: storedMessages,
             storedGroupParticipants: [],
             agentStore: agentStore,
             localModelStore: localModelStore,
@@ -150,7 +181,11 @@ final class ChatStore: ObservableObject {
             replyFilterStore: replyFilterStore,
             modelContext: modelContext
         )
-        chats.insert(chat, at: 0)
+        if isDefault {
+            chats.append(chat)
+        } else {
+            chats.insert(chat, at: 0)
+        }
         return chat
     }
 
@@ -184,8 +219,70 @@ final class ChatStore: ObservableObject {
         chats.filter { !$0.isGroupChat && $0.agentID == agentID }
     }
 
+    func extraChats(for agentID: Agent.ID) -> [ChatViewModel] {
+        chats.filter { !$0.isGroupChat && $0.agentID == agentID && !$0.isDefaultChat }
+    }
+
+    func defaultChat(for agentID: Agent.ID?) -> ChatViewModel? {
+        guard let agentID else { return nil }
+        return chats.first { !$0.isGroupChat && $0.agentID == agentID && $0.isDefaultChat }
+    }
+
+    func selectDefaultChat(for agent: Agent) {
+        let chat = defaultChat(for: agent.id) ?? makeDirectChat(with: agent, isDefault: true)
+        selectedChatID = chat.id
+    }
+
     var groupChats: [ChatViewModel] {
         chats.filter(\.isGroupChat)
+    }
+
+    func resetChat(_ chat: ChatViewModel) {
+        chat.resetActiveHistory()
+    }
+
+    func deleteChat(_ chat: ChatViewModel) {
+        guard chat.canDelete, !chat.isResponding else { return }
+
+        let chatID = chat.id
+        let agentID = chat.agentID
+        let wasSelected = selectedChatID == chatID
+        chat.deletePersistedRecords()
+        chats.removeAll { $0.id == chatID }
+        if wasSelected {
+            selectedChatID = defaultChat(for: agentID)?.id ?? chats.first?.id
+        }
+    }
+
+    private func ensureDefaultChats(for agents: [Agent]) {
+        for agent in agents {
+            let directs = chats.filter { !$0.isGroupChat && $0.agentID == agent.id }
+            let defaults = directs.filter(\.isDefaultChat)
+            if defaults.count == 1 {
+                continue
+            }
+            if defaults.count > 1 {
+                let keepID = preferredDefault(from: defaults)?.id
+                for chat in defaults where chat.id != keepID {
+                    chat.setDefaultChat(false)
+                }
+                continue
+            }
+            if let candidate = preferredDefault(from: directs) {
+                candidate.setDefaultChat(true)
+            } else {
+                _ = makeDirectChat(with: agent, isDefault: true)
+            }
+        }
+    }
+
+    private func preferredDefault(from chats: [ChatViewModel]) -> ChatViewModel? {
+        chats.max { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt < rhs.updatedAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
     }
 
     func addFakeMessagesToSelectedChat(count: Int) {
@@ -196,26 +293,50 @@ final class ChatStore: ObservableObject {
         selectedChat?.addSlowResponse()
     }
 
+    func backendPersistenceName(for modelIdentifier: String) -> String {
+        localModelStore.backend(for: modelIdentifier).persistenceName
+    }
+
     func executeHeartbeat(
         _ heartbeat: AgentHeartbeat,
-        onModelInput: ((String) -> Void)? = nil,
+        runID: UUID,
+        turnID: UUID,
+        recorder: ToolCallRecorder,
+        debugCaptureEnabled: Bool,
+        onDestinationChat: ((UUID) -> Void)? = nil,
+        onDebugPrompt: ((String, String) -> Void)? = nil,
         onModelResponseAccepted: (() -> Void)? = nil
     ) async -> HeartbeatExecutionReport {
         let startedAt = Date()
         let fallbackAgentName = "Deleted agent"
         let instruction = heartbeat.instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unresolvedDestination = heartbeatDestinationDescription(for: heartbeat)
 
         if Task.isCancelled {
             return failedHeartbeatReport(
                 agentName: agentStore.agent(for: heartbeat.agentID)?.displayName ?? fallbackAgentName,
                 instruction: instruction,
-                destination: heartbeatDestinationDescription(for: heartbeat),
+                destination: unresolvedDestination,
                 startedAt: startedAt,
+                runID: runID,
+                turnID: turnID,
+                chatID: nil,
+                debugCaptureEnabled: debugCaptureEnabled,
+                modelIdentifier: heartbeat.modelIdentifier ?? "",
+                backendRawValue: ChatBackend.missingLocalModel.persistenceName,
+                toolInvocations: recorder.snapshot(),
                 error: HeartbeatModelFailure(
                     modelInput: "",
                     modelOutput: nil,
                     message: "Aborted by user.",
-                    wasAborted: true
+                    wasAborted: true,
+                    runID: runID,
+                    turnID: turnID,
+                    chatID: nil,
+                    debugCaptureEnabled: debugCaptureEnabled,
+                    toolInvocations: recorder.snapshot(),
+                    debug: nil,
+                    backendRawValue: ChatBackend.missingLocalModel.persistenceName
                 )
             )
         }
@@ -224,18 +345,33 @@ final class ChatStore: ObservableObject {
             return failedHeartbeatReport(
                 agentName: fallbackAgentName,
                 instruction: instruction,
-                destination: heartbeatDestinationDescription(for: heartbeat),
+                destination: unresolvedDestination,
                 startedAt: startedAt,
+                runID: runID,
+                turnID: turnID,
+                chatID: nil,
+                debugCaptureEnabled: debugCaptureEnabled,
+                modelIdentifier: heartbeat.modelIdentifier ?? "",
+                backendRawValue: ChatBackend.missingLocalModel.persistenceName,
+                toolInvocations: recorder.snapshot(),
                 error: HeartbeatExecutionError.agentMissing
             )
         }
 
         guard !instruction.isEmpty else {
+            let modelIdentifier = heartbeat.modelIdentifier ?? agent.selectedModelIdentifier
             return failedHeartbeatReport(
                 agentName: agent.displayName,
                 instruction: instruction,
-                destination: heartbeatDestinationDescription(for: heartbeat),
+                destination: unresolvedDestination,
                 startedAt: startedAt,
+                runID: runID,
+                turnID: turnID,
+                chatID: nil,
+                debugCaptureEnabled: debugCaptureEnabled,
+                modelIdentifier: modelIdentifier,
+                backendRawValue: backendPersistenceName(for: modelIdentifier),
+                toolInvocations: recorder.snapshot(),
                 error: HeartbeatExecutionError.emptyInstruction
             )
         }
@@ -243,26 +379,56 @@ final class ChatStore: ObservableObject {
         let targetChat: ChatViewModel
         switch heartbeat.targetKind {
         case .privateChat:
-            targetChat = chats
-                .filter { !$0.isGroupChat && $0.agentID == agent.id }
-                .max { $0.updatedAt < $1.updatedAt }
-                ?? makeDirectChat(with: agent)
+            if let targetChatID = heartbeat.targetChatID {
+                guard let privateChat = chats.first(where: {
+                    $0.id == targetChatID && !$0.isGroupChat && $0.agentID == agent.id
+                }) else {
+                    let modelIdentifier = heartbeat.modelIdentifier ?? agent.selectedModelIdentifier
+                    return failedHeartbeatReport(
+                        agentName: agent.displayName,
+                        instruction: instruction,
+                        destination: unresolvedDestination,
+                        startedAt: startedAt,
+                        runID: runID,
+                        turnID: turnID,
+                        chatID: nil,
+                        debugCaptureEnabled: debugCaptureEnabled,
+                        modelIdentifier: modelIdentifier,
+                        backendRawValue: backendPersistenceName(for: modelIdentifier),
+                        toolInvocations: recorder.snapshot(),
+                        error: HeartbeatExecutionError.targetMissing
+                    )
+                }
+                targetChat = privateChat
+            } else {
+                targetChat = defaultChat(for: agent.id) ?? makeDirectChat(with: agent, isDefault: true)
+            }
         case .groupChat:
             guard let targetChatID = heartbeat.targetChatID,
                   let groupChat = chats.first(where: { $0.id == targetChatID && $0.isGroupChat }) else {
+                let modelIdentifier = heartbeat.modelIdentifier ?? agent.selectedModelIdentifier
                 return failedHeartbeatReport(
                     agentName: agent.displayName,
                     instruction: instruction,
-                    destination: heartbeatDestinationDescription(for: heartbeat),
+                    destination: unresolvedDestination,
                     startedAt: startedAt,
+                    runID: runID,
+                    turnID: turnID,
+                    chatID: nil,
+                    debugCaptureEnabled: debugCaptureEnabled,
+                    modelIdentifier: modelIdentifier,
+                    backendRawValue: backendPersistenceName(for: modelIdentifier),
+                    toolInvocations: recorder.snapshot(),
                     error: HeartbeatExecutionError.targetMissing
                 )
             }
             targetChat = groupChat
         }
 
+        onDestinationChat?(targetChat.id)
         let destination = targetChat.heartbeatDestinationDescription
         let modelIdentifier = heartbeat.modelIdentifier ?? agent.selectedModelIdentifier
+        let backendRawValue = backendPersistenceName(for: modelIdentifier)
         do {
             let exchange = try await targetChat.executeHeartbeat(
                 as: agent,
@@ -270,7 +436,11 @@ final class ChatStore: ObservableObject {
                 modelIdentifier: modelIdentifier,
                 lastCompletedAt: heartbeat.lastCompletedAt,
                 referenceDate: startedAt,
-                onModelInput: onModelInput,
+                runID: runID,
+                turnID: turnID,
+                recorder: recorder,
+                debugCaptureEnabled: debugCaptureEnabled,
+                onDebugPrompt: onDebugPrompt,
                 onModelResponseAccepted: onModelResponseAccepted
             )
             return HeartbeatExecutionReport(
@@ -279,11 +449,25 @@ final class ChatStore: ObservableObject {
                 destination: destination,
                 startedAt: startedAt,
                 completedAt: .now,
-                modelInput: exchange.modelInput,
-                modelOutput: exchange.modelOutput,
+                modelInput: "",
+                modelOutput: nil,
                 actionSummary: exchange.actionSummary,
                 errorMessage: nil,
-                retryDelay: nil
+                retryDelay: nil,
+                runID: exchange.runID,
+                turnID: exchange.turnID,
+                chatID: exchange.chatID,
+                debugCaptureEnabled: exchange.debugCaptureEnabled,
+                generationStatus: exchange.generationStatus,
+                assistantMessageID: exchange.assistantMessageID,
+                visibleReplyPreview: exchange.visibleReplyPreview,
+                memoryEntryCount: exchange.memoryEntryCount,
+                modelIdentifier: modelIdentifier,
+                backendRawValue: exchange.backendRawValue,
+                toolInvocations: exchange.toolInvocations,
+                debug: exchange.debug,
+                promptTokenCount: exchange.tokenUsage.isEmpty ? nil : exchange.tokenUsage.promptTokens,
+                completionTokenCount: exchange.tokenUsage.isEmpty ? nil : exchange.tokenUsage.completionTokens
             )
         } catch let error as HeartbeatModelFailure {
             return failedHeartbeatReport(
@@ -291,8 +475,14 @@ final class ChatStore: ObservableObject {
                 instruction: instruction,
                 destination: destination,
                 startedAt: startedAt,
-                modelInput: error.modelInput,
-                modelOutput: error.modelOutput,
+                runID: error.runID,
+                turnID: error.turnID,
+                chatID: error.chatID ?? targetChat.id,
+                debugCaptureEnabled: error.debugCaptureEnabled,
+                modelIdentifier: modelIdentifier,
+                backendRawValue: error.backendRawValue.isEmpty ? backendRawValue : error.backendRawValue,
+                toolInvocations: error.toolInvocations,
+                debug: error.debug,
                 error: error
             )
         } catch {
@@ -301,6 +491,13 @@ final class ChatStore: ObservableObject {
                 instruction: instruction,
                 destination: destination,
                 startedAt: startedAt,
+                runID: runID,
+                turnID: turnID,
+                chatID: targetChat.id,
+                debugCaptureEnabled: debugCaptureEnabled,
+                modelIdentifier: modelIdentifier,
+                backendRawValue: backendRawValue,
+                toolInvocations: recorder.snapshot(),
                 error: error
             )
         }
@@ -309,12 +506,18 @@ final class ChatStore: ObservableObject {
     func heartbeatDestinationDescription(for heartbeat: AgentHeartbeat) -> String {
         switch heartbeat.targetKind {
         case .privateChat:
-            guard let chat = chats
-                .filter({ !$0.isGroupChat && $0.agentID == heartbeat.agentID })
-                .max(by: { $0.updatedAt < $1.updatedAt }) else {
-                return "New private chat"
+            if let targetChatID = heartbeat.targetChatID {
+                guard let chat = chats.first(where: {
+                    $0.id == targetChatID && !$0.isGroupChat && $0.agentID == heartbeat.agentID
+                }) else {
+                    return "Missing private chat"
+                }
+                return chat.heartbeatDestinationDescription
             }
-            return chat.heartbeatDestinationDescription
+            if let chat = defaultChat(for: heartbeat.agentID) {
+                return chat.heartbeatDestinationDescription
+            }
+            return "Default chat"
         case .groupChat:
             guard let targetChatID = heartbeat.targetChatID,
                   let chat = chats.first(where: { $0.id == targetChatID && $0.isGroupChat }) else {
@@ -329,17 +532,20 @@ final class ChatStore: ObservableObject {
         instruction: String,
         destination: String,
         startedAt: Date,
-        modelInput: String = "",
-        modelOutput: String? = nil,
+        runID: UUID,
+        turnID: UUID,
+        chatID: UUID?,
+        debugCaptureEnabled: Bool,
+        modelIdentifier: String,
+        backendRawValue: String,
+        toolInvocations: [CapturedToolInvocation],
+        debug: GenerationDebugPayloadDraft? = nil,
         error: Error
     ) -> HeartbeatExecutionReport {
         let wasAborted = (error as? HeartbeatModelFailure)?.wasAborted == true
-        let retryDelay = (error as? HeartbeatExecutionError)?.retryDelay
         let actionSummary: String
         if wasAborted {
             actionSummary = "Run was aborted. No chat message was posted."
-        } else if retryDelay != nil {
-            actionSummary = "No chat message was posted. Scheduled a retry in 1 minute."
         } else {
             actionSummary = "No chat message was posted."
         }
@@ -350,12 +556,31 @@ final class ChatStore: ObservableObject {
             destination: destination,
             startedAt: startedAt,
             completedAt: Date(),
-            modelInput: modelInput,
-            modelOutput: modelOutput,
+            modelInput: "",
+            modelOutput: nil,
             actionSummary: actionSummary,
             errorMessage: wasAborted ? "Aborted by user." : error.localizedDescription,
-            retryDelay: retryDelay
+            retryDelay: nil,
+            runID: runID,
+            turnID: turnID,
+            chatID: chatID,
+            debugCaptureEnabled: debugCaptureEnabled,
+            generationStatus: wasAborted ? .aborted : .failed,
+            assistantMessageID: nil,
+            visibleReplyPreview: nil,
+            memoryEntryCount: 0,
+            modelIdentifier: modelIdentifier,
+            backendRawValue: backendRawValue,
+            toolInvocations: toolInvocations,
+            debug: debugCaptureEnabled ? debug : nil,
+            promptTokenCount: storedTokenUsage(from: error)?.promptTokens,
+            completionTokenCount: storedTokenUsage(from: error)?.completionTokens
         )
+    }
+
+    private func storedTokenUsage(from error: Error) -> TokenUsage? {
+        let usage = (error as? HeartbeatModelFailure)?.tokenUsage ?? .zero
+        return usage.isEmpty ? nil : usage
     }
 
     private func loadChats() {
@@ -368,7 +593,12 @@ final class ChatStore: ObservableObject {
             chats = storedChats.map { storedChat in
                 ChatViewModel(
                     storedChat: storedChat,
-                    storedMessages: fetchMessages(for: storedChat.id),
+                    storedMessages: ActiveChatMessages.fetch(
+                        chatID: storedChat.id,
+                        clearedThroughMessageID: storedChat.clearedThroughMessageID,
+                        limit: ChatStore.messageBatchSize,
+                        in: modelContext
+                    ),
                     storedGroupParticipants: fetchGroupParticipants(for: storedChat.id),
                     agentStore: agentStore,
                     localModelStore: localModelStore,
@@ -392,22 +622,6 @@ final class ChatStore: ObservableObject {
 
         do {
             return try modelContext.fetch(descriptor)
-        } catch {
-            return []
-        }
-    }
-
-    private func fetchMessages(for chatID: UUID) -> [StoredChatMessage] {
-        var descriptor = FetchDescriptor<StoredChatMessage>(
-            predicate: #Predicate { message in
-                message.chatID == chatID
-            },
-            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
-        )
-        descriptor.fetchLimit = ChatStore.messageBatchSize
-
-        do {
-            return try modelContext.fetch(descriptor).reversed()
         } catch {
             return []
         }
@@ -461,4 +675,108 @@ struct ChatMessage: Identifiable, Equatable {
 enum ChatRole: String {
     case user
     case assistant
+}
+
+enum ActiveChatMessages {
+    static func fetch(
+        chatID: UUID,
+        clearedThroughMessageID: UUID?,
+        olderThan: Date? = nil,
+        limit: Int? = nil,
+        in modelContext: ModelContext
+    ) -> [StoredChatMessage] {
+        let cutoff = cutoffDate(
+            clearedThroughMessageID: clearedThroughMessageID,
+            in: modelContext
+        )
+        let newestFirst = limit != nil
+        var descriptor = messageDescriptor(
+            chatID: chatID,
+            cutoff: cutoff,
+            olderThan: olderThan,
+            newestFirst: newestFirst
+        )
+        if let limit {
+            descriptor.fetchLimit = limit
+        }
+
+        do {
+            let fetched = try modelContext.fetch(descriptor)
+            return newestFirst ? fetched.reversed() : fetched
+        } catch {
+            return []
+        }
+    }
+
+    static func fetchAll(
+        chatID: UUID,
+        in modelContext: ModelContext
+    ) -> [StoredChatMessage] {
+        let descriptor = FetchDescriptor<StoredChatMessage>(
+            predicate: #Predicate { message in
+                message.chatID == chatID
+            },
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    private static func cutoffDate(
+        clearedThroughMessageID: UUID?,
+        in modelContext: ModelContext
+    ) -> Date? {
+        guard let clearedThroughMessageID else { return nil }
+
+        var descriptor = FetchDescriptor<StoredChatMessage>(
+            predicate: #Predicate { message in
+                message.id == clearedThroughMessageID
+            }
+        )
+        descriptor.fetchLimit = 1
+        return try? modelContext.fetch(descriptor).first?.createdAt
+    }
+
+    private static func messageDescriptor(
+        chatID: UUID,
+        cutoff: Date?,
+        olderThan: Date?,
+        newestFirst: Bool
+    ) -> FetchDescriptor<StoredChatMessage> {
+        let sort = SortDescriptor<StoredChatMessage>(
+            \.createdAt,
+            order: newestFirst ? .reverse : .forward
+        )
+        if let olderThan, let cutoff {
+            return FetchDescriptor(
+                predicate: #Predicate { message in
+                    message.chatID == chatID
+                        && message.createdAt > cutoff
+                        && message.createdAt < olderThan
+                },
+                sortBy: [sort]
+            )
+        }
+        if let olderThan {
+            return FetchDescriptor(
+                predicate: #Predicate { message in
+                    message.chatID == chatID && message.createdAt < olderThan
+                },
+                sortBy: [sort]
+            )
+        }
+        if let cutoff {
+            return FetchDescriptor(
+                predicate: #Predicate { message in
+                    message.chatID == chatID && message.createdAt > cutoff
+                },
+                sortBy: [sort]
+            )
+        }
+        return FetchDescriptor(
+            predicate: #Predicate { message in
+                message.chatID == chatID
+            },
+            sortBy: [sort]
+        )
+    }
 }

@@ -73,6 +73,7 @@ struct PreferencesView: View {
     @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var replyFilterStore: ReplyFilterStore
     @ObservedObject var chatStore: ChatStore
+    @ObservedObject var heartbeatScheduler: HeartbeatScheduler
     @ObservedObject var navigation: PreferencesNavigation
 
     var body: some View {
@@ -87,7 +88,8 @@ struct PreferencesView: View {
                         localModelStore: localModelStore,
                         textToSpeechToolStore: textToSpeechToolStore,
                         skillCatalog: skillCatalog,
-                        chatStore: chatStore
+                        chatStore: chatStore,
+                        heartbeatScheduler: heartbeatScheduler
                     )
                 case .models:
                     ModelPreferencesView(store: localModelStore, replyFilterStore: replyFilterStore)
@@ -618,7 +620,7 @@ private struct AppleFoundationModelEditor: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(OpenUITheme.foreground)
 
-                    Text("On-device Apple Intelligence")
+                    Text("On-device Apple Intelligence · \(ConversationCompaction.contextWindow(for: .appleFoundation)) token context")
                         .font(.system(size: 12))
                         .foregroundStyle(OpenUITheme.foregroundSubtle)
                 }
@@ -804,6 +806,21 @@ private struct LocalModelEditor: View {
                 }
             }
 
+            OpenUIDivider()
+
+            OpenUISettingsRow(
+                title: "Context window",
+                description: "Token limit of the loaded model. Chat uses this to summarize older history. Default 8192 if unset."
+            ) {
+                TextField(
+                    "8192",
+                    value: contextTokenLimit,
+                    format: .number
+                )
+                    .openUIInput()
+                    .frame(width: 120)
+            }
+
             if let modelLoadError {
                 OpenUIDivider()
 
@@ -864,6 +881,13 @@ private struct LocalModelEditor: View {
         )
     }
 
+    private var contextTokenLimit: Binding<Int> {
+        Binding(
+            get: { model.resolvedContextTokenLimit },
+            set: { store.updateContextTokenLimit(for: model, to: $0) }
+        )
+    }
+
     private func resetDiscoveredModels() {
         discoveryVersion = UUID()
         availableModelIDs = []
@@ -907,23 +931,13 @@ private struct PreferencesViewPreview: View {
     private let skillCatalog: SkillCatalog
     private let replyFilterStore: ReplyFilterStore
     private let chatStore: ChatStore
+    private let heartbeatScheduler: HeartbeatScheduler
     private let navigation = PreferencesNavigation()
 
     init() {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
-            let container = try ModelContainer(
-                for: Agent.self,
-                AgentHeartbeat.self,
-                HeartbeatRun.self,
-                LocalModel.self,
-                ReplyFilterSet.self,
-                TextToSpeechTool.self,
-                StoredChat.self,
-                StoredGroupChatParticipant.self,
-                StoredChatMessage.self,
-                configurations: configuration
-            )
+            let container = try ChatModelContainer.make(configuration: configuration)
             let context = container.mainContext
             let localModel = LocalModel(
                 name: "Studio Qwen",
@@ -961,6 +975,7 @@ private struct PreferencesViewPreview: View {
                 replyFilterStore: replyFilterStore,
                 modelContext: context
             )
+            heartbeatScheduler = HeartbeatScheduler(agentStore: agentStore, chatStore: chatStore)
         } catch {
             fatalError("Failed to create Preferences preview: \(error.localizedDescription)")
         }
@@ -974,6 +989,7 @@ private struct PreferencesViewPreview: View {
             skillCatalog: skillCatalog,
             replyFilterStore: replyFilterStore,
             chatStore: chatStore,
+            heartbeatScheduler: heartbeatScheduler,
             navigation: navigation
         )
         .modelContainer(modelContainer)

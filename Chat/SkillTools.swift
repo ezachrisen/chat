@@ -1,7 +1,7 @@
 import Foundation
 import FoundationModels
 
-enum SkillAccessError: LocalizedError {
+nonisolated enum SkillAccessError: LocalizedError {
     case unknownSkill(String)
     case emptyPath
     case pathEscape
@@ -36,7 +36,7 @@ enum SkillAccessError: LocalizedError {
     }
 }
 
-enum SkillFileAccess {
+nonisolated enum SkillFileAccess {
     static let maxFileBytes = 256_000
     static let scriptTimeout: TimeInterval = 30
 
@@ -214,8 +214,112 @@ enum SkillFileAccess {
     }
 }
 
+nonisolated struct CapturedToolInvocation: Sendable {
+    var sequence: Int
+    var roundIndex: Int
+    var toolName: String
+    var skillName: String?
+    var argumentsJSON: String
+    var resultText: String
+    var succeeded: Bool
+    var errorMessage: String?
+    var startedAt: Date
+    var completedAt: Date
+}
+
+nonisolated final class ToolCallRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invocations: [CapturedToolInvocation] = []
+    private var nextSequence = 0
+    var roundProvider: @Sendable () -> Int = { 0 }
+
+    func snapshot() -> [CapturedToolInvocation] {
+        lock.lock()
+        defer { lock.unlock() }
+        return invocations
+    }
+
+    func record(
+        startedAt: Date,
+        toolName: String,
+        argumentsJSON: String,
+        skillName: String?,
+        result: Result<String, Error>
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let completedAt = Date()
+        let sequence = nextSequence
+        nextSequence += 1
+        let roundIndex = roundProvider()
+
+        switch result {
+        case .success(let text):
+            invocations.append(
+                CapturedToolInvocation(
+                    sequence: sequence,
+                    roundIndex: roundIndex,
+                    toolName: toolName,
+                    skillName: skillName,
+                    argumentsJSON: argumentsJSON,
+                    resultText: text,
+                    succeeded: true,
+                    errorMessage: nil,
+                    startedAt: startedAt,
+                    completedAt: completedAt
+                )
+            )
+        case .failure(let error):
+            let message = error.localizedDescription
+            invocations.append(
+                CapturedToolInvocation(
+                    sequence: sequence,
+                    roundIndex: roundIndex,
+                    toolName: toolName,
+                    skillName: skillName,
+                    argumentsJSON: argumentsJSON,
+                    resultText: message,
+                    succeeded: false,
+                    errorMessage: message,
+                    startedAt: startedAt,
+                    completedAt: completedAt
+                )
+            )
+        }
+    }
+}
+
+nonisolated enum ToolArgumentsJSON {
+    static func encode(_ pairs: [String: String?]) -> String {
+        let object = pairs.compactMapValues { value in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : value
+        }
+        guard let data = try? JSONEncoder().encode(object),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return string
+    }
+
+    static func skillName(from argumentsJSON: String) -> String? {
+        struct SkillNameOnly: Decodable {
+            var skill_name: String
+        }
+
+        guard let data = argumentsJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(SkillNameOnly.self, from: data) else {
+            return nil
+        }
+        let name = decoded.skill_name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+}
+
 struct ReadSkillFileTool: Tool {
     let runtime: SkillRuntime
+    let recorder: ToolCallRecorder?
 
     var name: String { AgentToolID.readSkillFile.rawValue }
     var description: String { AgentToolID.readSkillFile.toolDescription }
@@ -230,16 +334,149 @@ struct ReadSkillFileTool: Tool {
     }
 
     func call(arguments: Arguments) async throws -> String {
-        try SkillFileAccess.read(
-            skillName: arguments.skill_name,
-            fileName: arguments.file_name,
-            runtime: runtime
+        let startedAt = Date()
+        let argumentsJSON = ToolArgumentsJSON.encode([
+            "skill_name": arguments.skill_name,
+            "file_name": arguments.file_name
+        ])
+        var capturedResult: Result<String, Error> = .failure(
+            SkillAccessError.startFailed("Tool did not return a result.")
         )
+        defer {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: arguments.skill_name,
+                result: capturedResult
+            )
+        }
+
+        do {
+            let output = try SkillFileAccess.read(
+                skillName: arguments.skill_name,
+                fileName: arguments.file_name,
+                runtime: runtime
+            )
+            capturedResult = .success(output)
+            return output
+        } catch {
+            capturedResult = .failure(error)
+            throw error
+        }
+    }
+}
+
+struct SendNotificationTool: Tool {
+    let agentName: String
+    let recorder: ToolCallRecorder?
+
+    var name: String { AgentToolID.sendNotification.rawValue }
+    var description: String { AgentToolID.sendNotification.toolDescription }
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "The notification body shown to the user.")
+        var body: String
+
+        @Guide(description: "Optional short title. Defaults to the agent name.")
+        var title: String?
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        let startedAt = Date()
+        let argumentsJSON = ToolArgumentsJSON.encode([
+            "title": arguments.title,
+            "body": arguments.body
+        ])
+        var capturedResult: Result<String, Error> = .failure(
+            SkillAccessError.startFailed("Tool did not return a result.")
+        )
+        defer {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: nil,
+                result: capturedResult
+            )
+        }
+
+        do {
+            let output = try await AppNotifications.send(
+                title: AppNotifications.resolvedTitle(
+                    title: arguments.title,
+                    fallback: agentName
+                ),
+                body: arguments.body
+            )
+            capturedResult = .success(output)
+            return output
+        } catch {
+            capturedResult = .failure(error)
+            throw error
+        }
+    }
+}
+
+struct ReadCalendarEventsTool: Tool {
+    let policy: CalendarAccessPolicy
+    let recorder: ToolCallRecorder?
+
+    var name: String { AgentToolID.readCalendarEvents.rawValue }
+    var description: String { AgentToolID.readCalendarEvents.toolDescription }
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Start of the range as an ISO 8601 date or date-time in the user's current time zone, for example 2026-08-01 or 2026-08-01T09:00:00.")
+        var start: String
+
+        @Guide(description: "End of the range as an ISO 8601 date or date-time in the user's current time zone, for example 2026-08-31 or 2026-08-31T17:00:00. A date-only end is inclusive of that day.")
+        var end: String
+
+        @Guide(description: "Optional comma-separated calendar IDs to query. Use IDs from previous results, not calendar names. Omit to query every calendar this agent is allowed to read.")
+        var calendar_ids: String?
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        let startedAt = Date()
+        let argumentsJSON = ToolArgumentsJSON.encode([
+            "start": arguments.start,
+            "end": arguments.end,
+            "calendar_ids": arguments.calendar_ids
+        ])
+        var capturedResult: Result<String, Error> = .failure(
+            SkillAccessError.startFailed("Tool did not return a result.")
+        )
+        defer {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: nil,
+                result: capturedResult
+            )
+        }
+
+        do {
+            let output = try await CalendarDirectory.shared.readEvents(
+                start: arguments.start,
+                end: arguments.end,
+                calendarIDsRaw: arguments.calendar_ids,
+                policy: policy
+            )
+            capturedResult = .success(output)
+            return output
+        } catch {
+            capturedResult = .failure(error)
+            throw error
+        }
     }
 }
 
 struct ExecuteSkillScriptTool: Tool {
     let runtime: SkillRuntime
+    let recorder: ToolCallRecorder?
 
     var name: String { AgentToolID.executeSkillScript.rawValue }
     var description: String { AgentToolID.executeSkillScript.toolDescription }
@@ -257,18 +494,49 @@ struct ExecuteSkillScriptTool: Tool {
     }
 
     func call(arguments: Arguments) async throws -> String {
-        try await SkillFileAccess.execute(
-            skillName: arguments.skill_name,
-            scriptName: arguments.script_name,
-            arguments: arguments.arguments,
-            runtime: runtime
+        let startedAt = Date()
+        let argumentsJSON = ToolArgumentsJSON.encode([
+            "skill_name": arguments.skill_name,
+            "script_name": arguments.script_name,
+            "arguments": arguments.arguments
+        ])
+        var capturedResult: Result<String, Error> = .failure(
+            SkillAccessError.startFailed("Tool did not return a result.")
         )
+        defer {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: arguments.skill_name,
+                result: capturedResult
+            )
+        }
+
+        do {
+            let output = try await SkillFileAccess.execute(
+                skillName: arguments.skill_name,
+                scriptName: arguments.script_name,
+                arguments: arguments.arguments,
+                runtime: runtime
+            )
+            capturedResult = .success(output)
+            return output
+        } catch {
+            capturedResult = .failure(error)
+            throw error
+        }
     }
 }
 
+// Only one of Apple Tool.call vs OpenAI execute runs for a given generation.
+// Record in both; do not also record from transcript .toolCalls.
 struct AgentToolBox: Sendable {
     let runtime: SkillRuntime
     let enabledToolIDs: Set<String>
+    let recorder: ToolCallRecorder?
+    let agentName: String
+    let calendarPolicy: CalendarAccessPolicy
 
     var isEmpty: Bool {
         appleTools.isEmpty
@@ -277,10 +545,16 @@ struct AgentToolBox: Sendable {
     var appleTools: [any Tool] {
         var tools: [any Tool] = []
         if enabledToolIDs.contains(AgentToolID.readSkillFile.rawValue) {
-            tools.append(ReadSkillFileTool(runtime: runtime))
+            tools.append(ReadSkillFileTool(runtime: runtime, recorder: recorder))
         }
         if enabledToolIDs.contains(AgentToolID.executeSkillScript.rawValue) {
-            tools.append(ExecuteSkillScriptTool(runtime: runtime))
+            tools.append(ExecuteSkillScriptTool(runtime: runtime, recorder: recorder))
+        }
+        if enabledToolIDs.contains(AgentToolID.sendNotification.rawValue) {
+            tools.append(SendNotificationTool(agentName: agentName, recorder: recorder))
+        }
+        if enabledToolIDs.contains(AgentToolID.readCalendarEvents.rawValue) {
+            tools.append(ReadCalendarEventsTool(policy: calendarPolicy, recorder: recorder))
         }
         return tools
     }
@@ -309,6 +583,27 @@ struct AgentToolBox: Sendable {
                     ],
                     required: ["skill_name", "script_name"]
                 )
+            case AgentToolID.sendNotification.rawValue:
+                return OpenAITool.function(
+                    name: tool.name,
+                    description: tool.description,
+                    properties: [
+                        "body": OpenAIJSONProperty(type: "string", description: "The notification body shown to the user."),
+                        "title": OpenAIJSONProperty(type: "string", description: "Optional short title. Defaults to the agent name.")
+                    ],
+                    required: ["body"]
+                )
+            case AgentToolID.readCalendarEvents.rawValue:
+                return OpenAITool.function(
+                    name: tool.name,
+                    description: tool.description,
+                    properties: [
+                        "start": OpenAIJSONProperty(type: "string", description: "Start of the range as an ISO 8601 date or date-time in the user's current time zone, for example 2026-08-01 or 2026-08-01T09:00:00."),
+                        "end": OpenAIJSONProperty(type: "string", description: "End of the range as an ISO 8601 date or date-time in the user's current time zone, for example 2026-08-31 or 2026-08-31T17:00:00. A date-only end is inclusive of that day."),
+                        "calendar_ids": OpenAIJSONProperty(type: "string", description: "Optional comma-separated calendar IDs to query. Use IDs, not names. Omit to query every allowed calendar.")
+                    ],
+                    required: ["start", "end"]
+                )
             default:
                 return OpenAITool.function(
                     name: tool.name,
@@ -321,33 +616,79 @@ struct AgentToolBox: Sendable {
     }
 
     func execute(name: String, argumentsJSON: String) async throws -> String {
-        let data = Data(argumentsJSON.utf8)
-        switch name {
-        case AgentToolID.readSkillFile.rawValue:
-            let arguments = try JSONDecoder().decode(ReadSkillFileCall.self, from: data)
-            return try SkillFileAccess.read(
-                skillName: arguments.skill_name,
-                fileName: arguments.file_name,
-                runtime: runtime
+        let startedAt = Date()
+        var capturedResult: Result<String, Error> = .failure(
+            SkillAccessError.startFailed("Tool did not return a result.")
+        )
+        defer {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: ToolArgumentsJSON.skillName(from: argumentsJSON),
+                result: capturedResult
             )
-        case AgentToolID.executeSkillScript.rawValue:
-            let arguments = try JSONDecoder().decode(ExecuteSkillScriptCall.self, from: data)
-            return try await SkillFileAccess.execute(
-                skillName: arguments.skill_name,
-                scriptName: arguments.script_name,
-                arguments: arguments.arguments,
-                runtime: runtime
-            )
-        default:
-            throw SkillAccessError.startFailed("Unknown tool “\(name)”.")
+        }
+
+        do {
+            let data = Data(argumentsJSON.utf8)
+            let output: String
+            switch name {
+            case AgentToolID.readSkillFile.rawValue:
+                let arguments = try JSONDecoder().decode(ReadSkillFileCall.self, from: data)
+                output = try SkillFileAccess.read(
+                    skillName: arguments.skill_name,
+                    fileName: arguments.file_name,
+                    runtime: runtime
+                )
+            case AgentToolID.executeSkillScript.rawValue:
+                let arguments = try JSONDecoder().decode(ExecuteSkillScriptCall.self, from: data)
+                output = try await SkillFileAccess.execute(
+                    skillName: arguments.skill_name,
+                    scriptName: arguments.script_name,
+                    arguments: arguments.arguments,
+                    runtime: runtime
+                )
+            case AgentToolID.sendNotification.rawValue:
+                let arguments = try JSONDecoder().decode(SendNotificationCall.self, from: data)
+                output = try await AppNotifications.send(
+                    title: AppNotifications.resolvedTitle(
+                        title: arguments.title,
+                        fallback: agentName
+                    ),
+                    body: arguments.body
+                )
+            case AgentToolID.readCalendarEvents.rawValue:
+                let arguments = try JSONDecoder().decode(ReadCalendarEventsCall.self, from: data)
+                output = try await CalendarDirectory.shared.readEvents(
+                    start: arguments.start,
+                    end: arguments.end,
+                    calendarIDsRaw: arguments.calendar_ids,
+                    policy: calendarPolicy
+                )
+            default:
+                throw SkillAccessError.startFailed("Unknown tool “\(name)”.")
+            }
+            capturedResult = .success(output)
+            return output
+        } catch {
+            capturedResult = .failure(error)
+            throw error
         }
     }
 
     @MainActor
-    static func make(agent: Agent?, catalog: SkillCatalog) -> AgentToolBox {
+    static func make(
+        agent: Agent?,
+        catalog: SkillCatalog,
+        recorder: ToolCallRecorder? = nil
+    ) -> AgentToolBox {
         AgentToolBox(
             runtime: catalog.runtime(for: agent),
-            enabledToolIDs: catalog.enabledToolIDs(for: agent)
+            enabledToolIDs: catalog.enabledToolIDs(for: agent),
+            recorder: recorder,
+            agentName: agent?.displayName ?? "Chat",
+            calendarPolicy: agent?.calendarAccessPolicy ?? .none
         )
     }
 }
@@ -361,6 +702,17 @@ private struct ExecuteSkillScriptCall: Decodable {
     var skill_name: String
     var script_name: String
     var arguments: String?
+}
+
+private struct SendNotificationCall: Decodable {
+    var title: String?
+    var body: String
+}
+
+private struct ReadCalendarEventsCall: Decodable {
+    var start: String
+    var end: String
+    var calendar_ids: String?
 }
 
 struct OpenAITool: Encodable, Sendable {

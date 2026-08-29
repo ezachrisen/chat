@@ -7,9 +7,13 @@ final class AgentStore: ObservableObject {
     @Published private(set) var agents: [Agent] = []
     @Published private(set) var heartbeats: [AgentHeartbeat] = []
     @Published private(set) var heartbeatRuns: [HeartbeatRun] = []
+    @Published private(set) var hasOlderHeartbeatRuns = false
     @Published var selectedAgentID: Agent.ID?
 
+    private static let heartbeatRunBatchSize = 200
+
     private let modelContext: ModelContext
+    private var isLoadingOlderHeartbeatRuns = false
 
     var selectedAgent: Agent? {
         guard let selectedAgentID else { return nil }
@@ -142,11 +146,58 @@ final class AgentStore: ObservableObject {
         objectWillChange.send()
     }
 
+    func setCalendarAccessAll(_ all: Bool, selecting ids: [String] = [], for agentID: Agent.ID) {
+        guard let agent = agents.first(where: { $0.id == agentID }) else { return }
+        agent.setCalendarAccessAll(all, selecting: ids)
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func setAllowedCalendarID(_ id: String, enabled: Bool, for agentID: Agent.ID) {
+        guard let agent = agents.first(where: { $0.id == agentID }) else { return }
+        agent.setAllowedCalendarID(id, enabled: enabled)
+        saveChanges()
+        objectWillChange.send()
+    }
+
     func setSkill(_ skillID: String, enabled: Bool, for agentID: Agent.ID) {
         guard let agent = agents.first(where: { $0.id == agentID }) else { return }
         agent.setSkill(skillID, enabled: enabled)
         saveChanges()
         objectWillChange.send()
+    }
+
+    func updateAgentDebugLog(id: Agent.ID, enabled: Bool) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
+        agent.debugLogEnabled = enabled
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func loadOlderHeartbeatRuns() {
+        guard hasOlderHeartbeatRuns,
+              !isLoadingOlderHeartbeatRuns,
+              let oldest = heartbeatRuns.last else {
+            return
+        }
+
+        isLoadingOlderHeartbeatRuns = true
+        defer { isLoadingOlderHeartbeatRuns = false }
+
+        let oldestDate = oldest.completedAt
+        var descriptor = FetchDescriptor<HeartbeatRun>(
+            predicate: #Predicate { $0.completedAt < oldestDate },
+            sortBy: [SortDescriptor(\.completedAt, order: .reverse)]
+        )
+        descriptor.fetchLimit = Self.heartbeatRunBatchSize
+
+        do {
+            let older = try modelContext.fetch(descriptor)
+            hasOlderHeartbeatRuns = older.count == Self.heartbeatRunBatchSize
+            heartbeatRuns.append(contentsOf: older)
+        } catch {
+            hasOlderHeartbeatRuns = false
+        }
     }
 
     func agent(for id: Agent.ID) -> Agent? {
@@ -204,7 +255,7 @@ final class AgentStore: ObservableObject {
         targetChatID: UUID?
     ) {
         heartbeat.targetKindRawValue = targetKind.rawValue
-        heartbeat.targetChatID = targetKind == .groupChat ? targetChatID : nil
+        heartbeat.targetChatID = targetChatID
         heartbeat.lastError = nil
         saveChanges()
         objectWillChange.send()
@@ -340,7 +391,9 @@ final class AgentStore: ObservableObject {
             }
         }
 
+        let shouldInsertTurn = report.chatID != nil
         let run = HeartbeatRun(
+            id: report.runID,
             heartbeatID: heartbeatID,
             agentID: agentID,
             agentName: report.agentName,
@@ -348,13 +401,46 @@ final class AgentStore: ObservableObject {
             destination: report.destination,
             startedAt: report.startedAt,
             completedAt: report.completedAt,
-            modelInput: report.modelInput,
-            modelOutput: report.modelOutput,
+            modelInput: "",
+            modelOutput: nil,
             actionSummary: report.actionSummary,
-            errorMessage: report.errorMessage
+            errorMessage: report.errorMessage,
+            generationTurnID: shouldInsertTurn ? report.turnID : nil,
+            promptTokenCount: report.promptTokenCount,
+            completionTokenCount: report.completionTokenCount
         )
         modelContext.insert(run)
         heartbeatRuns.insert(run, at: 0)
+
+        if let chatID = report.chatID {
+            GenerationStore.recordTurn(
+                draft: GenerationTurnDraft(
+                    id: report.turnID,
+                    kind: .heartbeat,
+                    chatID: chatID,
+                    userMessageID: nil,
+                    assistantMessageID: report.assistantMessageID,
+                    agentID: agentID,
+                    agentName: report.agentName,
+                    heartbeatID: heartbeatID,
+                    heartbeatRunID: report.runID,
+                    modelIdentifier: report.modelIdentifier,
+                    backendRawValue: report.backendRawValue,
+                    startedAt: report.startedAt,
+                    completedAt: report.completedAt,
+                    status: report.generationStatus,
+                    actionSummary: report.actionSummary,
+                    errorMessage: report.errorMessage,
+                    visibleReplyPreview: GenerationStore.visibleReplyPreview(from: report.visibleReplyPreview),
+                    memoryEntryCount: report.memoryEntryCount,
+                    debugCaptureEnabled: report.debugCaptureEnabled
+                ),
+                invocations: report.toolInvocations,
+                debug: report.debugCaptureEnabled ? report.debug : nil,
+                in: modelContext
+            )
+        }
+
         saveChanges()
         objectWillChange.send()
     }
@@ -411,20 +497,27 @@ final class AgentStore: ObservableObject {
     }
 
     private func loadHeartbeatRuns() {
-        let descriptor = FetchDescriptor<HeartbeatRun>(
+        var descriptor = FetchDescriptor<HeartbeatRun>(
             sortBy: [SortDescriptor(\.completedAt, order: .reverse)]
         )
+        descriptor.fetchLimit = Self.heartbeatRunBatchSize
 
         do {
             heartbeatRuns = try modelContext.fetch(descriptor)
+            hasOlderHeartbeatRuns = heartbeatRuns.count == Self.heartbeatRunBatchSize
         } catch {
             heartbeatRuns = []
+            hasOlderHeartbeatRuns = false
         }
 
         for heartbeat in heartbeats where heartbeat.lastCompletedAt == nil {
-            heartbeat.lastCompletedAt = heartbeatRuns.first {
-                $0.heartbeatID == heartbeat.id
-            }?.completedAt
+            let heartbeatID = heartbeat.id
+            var latestRunDescriptor = FetchDescriptor<HeartbeatRun>(
+                predicate: #Predicate { $0.heartbeatID == heartbeatID },
+                sortBy: [SortDescriptor(\.completedAt, order: .reverse)]
+            )
+            latestRunDescriptor.fetchLimit = 1
+            heartbeat.lastCompletedAt = try? modelContext.fetch(latestRunDescriptor).first?.completedAt
         }
         saveChanges()
     }
@@ -453,6 +546,9 @@ final class Agent: Identifiable {
     var textToSpeechVoiceModel: String?
     var enabledToolIDsJSON: String?
     var enabledSkillIDsJSON: String?
+    var debugLogEnabled: Bool?
+    var calendarAccessAll: Bool?
+    var allowedCalendarIDsJSON: String?
     var createdAt: Date
 
     init(
@@ -467,6 +563,9 @@ final class Agent: Identifiable {
         textToSpeechVoiceModel: String? = nil,
         enabledToolIDsJSON: String? = nil,
         enabledSkillIDsJSON: String? = nil,
+        debugLogEnabled: Bool? = nil,
+        calendarAccessAll: Bool? = nil,
+        allowedCalendarIDsJSON: String? = nil,
         createdAt: Date = .now
     ) {
         self.id = id
@@ -480,6 +579,9 @@ final class Agent: Identifiable {
         self.textToSpeechVoiceModel = textToSpeechVoiceModel
         self.enabledToolIDsJSON = enabledToolIDsJSON
         self.enabledSkillIDsJSON = enabledSkillIDsJSON
+        self.debugLogEnabled = debugLogEnabled
+        self.calendarAccessAll = calendarAccessAll
+        self.allowedCalendarIDsJSON = allowedCalendarIDsJSON
         self.createdAt = createdAt
     }
 
@@ -493,6 +595,10 @@ final class Agent: Identifiable {
 
     var memoryText: String {
         memory ?? ""
+    }
+
+    var isDebugLogEnabled: Bool {
+        debugLogEnabled == true
     }
 
     var voiceTriggerPhrases: [String] {
@@ -522,6 +628,37 @@ final class Agent: Identifiable {
 
     func setTool(_ toolID: AgentToolID, enabled: Bool) {
         enabledToolIDsJSON = updatedEnabledIDs(enabledToolIDsJSON, id: toolID.rawValue, enabled: enabled)
+        if toolID == .readCalendarEvents, enabled, calendarAccessAll == nil {
+            calendarAccessAll = true
+        }
+    }
+
+    var allowsAllCalendars: Bool {
+        calendarAccessAll ?? true
+    }
+
+    var allowedCalendarIDs: Set<String> {
+        enabledIDs(from: allowedCalendarIDsJSON)
+    }
+
+    var calendarAccessPolicy: CalendarAccessPolicy {
+        CalendarAccessPolicy(allowsAll: allowsAllCalendars, allowedIDs: allowedCalendarIDs)
+    }
+
+    func setCalendarAccessAll(_ all: Bool, selecting ids: [String] = []) {
+        calendarAccessAll = all
+        if !all, allowedCalendarIDs.isEmpty, !ids.isEmpty {
+            var json: String?
+            for id in ids {
+                json = updatedEnabledIDs(json, id: id, enabled: true)
+            }
+            allowedCalendarIDsJSON = json
+        }
+    }
+
+    func setAllowedCalendarID(_ id: String, enabled: Bool) {
+        calendarAccessAll = false
+        allowedCalendarIDsJSON = updatedEnabledIDs(allowedCalendarIDsJSON, id: id, enabled: enabled)
     }
 
     func setSkill(_ skillID: String, enabled: Bool) {

@@ -23,19 +23,27 @@ final class LocalModel: Identifiable {
     var endpoint: String
     var modelID: String
     var createdAt: Date
+    var contextTokenLimit: Int?
 
     init(
         id: UUID = UUID(),
         name: String,
         endpoint: String,
         modelID: String,
-        createdAt: Date = .now
+        createdAt: Date = .now,
+        contextTokenLimit: Int? = nil
     ) {
         self.id = id
         self.name = name
         self.endpoint = endpoint
         self.modelID = modelID
         self.createdAt = createdAt
+        self.contextTokenLimit = contextTokenLimit
+    }
+
+    var resolvedContextTokenLimit: Int {
+        let value = contextTokenLimit ?? ConversationCompaction.localModelDefaultContextTokens
+        return min(max(value, ConversationCompaction.minimumContextTokens), ConversationCompaction.maximumContextTokens)
     }
 
     var displayName: String {
@@ -50,6 +58,7 @@ struct LocalModelConfiguration: Sendable {
     let endpoint: String
     let modelID: String
     let bearerToken: String?
+    let contextTokenLimit: Int
 
     var endpointValidationError: String? {
         guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -133,6 +142,17 @@ enum ChatBackend {
             return "Missing local model"
         }
     }
+
+    var persistenceName: String {
+        switch self {
+        case .appleFoundation:
+            return "appleFoundation"
+        case .openAICompatible:
+            return "openAICompatible"
+        case .missingLocalModel:
+            return "missingLocalModel"
+        }
+    }
 }
 
 @MainActor
@@ -195,6 +215,19 @@ final class LocalModelStore: ObservableObject {
         objectWillChange.send()
     }
 
+    func updateContextTokenLimit(for model: LocalModel, to limit: Int?) {
+        if let limit {
+            model.contextTokenLimit = min(
+                max(limit, ConversationCompaction.minimumContextTokens),
+                ConversationCompaction.maximumContextTokens
+            )
+        } else {
+            model.contextTokenLimit = nil
+        }
+        saveChanges()
+        objectWillChange.send()
+    }
+
     func bearerToken(for model: LocalModel) -> String {
         LocalModelCredentials.token(for: model.id) ?? ""
     }
@@ -223,7 +256,8 @@ final class LocalModelStore: ObservableObject {
             name: model.displayName,
             endpoint: model.endpoint,
             modelID: model.modelID,
-            bearerToken: bearerToken(for: model).nilIfEmpty
+            bearerToken: bearerToken(for: model).nilIfEmpty,
+            contextTokenLimit: model.resolvedContextTokenLimit
         )
     }
 

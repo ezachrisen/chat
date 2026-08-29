@@ -5,6 +5,7 @@ import SwiftUI
 
 @main
 struct ChatApp: App {
+    @NSApplicationDelegateAdaptor(ChatAppDelegate.self) private var appDelegate
     private let modelContainer: ModelContainer
     @StateObject private var agentStore: AgentStore
     @StateObject private var localModelStore: LocalModelStore
@@ -41,7 +42,18 @@ struct ChatApp: App {
             _chatStore = StateObject(wrappedValue: chatStore)
             _heartbeatScheduler = StateObject(wrappedValue: heartbeatScheduler)
             _preferencesNavigation = StateObject(wrappedValue: preferencesNavigation)
-            heartbeatScheduler.start()
+            if SessionStorageProbe.isRequested {
+                Task { @MainActor in
+                    await SessionStorageProbe.maybeRun(
+                        container: container,
+                        agentStore: agentStore,
+                        chatStore: chatStore,
+                        skillCatalog: skillCatalog
+                    )
+                }
+            } else {
+                heartbeatScheduler.start()
+            }
         } catch {
             fatalError("Failed to create model container: \(error.localizedDescription)")
         }
@@ -82,6 +94,7 @@ struct ChatApp: App {
                 skillCatalog: skillCatalog,
                 replyFilterStore: replyFilterStore,
                 chatStore: chatStore,
+                heartbeatScheduler: heartbeatScheduler,
                 navigation: preferencesNavigation
             )
             .modelContainer(modelContainer)
@@ -114,7 +127,8 @@ struct ContentView: View {
                 ChatDetailView(
                     chat: chat,
                     agentStore: agentStore,
-                    textToSpeechToolStore: textToSpeechToolStore
+                    textToSpeechToolStore: textToSpeechToolStore,
+                    chatStore: chatStore
                 )
             } else {
                 Text("Start a new chat.")
@@ -135,6 +149,10 @@ struct ChatSidebar: View {
     @State private var chatBeingRenamed: ChatViewModel?
     @State private var renameDraft = ""
     @State private var renameAlertIsPresented = false
+    @State private var chatPendingReset: ChatViewModel?
+    @State private var resetConfirmationIsPresented = false
+    @State private var chatPendingDelete: ChatViewModel?
+    @State private var deleteConfirmationIsPresented = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -155,28 +173,32 @@ struct ChatSidebar: View {
                             chats: chatStore.groupChats,
                             selectedChatID: $chatStore.selectedChatID,
                             isCollapsed: groupChatsAreCollapsed,
-                            onRenameChat: beginRenaming
+                            onRenameChat: beginRenaming,
+                            onResetChat: beginReset,
+                            onDeleteChat: beginDelete
                         ) {
                             groupChatsAreCollapsed.toggle()
                         }
                     }
 
                     ForEach(agentStore.agents) { agent in
-                        let chats = chatStore.chats(for: agent.id)
-
-                        if !chats.isEmpty {
-                            AgentProjectSection(
-                                agent: agent,
-                                chats: chats,
-                                selectedChatID: $chatStore.selectedChatID,
-                                isCollapsed: collapsedAgentIDs.contains(agent.id),
-                                onRenameChat: beginRenaming,
-                                onNewChat: {
-                                    startChat(with: agent)
-                                }
-                            ) {
-                                toggleAgent(agent.id)
+                        AgentSidebarSection(
+                            agent: agent,
+                            defaultChat: chatStore.defaultChat(for: agent.id),
+                            extraChats: chatStore.extraChats(for: agent.id),
+                            selectedChatID: $chatStore.selectedChatID,
+                            isCollapsed: collapsedAgentIDs.contains(agent.id),
+                            onRenameChat: beginRenaming,
+                            onResetChat: beginReset,
+                            onDeleteChat: beginDelete,
+                            onNewChat: {
+                                startChat(with: agent)
+                            },
+                            onSelectDefault: {
+                                chatStore.selectDefaultChat(for: agent)
                             }
+                        ) {
+                            toggleAgent(agent.id)
                         }
                     }
                 }
@@ -192,12 +214,48 @@ struct ChatSidebar: View {
                 chatBeingRenamed?.rename(to: renameDraft)
             }
         }
+        .confirmationDialog(
+            "Reset chat?",
+            isPresented: $resetConfirmationIsPresented,
+            titleVisibility: .visible,
+            presenting: chatPendingReset
+        ) { chat in
+            Button("Reset Chat", role: .destructive) {
+                chatStore.resetChat(chat)
+            }
+        } message: { _ in
+            Text("Previous messages stay saved but will no longer appear or be sent to the model.")
+        }
+        .confirmationDialog(
+            "Delete chat?",
+            isPresented: $deleteConfirmationIsPresented,
+            titleVisibility: .visible,
+            presenting: chatPendingDelete
+        ) { chat in
+            Button("Delete Chat", role: .destructive) {
+                chatStore.deleteChat(chat)
+            }
+        } message: { _ in
+            Text("This chat will be removed from the sidebar. This cannot be undone.")
+        }
     }
 
     private func beginRenaming(_ chat: ChatViewModel) {
+        guard chat.canRename else { return }
         chatBeingRenamed = chat
         renameDraft = chat.title
         renameAlertIsPresented = true
+    }
+
+    private func beginReset(_ chat: ChatViewModel) {
+        chatPendingReset = chat
+        resetConfirmationIsPresented = true
+    }
+
+    private func beginDelete(_ chat: ChatViewModel) {
+        guard chat.canDelete else { return }
+        chatPendingDelete = chat
+        deleteConfirmationIsPresented = true
     }
 
     private func toggleAgent(_ agentID: Agent.ID) {
@@ -257,79 +315,143 @@ struct NewChatLabel: View {
     }
 }
 
-struct AgentProjectSection: View {
+struct AgentAvatar: View {
+    let name: String
+    let id: UUID
+    var size: CGFloat = 20
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(backgroundColor)
+
+            Text(initials)
+                .font(.system(size: max(9, size * 0.42), weight: .semibold))
+                .foregroundStyle(.white)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+
+    private var initials: String {
+        let parts = name.split { $0.isWhitespace || $0.isNewline }.filter { !$0.isEmpty }
+        if parts.count >= 2 {
+            return String((parts[0].prefix(1) + parts[1].prefix(1))).uppercased()
+        }
+        if let first = parts.first, let character = first.first {
+            return String(character).uppercased()
+        }
+        return "?"
+    }
+
+    private var backgroundColor: Color {
+        let colors: [Color] = [
+            Color(red: 0.31, green: 0.45, blue: 0.85),
+            Color(red: 0.18, green: 0.60, blue: 0.52),
+            Color(red: 0.75, green: 0.35, blue: 0.38),
+            Color(red: 0.61, green: 0.38, blue: 0.75),
+            Color(red: 0.85, green: 0.52, blue: 0.22),
+            Color(red: 0.22, green: 0.55, blue: 0.72),
+            Color(red: 0.45, green: 0.52, blue: 0.38),
+            Color(red: 0.70, green: 0.32, blue: 0.55)
+        ]
+        let index = id.uuidString.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
+        return colors[Int(UInt(bitPattern: index) % UInt(colors.count))]
+    }
+}
+
+struct AgentSidebarSection: View {
     let agent: Agent
-    let chats: [ChatViewModel]
+    let defaultChat: ChatViewModel?
+    let extraChats: [ChatViewModel]
     @Binding var selectedChatID: ChatViewModel.ID?
     let isCollapsed: Bool
     let onRenameChat: (ChatViewModel) -> Void
+    let onResetChat: (ChatViewModel) -> Void
+    let onDeleteChat: (ChatViewModel) -> Void
     let onNewChat: () -> Void
+    let onSelectDefault: () -> Void
     let onToggle: () -> Void
-    @State private var isHoveringHeader = false
+
+    private var isDefaultSelected: Bool {
+        defaultChat.map { selectedChatID == $0.id } ?? false
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ZStack(alignment: .trailing) {
-                Button(action: onToggle) {
+            HStack(spacing: 0) {
+                Button(action: onSelectDefault) {
                     HStack(spacing: 10) {
-                        Image(systemName: "folder")
-                            .font(.body)
-                            .frame(width: 20, height: 20)
+                        AgentAvatar(name: agent.displayName, id: agent.id)
 
                         Text(agent.displayName)
                             .font(.body)
                             .lineLimit(1)
 
-                        Image(systemName: "chevron.down")
-                            .font(.caption.weight(.semibold))
-                            .rotationEffect(.degrees(isCollapsed ? -90 : 0))
-
                         Spacer(minLength: 0)
                     }
                     .foregroundStyle(.primary)
                     .padding(.leading, 12)
-                    .padding(.trailing, 40)
-                    .frame(height: 32)
+                    .padding(.trailing, 8)
+                    .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
-                if isHoveringHeader {
-                    Button(action: onNewChat) {
-                        Image(systemName: "plus")
-                            .font(.body.weight(.medium))
-                            .frame(width: 28, height: 28)
+                if !extraChats.isEmpty {
+                    Button(action: onToggle) {
+                        Image(systemName: "chevron.down")
+                            .font(.caption.weight(.semibold))
+                            .rotationEffect(.degrees(isCollapsed ? -90 : 0))
+                            .frame(width: 28, height: 32)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .padding(.trailing, 6)
-                    .help("New chat with \(agent.displayName)")
-                    .transition(.opacity)
+                    .help(isCollapsed ? "Show chats" : "Hide chats")
                 }
             }
             .frame(maxWidth: .infinity)
+            .background(
+                isDefaultSelected ? Color.primary.opacity(0.10) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8)
+            )
             .contentShape(Rectangle())
-            .onHover { isHovering in
-                withAnimation(.easeInOut(duration: 0.12)) {
-                    isHoveringHeader = isHovering
+            .contextMenu {
+                Button("New chat") {
+                    onNewChat()
+                }
+                if let defaultChat {
+                    Button("Reset chat") {
+                        onResetChat(defaultChat)
+                    }
+                    .disabled(defaultChat.isResponding || defaultChat.isCompacting)
                 }
             }
 
-            if !isCollapsed {
+            if !isCollapsed, !extraChats.isEmpty {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(chats) { chat in
+                    ForEach(extraChats) { chat in
                         ChatRow(
                             chat: chat,
                             isSelected: selectedChatID == chat.id,
                             onRename: {
                                 onRenameChat(chat)
+                            },
+                            onReset: {
+                                onResetChat(chat)
+                            },
+                            onDelete: {
+                                onDeleteChat(chat)
                             }
                         ) {
                             selectedChatID = chat.id
                         }
                     }
                 }
+                .padding(.leading, 30)
                 .padding(.bottom, 16)
+            } else {
+                Color.clear.frame(height: 4)
             }
         }
     }
@@ -340,6 +462,8 @@ struct GroupChatSection: View {
     @Binding var selectedChatID: ChatViewModel.ID?
     let isCollapsed: Bool
     let onRenameChat: (ChatViewModel) -> Void
+    let onResetChat: (ChatViewModel) -> Void
+    let onDeleteChat: (ChatViewModel) -> Void
     let onToggle: () -> Void
 
     var body: some View {
@@ -374,6 +498,12 @@ struct GroupChatSection: View {
                             isSelected: selectedChatID == chat.id,
                             onRename: {
                                 onRenameChat(chat)
+                            },
+                            onReset: {
+                                onResetChat(chat)
+                            },
+                            onDelete: {
+                                onDeleteChat(chat)
                             }
                         ) {
                             selectedChatID = chat.id
@@ -389,7 +519,9 @@ struct GroupChatSection: View {
 struct ChatRow: View {
     @ObservedObject var chat: ChatViewModel
     let isSelected: Bool
-    let onRename: () -> Void
+    let onRename: (() -> Void)?
+    let onReset: () -> Void
+    let onDelete: (() -> Void)?
     let onSelect: () -> Void
 
     var body: some View {
@@ -411,8 +543,20 @@ struct ChatRow: View {
         }
         .buttonStyle(.plain)
         .contextMenu {
-            Button("Rename chat") {
-                onRename()
+            if let onRename {
+                Button("Rename chat") {
+                    onRename()
+                }
+            }
+            Button("Reset chat") {
+                onReset()
+            }
+            .disabled(chat.isResponding || chat.isCompacting)
+            if let onDelete {
+                Button("Delete chat", role: .destructive) {
+                    onDelete()
+                }
+                .disabled(chat.isResponding)
             }
         }
     }
@@ -424,6 +568,7 @@ struct ChatDetailView: View {
     @ObservedObject var chat: ChatViewModel
     @ObservedObject var agentStore: AgentStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
+    @ObservedObject var chatStore: ChatStore
     @StateObject private var voiceInput = VoiceInputService()
     @StateObject private var voicePlayback = TextToSpeechPlaybackService()
     @FocusState private var composerIsFocused: Bool
@@ -436,6 +581,9 @@ struct ChatDetailView: View {
     @State private var automaticReplyReadingStartedAt: Date?
     @State private var voiceObservedMessageIDs: Set<ChatMessage.ID> = []
     @State private var voiceErrorMessage: String?
+    @State private var isCompactionStatusPresented = false
+    @State private var resetConfirmationIsPresented = false
+    @State private var deleteConfirmationIsPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -460,6 +608,7 @@ struct ChatDetailView: View {
                             ForEach(chat.messages) { message in
                                 MessageBubble(
                                     message: message,
+                                    rendersMarkdown: chat.rendersMarkdown,
                                     audioChunkIndexes: voicePlayback
                                         .generatedAudioChunkIndexesByMessageID[message.id] ?? [],
                                     playingAudioChunkIndex: voicePlayback.playingMessageID == message.id
@@ -543,6 +692,7 @@ struct ChatDetailView: View {
                     voiceObservedMessageIDs = Set(chat.messages.map(\.id))
                     visibleMessageIDs.removeAll()
                     hasUnreadNewMessages = false
+                    isCompactionStatusPresented = false
                     scrollToBottomAfterLayout(with: proxy)
                 }
                 .onChange(of: chat.messages) {
@@ -552,7 +702,7 @@ struct ChatDetailView: View {
                 .onChange(of: chat.isResponding) {
                     submitPendingVoiceDraftIfPossible()
 
-                    if latestMessageIsVisible {
+                    if chat.isResponding, latestMessageIsVisible {
                         scrollToBottom(with: proxy)
                     }
                 }
@@ -567,7 +717,80 @@ struct ChatDetailView: View {
                 .padding()
                 .background(.bar)
         }
-        .navigationTitle(chat.title)
+        .navigationTitle(chat.displayTitle)
+        .toolbar {
+            ToolbarItem {
+                Menu {
+                    Toggle("Render Markdown", isOn: rendersMarkdown)
+
+                    Divider()
+
+                    Button {
+                        Task {
+                            await chat.compactConversation()
+                        }
+                    } label: {
+                        if chat.isCompacting {
+                            Label("Compacting…", systemImage: "ellipsis")
+                        } else {
+                            Label("Compact", systemImage: "rectangle.compress.vertical")
+                        }
+                    }
+                    .disabled(chat.isResponding || chat.isCompacting)
+
+                    Button("Compaction Status") {
+                        isCompactionStatusPresented = true
+                    }
+
+                    Divider()
+
+                    Button("Reset Chat") {
+                        resetConfirmationIsPresented = true
+                    }
+                    .disabled(chat.isResponding || chat.isCompacting)
+
+                    if chat.canDelete {
+                        Button("Delete Chat", role: .destructive) {
+                            deleteConfirmationIsPresented = true
+                        }
+                        .disabled(chat.isResponding)
+                    }
+                } label: {
+                    if chat.isCompacting {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+                .help("Chat actions")
+            }
+        }
+        .sheet(isPresented: $isCompactionStatusPresented) {
+            CompactionStatusView(chat: chat)
+        }
+        .confirmationDialog(
+            "Reset chat?",
+            isPresented: $resetConfirmationIsPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Chat", role: .destructive) {
+                chatStore.resetChat(chat)
+            }
+        } message: {
+            Text("Previous messages stay saved but will no longer appear or be sent to the model.")
+        }
+        .confirmationDialog(
+            "Delete chat?",
+            isPresented: $deleteConfirmationIsPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Chat", role: .destructive) {
+                chatStore.deleteChat(chat)
+            }
+        } message: {
+            Text("This chat will be removed from the sidebar. This cannot be undone.")
+        }
         .onDisappear {
             stopVoiceModes()
             voicePlayback.clearGeneratedAudio()
@@ -595,6 +818,13 @@ struct ChatDetailView: View {
         } message: {
             Text(voiceErrorMessage ?? "Voice input could not be started.")
         }
+    }
+
+    private var rendersMarkdown: Binding<Bool> {
+        Binding(
+            get: { chat.rendersMarkdown },
+            set: { chat.setRendersMarkdown($0) }
+        )
     }
 
     private var modelStatus: some View {
@@ -1044,6 +1274,7 @@ struct ChatDetailView: View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    var rendersMarkdown = false
     let audioChunkIndexes: [Int]
     let playingAudioChunkIndex: Int?
     let playbackCurrentTime: TimeInterval
@@ -1051,32 +1282,40 @@ struct MessageBubble: View {
     let onToggleAudio: (Int) -> Void
     let onSeekAudio: (TimeInterval) -> Void
 
-    @ViewBuilder
+    @Environment(\.modelContext) private var modelContext
+    @State private var generationTurn: GenerationTurn?
+
     var body: some View {
-        if message.role == .assistant {
-            VStack(alignment: .leading, spacing: 6) {
+        Group {
+            if message.role == .assistant {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .bottom, spacing: 6) {
+                        bubble
+
+                        audioControls
+                        inspectorControl
+
+                        Spacer(minLength: 40)
+                    }
+
+                    if playingAudioChunkIndex != nil {
+                        AudioPlaybackTimeline(
+                            currentTime: playbackCurrentTime,
+                            duration: playbackDuration,
+                            onSeek: onSeekAudio
+                        )
+                        .frame(maxWidth: 340)
+                    }
+                }
+            } else {
                 HStack(alignment: .bottom, spacing: 6) {
-                    bubble
-
-                    audioControls
-
                     Spacer(minLength: 40)
-                }
-
-                if playingAudioChunkIndex != nil {
-                    AudioPlaybackTimeline(
-                        currentTime: playbackCurrentTime,
-                        duration: playbackDuration,
-                        onSeek: onSeekAudio
-                    )
-                    .frame(maxWidth: 340)
+                    bubble
                 }
             }
-        } else {
-            HStack(alignment: .bottom, spacing: 6) {
-                Spacer(minLength: 40)
-                bubble
-            }
+        }
+        .task(id: message.id) {
+            loadGenerationTurn()
         }
     }
 
@@ -1112,6 +1351,14 @@ struct MessageBubble: View {
         }
     }
 
+    @ViewBuilder
+    private var inspectorControl: some View {
+        if let generationTurn,
+           generationTurn.toolCallCount > 0 || generationTurn.debugCaptureEnabled {
+            GenerationInspectorButton(turn: generationTurn)
+        }
+    }
+
     private var bubble: some View {
         VStack(alignment: .leading, spacing: 5) {
             if message.role == .assistant, let authorName = message.authorName {
@@ -1119,7 +1366,7 @@ struct MessageBubble: View {
                     .font(.body.weight(.bold))
             }
 
-            Text(message.text)
+            messageText
                 .textSelection(.enabled)
                 .font(.body)
         }
@@ -1128,6 +1375,25 @@ struct MessageBubble: View {
             .padding(.vertical, 10)
             .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
             .frame(maxWidth: 620, alignment: message.role == .user ? .trailing : .leading)
+    }
+
+    @ViewBuilder
+    private var messageText: some View {
+        if message.role == .assistant, rendersMarkdown {
+            MarkdownMessageView(text: message.text)
+        } else {
+            Text(message.text)
+        }
+    }
+}
+
+private extension MessageBubble {
+    func loadGenerationTurn() {
+        guard message.role == .assistant else {
+            generationTurn = nil
+            return
+        }
+        generationTurn = GenerationQuery.fetchTurn(forAssistantMessage: message.id, in: modelContext)
     }
 }
 
@@ -1337,6 +1603,89 @@ struct AgentCommands: Commands {
 }
 #endif
 
+private struct CompactionStatusView: View {
+    @ObservedObject var chat: ChatViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var tokenCount: Int?
+
+    private var status: ConversationCompactionStatus {
+        chat.compactionStatus
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Compaction Status")
+                    .font(.headline)
+                Spacer()
+                Button("Done") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+
+            if status.hasDigest {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let compactedAt = status.compactedAt {
+                        LabeledContent("Last compacted") {
+                            Text(compactedAt.formatted(date: .abbreviated, time: .shortened))
+                        }
+                    } else {
+                        LabeledContent("Last compacted") {
+                            Text("Unknown")
+                        }
+                    }
+
+                    if let covered = status.coveredMessageCount {
+                        LabeledContent("Messages covered") {
+                            Text("\(covered)")
+                        }
+                    }
+
+                    LabeledContent("Summary tokens") {
+                        if let tokenCount {
+                            Text("\(tokenCount)")
+                        } else {
+                            Text("About \(status.estimatedTokens)")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .font(.callout)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Current summary")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    ScrollView {
+                        Text(status.summary)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(10)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                }
+            } else {
+                Text("This chat has not been compacted yet. Older messages are sent in full until they exceed the model’s context window.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 480, idealWidth: 560, minHeight: 360, idealHeight: 480)
+        .task(id: status.summary) {
+            guard status.hasDigest else {
+                tokenCount = nil
+                return
+            }
+            tokenCount = nil
+            tokenCount = await ConversationCompaction.tokenCount(for: status.summary)
+        }
+    }
+}
+
 struct DeveloperCommands: Commands {
     @ObservedObject var chatStore: ChatStore
 
@@ -1351,6 +1700,20 @@ struct DeveloperCommands: Commands {
                 chatStore.addSlowResponseToSelectedChat()
             }
             .disabled(chatStore.selectedChat == nil)
+
+            Button("Compact conversation") {
+                guard let chat = chatStore.selectedChat else { return }
+                Task {
+                    await chat.compactConversation()
+                }
+            }
+            .disabled(chatStore.selectedChat == nil || chatStore.selectedChat?.isCompacting == true)
+
+            Button("Send test notification") {
+                Task {
+                    await AppNotifications.sendDeveloperTest()
+                }
+            }
         }
     }
 }
@@ -1368,18 +1731,7 @@ struct ContentViewPreview: View {
     init() {
         do {
             let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
-            let container = try ModelContainer(
-                for: Agent.self,
-                AgentHeartbeat.self,
-                HeartbeatRun.self,
-                LocalModel.self,
-                ReplyFilterSet.self,
-                TextToSpeechTool.self,
-                StoredChat.self,
-                StoredGroupChatParticipant.self,
-                StoredChatMessage.self,
-                configurations: configuration
-            )
+            let container = try ChatModelContainer.make(configuration: configuration)
             let agentStore = AgentStore(modelContext: container.mainContext)
             let localModelStore = LocalModelStore(modelContext: container.mainContext)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: container.mainContext)
