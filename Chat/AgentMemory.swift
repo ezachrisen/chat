@@ -7,7 +7,7 @@ struct AgentModelOutput {
 
 enum AgentMemoryHarness {
     private static let memoryExpression = try! NSRegularExpression(
-        pattern: #"\[{1,2}MEMORY\](.*?)\[{1,2}/MEMORY\]"#,
+        pattern: #"(?:\[\[MEMORY\]\]|\[MEMORY\])(.*?)(?:\[\[/MEMORY\]\]|\[/MEMORY\])"#,
         options: [.caseInsensitive, .dotMatchesLineSeparators]
     )
 

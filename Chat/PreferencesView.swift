@@ -1,4 +1,5 @@
 import Combine
+import ShadSwift
 import SwiftUI
 import SwiftData
 
@@ -27,16 +28,16 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
         }
     }
 
-    var systemImage: String {
+    var icon: ShadIcon {
         switch self {
         case .agents:
-            return "person.2"
+            return .users
         case .models:
-            return "cpu"
+            return .custom("cpu")
         case .skills:
-            return "book"
+            return .custom("book")
         case .textToSpeech:
-            return "waveform"
+            return .custom("waveform")
         }
     }
 }
@@ -44,26 +45,6 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
 @MainActor
 final class PreferencesNavigation: ObservableObject {
     @Published var selection: PreferencesSection = .agents
-}
-
-enum OpenUITheme {
-    static let background = Color(red: 1, green: 1, blue: 1)
-    static let foreground = Color(red: 26 / 255, green: 28 / 255, blue: 31 / 255)
-    static let foregroundMuted = Color(red: 107 / 255, green: 114 / 255, blue: 128 / 255)
-    static let foregroundSubtle = Color(red: 156 / 255, green: 163 / 255, blue: 175 / 255)
-    static let accent = Color(red: 51 / 255, green: 156 / 255, blue: 1)
-    static let accentSoft = accent.opacity(0.15)
-    static let surface = Color.white
-    static let sidebar = Color(red: 247 / 255, green: 247 / 255, blue: 248 / 255)
-    static let surfaceActive = Color(red: 236 / 255, green: 236 / 255, blue: 236 / 255)
-    static let surfaceMuted = Color(red: 243 / 255, green: 244 / 255, blue: 246 / 255)
-    static let border = Color(red: 229 / 255, green: 231 / 255, blue: 235 / 255)
-    static let borderSubtle = Color(red: 239 / 255, green: 239 / 255, blue: 239 / 255)
-    static let primary = foreground
-    static let danger = Color(red: 225 / 255, green: 29 / 255, blue: 72 / 255)
-    static let warningBackground = Color(red: 254 / 255, green: 243 / 255, blue: 226 / 255)
-    static let warningForeground = Color(red: 146 / 255, green: 64 / 255, blue: 14 / 255)
-    static let warningBorder = Color(red: 245 / 255, green: 217 / 255, blue: 168 / 255)
 }
 
 struct PreferencesView: View {
@@ -75,12 +56,13 @@ struct PreferencesView: View {
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
     @ObservedObject var navigation: PreferencesNavigation
+    @StateObject private var sidebar = ShadSidebarState(isOpen: true, width: 224, iconWidth: 48)
 
     var body: some View {
-        HStack(spacing: 0) {
-            OpenUIPreferencesSidebar(selection: $navigation.selection)
+        ShadSidebarProvider(state: sidebar) {
+            ShadPreferencesSidebar(selection: $navigation.selection)
 
-            Group {
+            ShadSidebarInset {
                 switch navigation.selection {
                 case .agents:
                     AgentsPreferencesView(
@@ -99,11 +81,7 @@ struct PreferencesView: View {
                     TextToSpeechPreferencesView(store: textToSpeechToolStore)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(OpenUITheme.background)
         }
-        .tint(OpenUITheme.accent)
-        .foregroundStyle(OpenUITheme.foreground)
         .frame(
             minWidth: 940,
             idealWidth: 1_080,
@@ -112,7 +90,7 @@ struct PreferencesView: View {
             idealHeight: 760,
             maxHeight: .infinity
         )
-        .preferredColorScheme(.light)
+        .shadTheme(ChatShadTheme.theme)
 #if os(macOS)
         .background(
             PreferencesWindowConfigurator()
@@ -167,110 +145,87 @@ private struct PreferencesWindowConfigurator: NSViewRepresentable {
 }
 #endif
 
-private struct OpenUIPreferencesSidebar: View {
+private struct ShadPreferencesSidebar: View {
     @Binding var selection: PreferencesSection
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("Chat")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(OpenUITheme.foreground)
-                .padding(.horizontal, 12)
+        ShadSidebar(collapsible: .none) {
+            ShadSidebarHeader {
+                Text("Chat")
+                    .font(theme.font(theme.typography.lg, theme.typography.semibold))
+                    .foregroundStyle(theme.colors.sidebarForeground)
+                    .padding(theme.spacing.md)
+            }
 
-            Text("SETTINGS")
-                .font(.system(size: 11, weight: .medium))
-                .tracking(0.4)
-                .foregroundStyle(OpenUITheme.foregroundSubtle)
-                .padding(.top, 28)
-                .padding(.bottom, 8)
-                .padding(.horizontal, 12)
-
-            VStack(spacing: 4) {
-                ForEach(PreferencesSection.allCases) { section in
-                    Button {
-                        selection = section
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: section.systemImage)
-                                .font(.system(size: 16, weight: .regular))
-                                .frame(width: 20)
-
-                            Text(section.title)
-                                .font(.system(size: 14, weight: selection == section ? .medium : .regular))
-
-                            Spacer(minLength: 0)
+            ShadSidebarContent {
+                ShadSidebarGroup("SETTINGS") {
+                    ShadSidebarMenu {
+                        ForEach(PreferencesSection.allCases) { section in
+                            ShadSidebarMenuItem {
+                                ShadSidebarMenuButton(
+                                    section.title,
+                                    icon: section.icon,
+                                    isActive: selection == section
+                                ) {
+                                    selection = section
+                                }
+                                .accessibilityAddTraits(selection == section ? .isSelected : [])
+                            }
                         }
-                        .foregroundStyle(OpenUITheme.foreground)
-                        .padding(.horizontal, 12)
-                        .frame(height: 36)
-                        .contentShape(Rectangle())
-                        .background(
-                            selection == section ? OpenUITheme.surfaceActive : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 10)
-                        )
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(selection == section ? .isSelected : [])
                 }
             }
 
-            Spacer()
-
-            Text("Local-first conversations")
-                .font(.system(size: 12))
-                .foregroundStyle(OpenUITheme.foregroundSubtle)
-                .padding(.horizontal, 12)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 24)
-        .frame(width: 224)
-        .frame(maxHeight: .infinity, alignment: .topLeading)
-        .background(OpenUITheme.sidebar)
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(OpenUITheme.borderSubtle)
-                .frame(width: 1)
-        }
-    }
-}
-
-struct OpenUIPageHeader: View {
-    let title: String
-    let description: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.system(size: 26, weight: .semibold))
-                .foregroundStyle(OpenUITheme.foreground)
-
-            Text(description)
-                .font(.system(size: 13))
-                .foregroundStyle(OpenUITheme.foregroundMuted)
-        }
-    }
-}
-
-struct OpenUISectionHeader: View {
-    let title: String
-    var description: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(OpenUITheme.foreground)
-
-            if let description {
-                Text(description)
-                    .font(.system(size: 13))
-                    .foregroundStyle(OpenUITheme.foregroundMuted)
+            ShadSidebarFooter {
+                Text("Local-first conversations")
+                    .font(theme.font(theme.typography.xs))
+                    .foregroundStyle(theme.colors.sidebarForeground.opacity(0.6))
+                    .padding(theme.spacing.md)
             }
         }
     }
 }
 
-struct OpenUISettingsRow<Control: View>: View {
+struct ShadSettingsPageHeader: View {
+    let title: String
+    let description: String
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: theme.spacing.sm) {
+            Text(title)
+                .font(theme.font(theme.typography.xxl, theme.typography.semibold))
+                .foregroundStyle(theme.colors.foreground)
+
+            Text(description)
+                .font(theme.font(theme.typography.sm))
+                .foregroundStyle(theme.colors.mutedForeground)
+        }
+    }
+}
+
+struct ShadSettingsSectionHeader: View {
+    let title: String
+    var description: String?
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: theme.spacing.xs) {
+            Text(title)
+                .font(theme.font(theme.typography.base, theme.typography.semibold))
+                .foregroundStyle(theme.colors.foreground)
+
+            if let description {
+                Text(description)
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.mutedForeground)
+            }
+        }
+    }
+}
+
+struct ShadSettingsRow<Control: View>: View {
     let title: String
     let description: String
     @ViewBuilder let control: () -> Control
@@ -286,168 +241,86 @@ struct OpenUISettingsRow<Control: View>: View {
     }
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .center, spacing: 20) {
-                labels
-                    .frame(width: 240, alignment: .leading)
+        ShadItem(size: .sm) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: 20) {
+                    labels
+                        .frame(width: 240, alignment: .leading)
 
-                Spacer(minLength: 0)
+                    Spacer(minLength: 0)
 
-                control()
+                    control()
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    labels
+
+                    control()
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
             }
-
-            VStack(alignment: .leading, spacing: 10) {
-                labels
-
-                control()
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .frame(minHeight: 52)
     }
 
     private var labels: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(OpenUITheme.foreground)
-
-            Text(description)
-                .font(.system(size: 13))
-                .foregroundStyle(OpenUITheme.foregroundMuted)
-                .fixedSize(horizontal: false, vertical: true)
+        ShadItemContent {
+            ShadItemTitle(title)
+            ShadItemDescription(description)
         }
-    }
-}
-
-struct OpenUIDivider: View {
-    var body: some View {
-        Rectangle()
-            .fill(OpenUITheme.borderSubtle)
-            .frame(height: 1)
-    }
-}
-
-struct OpenUICardModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .background(OpenUITheme.surface)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(OpenUITheme.border, lineWidth: 1)
-            }
     }
 }
 
 extension View {
-    func openUICard() -> some View {
-        modifier(OpenUICardModifier())
-    }
-
-    func openUIInput() -> some View {
-        self
-            .textFieldStyle(.plain)
-            .font(.system(size: 14))
-            .padding(.horizontal, 11)
-            .frame(height: 34)
-            .background(OpenUITheme.surface, in: RoundedRectangle(cornerRadius: 10))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(OpenUITheme.border, lineWidth: 1)
-            }
-    }
-}
-
-struct OpenUIPrimaryButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 14, weight: .medium))
-            .foregroundStyle(Color.white)
-            .padding(.horizontal, 16)
-            .frame(height: 34)
-            .background(OpenUITheme.primary, in: Capsule())
-            .opacity(configuration.isPressed ? 0.76 : 1)
-    }
-}
-
-struct OpenUISecondaryButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 14, weight: .medium))
-            .foregroundStyle(OpenUITheme.foreground)
-            .padding(.horizontal, 14)
-            .frame(height: 34)
-            .background(OpenUITheme.surface, in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(OpenUITheme.border, lineWidth: 1)
-            }
-            .opacity(configuration.isPressed ? 0.68 : 1)
-    }
-}
-
-struct OpenUIDangerButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(OpenUITheme.danger)
-            .padding(.horizontal, 12)
-            .frame(height: 32)
-            .background(OpenUITheme.surface, in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(OpenUITheme.border, lineWidth: 1)
-            }
-            .opacity(configuration.isPressed ? 0.68 : 1)
+    func shadSettingsCard() -> some View {
+        ShadCard(spacing: 0) {
+            self
+        }
     }
 }
 
 struct ModelPreferencesView: View {
     @ObservedObject var store: LocalModelStore
     @ObservedObject var replyFilterStore: ReplyFilterStore
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 32) {
                 HStack(alignment: .top, spacing: 24) {
-                    OpenUIPageHeader(
+                    ShadSettingsPageHeader(
                         title: "Models",
-                        description: "Configure local servers and the reply filters that strip hidden control text from each model."
+                        description: "Use an on-device model, your ChatGPT subscription, or an OpenAI-compatible local server."
                     )
 
                     Spacer()
 
-                    Button {
+                    ShadButton("Add model", icon: .plus) {
                         store.addLocalModel()
-                    } label: {
-                        Label("Add model", systemImage: "plus")
                     }
-                    .buttonStyle(OpenUIPrimaryButtonStyle())
                 }
 
                 AppleFoundationModelEditor(replyFilterStore: replyFilterStore)
 
+                ChatGPTSubscriptionModelEditor(store: store)
+
                 if store.localModels.isEmpty {
                     VStack(spacing: 12) {
-                        Image(systemName: "desktopcomputer")
-                            .font(.system(size: 26, weight: .regular))
-                            .foregroundStyle(OpenUITheme.accent)
+                        ShadIconView(.custom("desktopcomputer"), size: theme.typography.xxl)
+                            .foregroundStyle(theme.colors.primary)
 
                         Text("No local models")
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(theme.font(theme.typography.base, theme.typography.semibold))
 
                         Text("Add a model served by LM Studio, Ollama, llama.cpp, or another OpenAI-compatible server.")
-                            .font(.system(size: 13))
-                            .foregroundStyle(OpenUITheme.foregroundMuted)
+                            .font(theme.font(theme.typography.sm))
+                            .foregroundStyle(theme.colors.mutedForeground)
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: 420)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 48)
-                    .openUICard()
+                    .shadSettingsCard()
                 } else {
                     VStack(spacing: 16) {
                         ForEach(store.localModels) { model in
@@ -464,50 +337,46 @@ struct ModelPreferencesView: View {
             .padding(.horizontal, 40)
             .padding(.vertical, 36)
         }
-        .background(OpenUITheme.background)
+        .background(theme.colors.background)
     }
 }
 
 struct TextToSpeechPreferencesView: View {
     @ObservedObject var store: TextToSpeechToolStore
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 32) {
                 HStack(alignment: .top, spacing: 24) {
-                    OpenUIPageHeader(
+                    ShadSettingsPageHeader(
                         title: "Text to Speech",
                         description: "Configure command-line tools that can turn text into speech."
                     )
 
                     Spacer()
 
-                    Button {
+                    ShadButton("Add tool", icon: .plus) {
                         store.addTool()
-                    } label: {
-                        Label("Add tool", systemImage: "plus")
                     }
-                    .buttonStyle(OpenUIPrimaryButtonStyle())
                 }
 
                 if store.tools.isEmpty {
                     VStack(spacing: 12) {
-                        Image(systemName: "waveform")
-                            .font(.system(size: 26, weight: .regular))
-                            .foregroundStyle(OpenUITheme.accent)
+                        ShadBlueIconTile(systemName: "waveform")
 
                         Text("No text-to-speech tools")
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(theme.font(theme.typography.base, theme.typography.semibold))
 
                         Text("Add a command-line tool to make it available for text-to-speech features.")
-                            .font(.system(size: 13))
-                            .foregroundStyle(OpenUITheme.foregroundMuted)
+                            .font(theme.font(theme.typography.sm))
+                            .foregroundStyle(theme.colors.mutedForeground)
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: 420)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 48)
-                    .openUICard()
+                    .shadSettingsCard()
                 } else {
                     VStack(spacing: 16) {
                         ForEach(store.tools) { tool in
@@ -520,72 +389,66 @@ struct TextToSpeechPreferencesView: View {
             .padding(.horizontal, 40)
             .padding(.vertical, 36)
         }
-        .background(OpenUITheme.background)
+        .background(theme.colors.background)
     }
 }
 
 private struct TextToSpeechToolEditor: View {
     let tool: TextToSpeechTool
     @ObservedObject var store: TextToSpeechToolStore
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: "waveform")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(OpenUITheme.accent)
-                    .frame(width: 34, height: 34)
-                    .background(OpenUITheme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+                ShadBlueIconTile(systemName: "waveform")
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(tool.displayName)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(OpenUITheme.foreground)
+                        .font(theme.font(theme.typography.base, theme.typography.semibold))
+                        .foregroundStyle(theme.colors.foreground)
 
                     Text(tool.path.isEmpty ? "Enter a CLI path to finish setup" : tool.path)
-                        .font(.system(size: 12))
-                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .font(theme.font(theme.typography.xs))
+                        .foregroundStyle(theme.colors.mutedForeground)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
 
                 Spacer()
 
-                Button(role: .destructive) {
+                ShadButton("Remove", variant: .destructive, size: .sm, icon: .trash) {
                     store.remove(tool)
-                } label: {
-                    Label("Remove", systemImage: "trash")
                 }
-                .buttonStyle(OpenUIDangerButtonStyle())
             }
             .padding(16)
 
-            OpenUIDivider()
+            ShadSeparator()
 
-            OpenUISettingsRow(
+            ShadSettingsRow(
                 title: "Name",
                 description: "The name used to identify this text-to-speech tool."
             ) {
-                TextField("Text-to-speech tool", text: name)
-                    .openUIInput()
+                ShadInput("Text-to-speech tool", text: name)
                     .frame(width: 330)
+                    .accessibilityLabel("Tool name")
             }
 
-            OpenUIDivider()
+            ShadSeparator()
 
-            OpenUISettingsRow(
+            ShadSettingsRow(
                 title: "CLI path",
                 description: "Absolute path to the command-line executable."
             ) {
-                TextField("/path/to/text-to-speech-cli", text: path)
-                    .openUIInput()
+                ShadInput("/path/to/text-to-speech-cli", text: path)
                     .frame(width: 330)
+                    .accessibilityLabel("CLI path")
 #if os(iOS)
                     .textInputAutocapitalization(.never)
 #endif
             }
         }
-        .openUICard()
+        .shadSettingsCard()
     }
 
     private var name: Binding<String> {
@@ -603,40 +466,250 @@ private struct TextToSpeechToolEditor: View {
     }
 }
 
-private struct AppleFoundationModelEditor: View {
-    @ObservedObject var replyFilterStore: ReplyFilterStore
+private struct ChatGPTSubscriptionModelEditor: View {
+    @ObservedObject var store: LocalModelStore
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: "applelogo")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(OpenUITheme.accent)
-                    .frame(width: 34, height: 34)
-                    .background(OpenUITheme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+                ShadBlueIconTile(systemName: "bubble.left.and.bubble.right")
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ChatGPT subscription")
+                        .font(theme.font(theme.typography.base, theme.typography.semibold))
+                        .foregroundStyle(theme.colors.foreground)
+
+                    Text(statusText)
+                        .font(theme.font(theme.typography.xs))
+                        .foregroundStyle(statusColor)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("chatgpt-provider-status")
+                }
+
+                Spacer()
+
+                actionButton
+            }
+            .padding(16)
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Subscription access",
+                description: "Uses Codex-managed ChatGPT sign-in and your plan limits. Chat never reads or stores your account tokens."
+            ) {
+                Text(accountSummary)
+                    .font(theme.font(theme.typography.sm, theme.typography.medium))
+                    .foregroundStyle(theme.colors.foreground)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 330, alignment: .trailing)
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Available models",
+                description: "Fetched from the models enabled for your ChatGPT account. Choose one in an agent's Identity settings."
+            ) {
+                Text(modelSummary)
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.mutedForeground)
+                    .frame(width: 330, alignment: .trailing)
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Codex executable",
+                description: "Leave blank to find Codex in the ChatGPT app or your PATH. Set an absolute path to override discovery."
+            ) {
+                HStack(spacing: 8) {
+                    ShadInput(
+                        "Automatic",
+                        text: executablePath,
+                        onSubmit: refresh
+                    )
+                    .frame(width: 270)
+                    .accessibilityLabel("Codex executable path")
+                    .disabled(store.chatGPTConnectionState.isBusy)
+
+                    ShadButton(
+                        icon: .refresh,
+                        variant: .outline,
+                        size: .icon,
+                        accessibilityLabel: "Refresh ChatGPT connection",
+                        isLoading: store.chatGPTConnectionState.isBusy
+                    ) {
+                        refresh()
+                    }
+                    .disabled(store.chatGPTConnectionState.isBusy)
+                }
+            }
+
+            if let issueText {
+                ShadSeparator()
+
+                ShadItem(variant: .muted, size: .sm) {
+                    ShadIconView(.triangleAlert, size: theme.typography.base)
+                        .foregroundStyle(theme.colors.warning)
+                    ShadItemContent {
+                        Text(issueText)
+                            .font(theme.font(theme.typography.sm))
+                            .foregroundStyle(theme.colors.warning)
+                    }
+                }
+                .accessibilityIdentifier("chatgpt-provider-error")
+            }
+        }
+        .shadSettingsCard()
+        .task {
+            await store.refreshChatGPT()
+        }
+        .accessibilityIdentifier("chatgpt-provider-card")
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch store.chatGPTConnectionState {
+        case .connected:
+            ShadButton(
+                "Refresh",
+                variant: .outline,
+                size: .sm,
+                icon: .refresh,
+                isLoading: store.chatGPTConnectionState.isBusy
+            ) {
+                refresh()
+            }
+            .disabled(store.chatGPTConnectionState.isBusy)
+            .accessibilityIdentifier("chatgpt-provider-refresh")
+        case .checking:
+            ShadButton("Checking", variant: .outline, size: .sm, isLoading: true) {}
+                .disabled(true)
+        case .connecting:
+            ShadButton("Connecting", variant: .outline, size: .sm, isLoading: true) {}
+                .disabled(true)
+        default:
+            ShadButton("Connect ChatGPT", size: .sm) {
+                Task {
+                    await store.connectChatGPT()
+                }
+            }
+            .accessibilityIdentifier("chatgpt-provider-connect")
+        }
+    }
+
+    private var executablePath: Binding<String> {
+        Binding(
+            get: { store.configuredCodexExecutablePath },
+            set: { store.updateCodexExecutablePath($0) }
+        )
+    }
+
+    private var statusText: String {
+        switch store.chatGPTConnectionState {
+        case .idle:
+            return "Ready to check your Codex sign-in"
+        case .checking:
+            return "Checking your ChatGPT account…"
+        case .signedOut:
+            return "Not connected"
+        case .connecting:
+            return "Finish signing in in your browser…"
+        case .connected(let account):
+            return account.email.map { "Connected as \($0)" } ?? "Connected"
+        case .unavailable:
+            return "Codex is unavailable"
+        case .failed:
+            return "Connection needs attention"
+        }
+    }
+
+    private var statusColor: Color {
+        switch store.chatGPTConnectionState {
+        case .connected:
+            return theme.colors.success
+        case .unavailable, .failed:
+            return theme.colors.warning
+        default:
+            return theme.colors.mutedForeground
+        }
+    }
+
+    private var accountSummary: String {
+        switch store.chatGPTConnectionState {
+        case .connected(let account):
+            return account.planType.map(prettyPlanName) ?? "ChatGPT"
+        case .signedOut:
+            return "Sign in required"
+        default:
+            return "—"
+        }
+    }
+
+    private var modelSummary: String {
+        guard !store.chatGPTModels.isEmpty else {
+            return "Connect to load models"
+        }
+        let count = store.chatGPTModels.count
+        return "\(count) \(count == 1 ? "model" : "models")"
+    }
+
+    private var issueText: String? {
+        switch store.chatGPTConnectionState {
+        case .unavailable(let message), .failed(let message):
+            return message
+        default:
+            return nil
+        }
+    }
+
+    private func prettyPlanName(_ plan: String) -> String {
+        plan
+            .split(separator: "_")
+            .map { $0.prefix(1).uppercased() + String($0.dropFirst()) }
+            .joined(separator: " ")
+    }
+
+    private func refresh() {
+        Task {
+            await store.refreshChatGPT()
+        }
+    }
+}
+
+private struct AppleFoundationModelEditor: View {
+    @ObservedObject var replyFilterStore: ReplyFilterStore
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                ShadBlueIconTile(systemName: "applelogo")
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Apple Foundation Model")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(OpenUITheme.foreground)
+                        .font(theme.font(theme.typography.base, theme.typography.semibold))
+                        .foregroundStyle(theme.colors.foreground)
 
                     Text("On-device Apple Intelligence · \(ConversationCompaction.contextWindow(for: .appleFoundation)) token context")
-                        .font(.system(size: 12))
-                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .font(theme.font(theme.typography.xs))
+                        .foregroundStyle(theme.colors.mutedForeground)
                 }
 
                 Spacer()
             }
             .padding(16)
 
-            OpenUIDivider()
+            ShadSeparator()
 
             ReplyFilterPatternsEditor(
                 modelIdentifier: ChatModelIdentifier.appleFoundation,
                 store: replyFilterStore
             )
         }
-        .openUICard()
+        .shadSettingsCard()
     }
 }
 
@@ -645,23 +718,16 @@ private struct ReplyFilterPatternsEditor: View {
     @ObservedObject var store: ReplyFilterStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text("Reply filters")
-                .font(.system(size: 14, weight: .medium))
+        ShadField {
+            ShadFieldLabel("Reply filters")
+            ShadFieldDescription(
+                "One regular expression per line. Matches are removed from the visible reply. Lines starting with # are ignored."
+            )
 
-            Text("One regular expression per line. Matches are removed from the visible reply. Lines starting with # are ignored.")
-                .font(.system(size: 13))
-                .foregroundStyle(OpenUITheme.foregroundMuted)
-
-            TextEditor(text: patternsText)
-                .font(.system(size: 13, design: .monospaced))
-                .frame(minHeight: 92, maxHeight: 160)
-                .padding(8)
-                .scrollContentBackground(.hidden)
-                .background(OpenUITheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 12))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(OpenUITheme.border, lineWidth: 1)
+            ShadTextarea("One regular expression per line", text: patternsText, minHeight: 92, maxHeight: 160)
+                .accessibilityLabel("Reply filters")
+                .shadTheme { fieldTheme in
+                    fieldTheme.typography.fontName = fieldTheme.typography.monoFontName
                 }
         }
         .padding(16)
@@ -684,73 +750,79 @@ private struct LocalModelEditor: View {
     @State private var isLoadingModels = false
     @State private var modelLoadError: String?
     @State private var discoveryVersion = UUID()
+    @State private var contextTokenLimitText = ""
+    @Environment(\.shadTheme) private var theme
+
+    init(
+        model: LocalModel,
+        store: LocalModelStore,
+        replyFilterStore: ReplyFilterStore
+    ) {
+        self.model = model
+        _store = ObservedObject(wrappedValue: store)
+        _replyFilterStore = ObservedObject(wrappedValue: replyFilterStore)
+        _contextTokenLimitText = State(initialValue: String(model.resolvedContextTokenLimit))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: "cpu")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(OpenUITheme.accent)
-                    .frame(width: 34, height: 34)
-                    .background(OpenUITheme.accentSoft, in: RoundedRectangle(cornerRadius: 10))
+                ShadBlueIconTile(systemName: "cpu")
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(model.displayName)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(OpenUITheme.foreground)
+                        .font(theme.font(theme.typography.base, theme.typography.semibold))
+                        .foregroundStyle(theme.colors.foreground)
 
                     Text(model.modelID.isEmpty ? "Choose a server model to finish setup" : model.modelID)
-                        .font(.system(size: 12))
-                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .font(theme.font(theme.typography.xs))
+                        .foregroundStyle(theme.colors.mutedForeground)
                         .lineLimit(1)
                 }
 
                 Spacer()
 
-                Button(role: .destructive) {
+                ShadButton("Remove", variant: .destructive, size: .sm, icon: .trash) {
                     store.remove(model)
-                } label: {
-                    Label("Remove", systemImage: "trash")
                 }
-                .buttonStyle(OpenUIDangerButtonStyle())
             }
             .padding(16)
 
-            OpenUIDivider()
+            ShadSeparator()
 
-            OpenUISettingsRow(
+            ShadSettingsRow(
                 title: "Display name",
                 description: "The name shown in agent model menus."
             ) {
-                TextField("Local model", text: name)
-                    .openUIInput()
+                ShadInput("Local model", text: name)
                     .frame(width: 330)
+                    .accessibilityLabel("Display name")
             }
 
-            OpenUIDivider()
+            ShadSeparator()
 
-            OpenUISettingsRow(
+            ShadSettingsRow(
                 title: "Server URL",
                 description: "Base URL for the OpenAI-compatible API."
             ) {
-                TextField("http://127.0.0.1:1234/v1", text: endpoint)
-                    .openUIInput()
+                ShadInput("http://127.0.0.1:1234/v1", text: endpoint)
                     .frame(width: 330)
+                    .accessibilityLabel("Server URL")
 #if os(iOS)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.URL)
 #endif
             }
 
-            OpenUIDivider()
+            ShadSeparator()
 
-            OpenUISettingsRow(
+            ShadSettingsRow(
                 title: "Bearer token",
                 description: "Optional credential stored in the system keychain."
             ) {
-                SecureField("Optional", text: $bearerToken)
-                    .openUIInput()
+                ShadInput("Optional", text: $bearerToken, isSecure: true)
                     .frame(width: 330)
+                    .accessibilityLabel("Bearer token")
 #if os(iOS)
                     .textInputAutocapitalization(.never)
 #endif
@@ -760,95 +832,84 @@ private struct LocalModelEditor: View {
                     }
             }
 
-            OpenUIDivider()
+            ShadSeparator()
 
-            OpenUISettingsRow(
+            ShadSettingsRow(
                 title: "Server model",
                 description: "Loaded from the server's models API."
             ) {
                 HStack(spacing: 8) {
-                    Picker("Model", selection: modelID) {
-                        if model.modelID.isEmpty {
-                            Text("Choose a model")
-                                .tag("")
-                        } else if !availableModelIDs.contains(model.modelID) {
-                            Text(model.modelID)
-                                .tag(model.modelID)
-                        }
-
-                        ForEach(availableModelIDs, id: \.self) { modelID in
-                            Text(modelID)
-                                .tag(modelID)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 270)
+                    ShadSelect(
+                        selection: optionalModelID,
+                        options: serverModelOptions,
+                        placeholder: "Choose a model",
+                        width: 270
+                    )
                     .disabled(availableModelIDs.isEmpty)
+                    .accessibilityLabel("Server model")
+                    .accessibilityValue(model.modelID.isEmpty ? "No model selected" : model.modelID)
 
-                    Button {
+                    ShadButton(
+                        icon: .refresh,
+                        variant: .outline,
+                        size: .icon,
+                        accessibilityLabel: "Refresh models",
+                        isLoading: isLoadingModels
+                    ) {
                         Task {
                             await loadModels()
                         }
-                    } label: {
-                        if isLoadingModels {
-                            ProgressView()
-                                .controlSize(.small)
-                                .frame(width: 16, height: 16)
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                                .frame(width: 16, height: 16)
-                        }
                     }
-                    .buttonStyle(OpenUISecondaryButtonStyle())
                     .disabled(isLoadingModels)
                     .help("Refresh models")
                 }
             }
 
-            OpenUIDivider()
+            ShadSeparator()
 
-            OpenUISettingsRow(
+            ShadSettingsRow(
                 title: "Context window",
                 description: "Token limit of the loaded model. Chat uses this to summarize older history. Default 8192 if unset."
             ) {
-                TextField(
-                    "8192",
-                    value: contextTokenLimit,
-                    format: .number
-                )
-                    .openUIInput()
-                    .frame(width: 120)
+                ShadField(isInvalid: contextTokenLimitError != nil, spacing: theme.spacing.xs) {
+                    ShadInput(
+                        "8192",
+                        text: $contextTokenLimitText,
+                        isInvalid: contextTokenLimitError != nil,
+                        onSubmit: normalizeContextTokenLimit
+                    )
+                    .accessibilityLabel("Context window")
+                    .onChange(of: contextTokenLimitText) {
+                        updateContextTokenLimitIfValid()
+                    }
+
+                    ShadFieldError(contextTokenLimitError)
+                }
+                .frame(width: 240)
             }
 
             if let modelLoadError {
-                OpenUIDivider()
+                ShadSeparator()
 
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "exclamationmark.triangle")
-
-                    Text(modelLoadError)
-                        .font(.system(size: 13))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .foregroundStyle(OpenUITheme.warningForeground)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-                .background(OpenUITheme.warningBackground)
-                .overlay {
-                    Rectangle()
-                        .stroke(OpenUITheme.warningBorder, lineWidth: 1)
+                ShadItem(variant: .muted, size: .sm) {
+                    ShadIconView(.triangleAlert, size: theme.typography.base)
+                        .foregroundStyle(theme.colors.warning)
+                    ShadItemContent {
+                        Text(modelLoadError)
+                            .font(theme.font(theme.typography.sm))
+                            .foregroundStyle(theme.colors.warning)
+                    }
                 }
             }
 
-            OpenUIDivider()
+            ShadSeparator()
 
             ReplyFilterPatternsEditor(
                 modelIdentifier: ChatModelIdentifier.localModelID(model.id),
                 store: replyFilterStore
             )
         }
-        .openUICard()
+        .shadSettingsCard()
         .onAppear {
             bearerToken = store.bearerToken(for: model)
         }
@@ -881,11 +942,42 @@ private struct LocalModelEditor: View {
         )
     }
 
-    private var contextTokenLimit: Binding<Int> {
+    private var optionalModelID: Binding<String?> {
         Binding(
-            get: { model.resolvedContextTokenLimit },
-            set: { store.updateContextTokenLimit(for: model, to: $0) }
+            get: { model.modelID.isEmpty ? nil : model.modelID },
+            set: { value in
+                guard let value else { return }
+                modelID.wrappedValue = value
+            }
         )
+    }
+
+    private var serverModelOptions: [ShadSelectOption<String>] {
+        var identifiers = availableModelIDs
+        if !model.modelID.isEmpty, !identifiers.contains(model.modelID) {
+            identifiers.insert(model.modelID, at: 0)
+        }
+        return identifiers.map { ShadSelectOption($0, value: $0) }
+    }
+
+    private var contextTokenLimitError: String? {
+        guard let value = Int(contextTokenLimitText) else {
+            return "Enter a whole number."
+        }
+        guard (ConversationCompaction.minimumContextTokens...ConversationCompaction.maximumContextTokens).contains(value) else {
+            return "Enter \(ConversationCompaction.minimumContextTokens)...\(ConversationCompaction.maximumContextTokens)."
+        }
+        return nil
+    }
+
+    private func updateContextTokenLimitIfValid() {
+        guard contextTokenLimitError == nil, let value = Int(contextTokenLimitText) else { return }
+        store.updateContextTokenLimit(for: model, to: value)
+    }
+
+    private func normalizeContextTokenLimit() {
+        updateContextTokenLimitIfValid()
+        contextTokenLimitText = String(model.resolvedContextTokenLimit)
     }
 
     private func resetDiscoveredModels() {

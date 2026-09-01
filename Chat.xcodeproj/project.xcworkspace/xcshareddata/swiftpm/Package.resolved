@@ -1,0 +1,15 @@
+{
+  "originHash" : "2250c404ea88a775d27286b63d7c25c0d28ec2a47975cfbaa80550d9526f264b",
+  "pins" : [
+    {
+      "identity" : "shadswift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ezachrisen/shadswift.git",
+      "state" : {
+        "revision" : "a0003b3adb9f475adcb19d356da348d208865f53",
+        "version" : "0.1.0"
+      }
+    }
+  ],
+  "version" : 3
+}

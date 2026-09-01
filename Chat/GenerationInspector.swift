@@ -1,3 +1,4 @@
+import ShadSwift
 import SwiftData
 import SwiftUI
 
@@ -7,22 +8,28 @@ struct GenerationInspectorButton: View {
     @State private var isPresented = false
 
     var body: some View {
-        Button {
+        ShadButton(
+            icon: .custom("wrench.and.screwdriver"),
+            variant: .ghost,
+            size: .iconSM,
+            shape: .pill,
+            accessibilityLabel: "Inspect tools and debug log"
+        ) {
             isPresented.toggle()
-        } label: {
-            Image(systemName: "wrench.and.screwdriver")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 26, height: 26)
-                .background(Color.secondary.opacity(0.10), in: Circle())
-                .contentShape(Circle())
         }
-        .buttonStyle(.plain)
         .help("Inspect tools and debug log")
-        .popover(isPresented: $isPresented, arrowEdge: .leading) {
-            GenerationTurnInspector(turn: turn)
-                .frame(minWidth: 420, idealWidth: 460, minHeight: 280, idealHeight: 420)
-                .padding(16)
+        .shadPopover(
+            isPresented: $isPresented,
+            configuration: ShadPopoverConfiguration(
+                alignment: .trailingBottom,
+                maxHeight: 460,
+                becomesKey: true
+            )
+        ) {
+            ShadPopoverSurface(padding: 16) {
+                GenerationTurnInspector(turn: turn)
+                    .frame(minWidth: 420, idealWidth: 460, minHeight: 280, idealHeight: 420)
+            }
         }
     }
 }
@@ -53,25 +60,25 @@ struct GenerationTurnInspector: View {
     @Environment(\.modelContext) private var modelContext
     @State private var invocations: [ToolInvocationDisplay] = []
     @State private var payload: GenerationDebugPayload?
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(turn.agentName)
-                        .font(.headline)
-                    Text(turn.actionSummary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("\(turn.kind.rawValue) · \(turn.status.rawValue) · \(turn.toolCallCount) tool\(turn.toolCallCount == 1 ? "" : "s")")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+            VStack(alignment: .leading, spacing: theme.spacing.lg) {
+                ShadItem(variant: .muted, size: .sm) {
+                    ShadItemContent {
+                        ShadItemTitle(turn.agentName)
+                        ShadItemDescription(turn.actionSummary)
+                        Text("\(turn.kind.rawValue) · \(turn.status.rawValue) · \(turn.toolCallCount) tool\(turn.toolCallCount == 1 ? "" : "s")")
+                            .font(theme.font(theme.typography.xs))
+                            .foregroundStyle(theme.colors.mutedForeground)
+                    }
                 }
 
                 if invocations.isEmpty {
-                    Text("No tools were called.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    ShadItem(variant: .muted, size: .xs) {
+                        ShadItemDescription("No tools were called.")
+                    }
                 } else {
                     GenerationToolCallList(invocations: invocations)
                 }
@@ -79,13 +86,13 @@ struct GenerationTurnInspector: View {
                 if turn.debugCaptureEnabled, let payload {
                     GenerationDebugSections(payload: payload)
                 } else if turn.debugCaptureEnabled {
-                    Text("Debug log was on, but no payload was stored.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    ShadItem(variant: .muted, size: .xs) {
+                        ShadItemDescription("Debug log was on, but no payload was stored.")
+                    }
                 } else {
-                    Text("Debug log was off for this run.")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    ShadItem(variant: .muted, size: .xs) {
+                        ShadItemDescription("Debug log was off for this run.")
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -103,57 +110,56 @@ struct GenerationTurnInspector: View {
 
 struct GenerationToolCallList: View {
     let invocations: [ToolInvocationDisplay]
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: theme.spacing.md) {
             Text("Tools")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(theme.font(theme.typography.xs, theme.typography.semibold))
+                .foregroundStyle(theme.colors.mutedForeground)
 
-            ForEach(invocations, id: \ToolInvocationDisplay.id) { invocation in
-                toolRow(invocation)
+            ShadItemGroup(spacing: theme.spacing.md) {
+                ForEach(invocations, id: \ToolInvocationDisplay.id) { invocation in
+                    toolRow(invocation)
+                }
             }
         }
     }
 
     @ViewBuilder
     private func toolRow(_ invocation: ToolInvocationDisplay) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(invocation.toolName)
-                    .font(.body.weight(.medium))
-                Spacer()
-                Text(invocation.succeeded ? "Succeeded" : "Failed")
-                    .font(.caption)
-                    .foregroundStyle(invocation.succeeded ? Color.secondary : Color.red)
-            }
+        ShadItem(variant: .muted, size: .sm) {
+            VStack(alignment: .leading, spacing: theme.spacing.sm) {
+                HStack {
+                    ShadItemTitle(invocation.toolName)
+                    Spacer()
+                    ShadBadge(
+                        invocation.succeeded ? "Succeeded" : "Failed",
+                        variant: .secondary,
+                        color: invocation.succeeded ? .green : .red
+                    )
+                }
 
-            if let skillName = invocation.skillName {
-                Text("Skill: \(skillName)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+                if let skillName = invocation.skillName {
+                    ShadItemDescription("Skill: \(skillName)")
+                }
 
-            if !invocation.argumentsJSON.isEmpty {
-                Text(truncated(invocation.argumentsJSON, limit: 500))
-                    .font(.system(.caption, design: .monospaced))
+                if !invocation.argumentsJSON.isEmpty {
+                    Text(truncated(invocation.argumentsJSON, limit: 500))
+                        .font(theme.monoFont(theme.typography.xs))
+                        .textSelection(.enabled)
+                        .foregroundStyle(theme.colors.mutedForeground)
+                }
+
+                Text(truncated(invocation.resultText, limit: 800))
+                    .font(theme.monoFont(theme.typography.xs))
                     .textSelection(.enabled)
-                    .foregroundStyle(.secondary)
-            }
 
-            Text(truncated(invocation.resultText, limit: 800))
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-
-            if invocation.resultTruncated {
-                Text("Result truncated")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                if invocation.resultTruncated {
+                    ShadBadge("Result truncated", variant: .outline)
+                }
             }
         }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func truncated(_ text: String, limit: Int) -> String {
@@ -164,12 +170,13 @@ struct GenerationToolCallList: View {
 
 struct GenerationDebugSections: View {
     let payload: GenerationDebugPayload
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: theme.spacing.lg) {
             Text("Debug log")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(theme.font(theme.typography.xs, theme.typography.semibold))
+                .foregroundStyle(theme.colors.mutedForeground)
 
             GenerationTextBlock(title: "System prompt", text: payload.systemPrompt)
             GenerationTextBlock(title: "Conversation prompt", text: payload.conversationPrompt)
@@ -193,22 +200,23 @@ struct GenerationDebugSections: View {
 struct GenerationTextBlock: View {
     let title: String
     let text: String
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: theme.spacing.sm) {
             Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(theme.font(theme.typography.xs, theme.typography.semibold))
+                .foregroundStyle(theme.colors.mutedForeground)
 
-            ScrollView {
-                Text(text.isEmpty ? "(empty)" : text)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
+            ShadItem(variant: .muted, size: .sm) {
+                ScrollView {
+                    Text(text.isEmpty ? "(empty)" : text)
+                        .font(theme.monoFont(theme.typography.xs))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220)
             }
-            .frame(maxHeight: 220)
-            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

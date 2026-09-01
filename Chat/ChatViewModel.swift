@@ -9,12 +9,29 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     var id: UUID { storedChat.id }
     var agentID: Agent.ID { storedChat.agentID }
-    var agentName: String { storedChat.agentName }
+    var agentName: String {
+        if isDefaultChat, let agent = agentStore.agent(for: agentID) {
+            return agent.displayName
+        }
+        return storedChat.agentName
+    }
     var isGroupChat: Bool { storedChat.kind == .group }
     var isDefaultChat: Bool { storedChat.isDefaultChat == true }
     var canDelete: Bool { !isDefaultChat }
     var canRename: Bool { !isDefaultChat }
     var updatedAt: Date { storedChat.updatedAt }
+    var usesChatGPTModel: Bool {
+        if isGroupChat {
+            return groupParticipants.contains {
+                ChatModelIdentifier.isChatGPT(
+                    $0.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation
+                )
+            }
+        }
+        return ChatModelIdentifier.isChatGPT(
+            directModelIdentifier
+        )
+    }
     var displayTitle: String {
         if isDefaultChat {
             return agentStore.agent(for: agentID)?.displayName ?? storedChat.agentName
@@ -50,7 +67,18 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private let localModelStore: LocalModelStore
     private let skillCatalog: SkillCatalog
     private let replyFilterStore: ReplyFilterStore
-    private let backend: ChatBackend
+    private var modelStoreCancellable: AnyCancellable?
+
+    private var backend: ChatBackend {
+        localModelStore.backend(for: directModelIdentifier)
+    }
+
+    private var directModelIdentifier: String {
+        if isDefaultChat, let agent = agentStore.agent(for: agentID) {
+            return agent.selectedModelIdentifier
+        }
+        return storedChat.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation
+    }
 
     var canSubmitDraft: Bool {
         canSend && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -94,7 +122,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
         self.replyFilterStore = replyFilterStore
         self.modelContext = modelContext
         title = storedChat.title
-        let fallbackAssistantName = storedChat.kind == .direct ? storedChat.agentName : nil
+        let fallbackAssistantName: String?
+        if storedChat.kind == .direct {
+            fallbackAssistantName = storedChat.isDefaultChat == true
+                ? agentStore.agent(for: storedChat.agentID)?.displayName ?? storedChat.agentName
+                : storedChat.agentName
+        } else {
+            fallbackAssistantName = nil
+        }
         messages = storedMessages.map {
             ChatMessage(storedMessage: $0, fallbackAssistantName: fallbackAssistantName)
         }
@@ -102,12 +137,39 @@ final class ChatViewModel: ObservableObject, Identifiable {
         groupSystemInstructions = storedChat.groupSystemInstructions ?? ""
         respondingAgentName = nil
         hasOlderMessages = storedMessages.count == ChatViewModel.messageBatchSize
-        backend = localModelStore.backend(for: storedChat.agentModelIdentifier)
         updateAvailability()
+        modelStoreCancellable = localModelStore.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateAvailability()
+            }
+        }
     }
 
     var groupParticipantMentions: [String] {
         groupParticipants.map(\.mention)
+    }
+
+    func stageGroupParticipantRemoval(agentID: Agent.ID) -> Set<ObjectIdentifier> {
+        guard isGroupChat else { return [] }
+        let removedParticipants = groupParticipants.filter { $0.agentID == agentID }
+        guard !removedParticipants.isEmpty else { return [] }
+
+        let removedObjectIDs = Set(removedParticipants.map(ObjectIdentifier.init))
+
+        for participant in removedParticipants {
+            modelContext.delete(participant)
+        }
+        storedChat.updatedAt = .now
+        return removedObjectIDs
+    }
+
+    func removeGroupParticipantsFromLiveRoster(
+        objectIDs: Set<ObjectIdentifier>
+    ) {
+        guard isGroupChat, !objectIDs.isEmpty else { return }
+
+        groupParticipants.removeAll { objectIDs.contains(ObjectIdentifier($0)) }
+        updateAvailability()
     }
 
     var availableAgentMentions: [String] {
@@ -136,7 +198,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         isLoadingOlderMessages = true
         defer { isLoadingOlderMessages = false }
 
-        let fallbackAssistantName = isGroupChat ? nil : storedChat.agentName
+        let fallbackAssistantName = isGroupChat ? nil : agentName
         let olderMessages = ActiveChatMessages.fetch(
             chatID: id,
             clearedThroughMessageID: storedChat.clearedThroughMessageID,
@@ -199,6 +261,26 @@ final class ChatViewModel: ObservableObject, Identifiable {
         saveChanges()
     }
 
+    func synchronizeDefaultChat(with agent: Agent) {
+        guard isDefaultChat, !isGroupChat, agent.id == agentID else { return }
+
+        let newName = agent.displayName
+        let newModelIdentifier = agent.selectedModelIdentifier
+        let changed = storedChat.agentName != newName
+            || storedChat.agentSoul != agent.soul
+            || storedChat.agentModelIdentifier != newModelIdentifier
+            || storedChat.title != newName
+        guard changed else { return }
+
+        storedChat.agentName = newName
+        storedChat.agentSoul = agent.soul
+        storedChat.agentModelIdentifier = newModelIdentifier
+        storedChat.title = newName
+        title = newName
+        saveChanges()
+        updateAvailability()
+    }
+
     func updateGroupSystemInstructions(_ instructions: String) {
         guard isGroupChat else { return }
         groupSystemInstructions = instructions
@@ -249,6 +331,9 @@ final class ChatViewModel: ObservableObject, Identifiable {
     }
 
     func send() {
+        if let agent = agentStore.agent(for: agentID) {
+            synchronizeDefaultChat(with: agent)
+        }
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard canSubmitDraft, !prompt.isEmpty else { return }
@@ -470,13 +555,16 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     private func respond(userMessageID: UUID) async {
         let startedAt = Date()
+        let resolvedAgentName = agentName
+        let modelIdentifier = directModelIdentifier
+        let backend = localModelStore.backend(for: modelIdentifier)
         let agent = agentStore.agent(for: storedChat.agentID)
         let debugCaptureEnabled = agent?.isDebugLogEnabled == true
         let recorder = ToolCallRecorder()
         let generation = generationSupport(for: agent, recorder: recorder)
         let storedMessages = allStoredMessages()
         let systemInstructions = ModelPrompts.agentSystemInstructions(
-            agentName: storedChat.agentName,
+            agentName: resolvedAgentName,
             soul: currentSoul(
                 for: storedChat.agentID,
                 fallback: storedChat.agentSoul
@@ -491,13 +579,13 @@ final class ChatViewModel: ObservableObject, Identifiable {
             toolsEnabled: !generation.tools.isEmpty
         )
         let appleFoundationPrompt = ModelPrompts.directConversationPrompt(
-            agentName: storedChat.agentName,
+            agentName: resolvedAgentName,
             transcript: ModelPrompts.withDigest(
                 prepared.digestText,
                 recent: ModelPrompts.conversationTranscript(
                     messages: prepared.tail,
                     isGroupChat: false,
-                    fallbackAgentName: storedChat.agentName
+                    fallbackAgentName: resolvedAgentName
                 )
             )
         )
@@ -513,7 +601,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 using: backend,
                 systemPrompt: recordedSystemPrompt,
                 messages: prepared.tail.map {
-                    ChatMessage(storedMessage: $0, fallbackAssistantName: storedChat.agentName)
+                    ChatMessage(storedMessage: $0, fallbackAssistantName: resolvedAgentName)
                 },
                 appleFoundationPrompt: appleFoundationPrompt,
                 tools: generation.tools,
@@ -522,7 +610,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             )
             let parsedResponse = sanitizedReply(
                 result.finalText,
-                modelIdentifier: storedChat.agentModelIdentifier
+                modelIdentifier: modelIdentifier
             )
             agentStore.appendAgentMemoryEntries(
                 id: storedChat.agentID,
@@ -532,8 +620,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 kind: .direct,
                 userMessageID: userMessageID,
                 agentID: storedChat.agentID,
-                agentName: storedChat.agentName,
-                modelIdentifier: storedChat.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation,
+                agentName: resolvedAgentName,
+                modelIdentifier: modelIdentifier,
                 backend: backend,
                 startedAt: startedAt,
                 parsedResponse: parsedResponse,
@@ -548,8 +636,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 kind: .direct,
                 userMessageID: userMessageID,
                 agentID: storedChat.agentID,
-                agentName: storedChat.agentName,
-                modelIdentifier: storedChat.agentModelIdentifier ?? ChatModelIdentifier.appleFoundation,
+                agentName: resolvedAgentName,
+                modelIdentifier: modelIdentifier,
                 backend: backend,
                 startedAt: startedAt,
                 error: error,
@@ -942,7 +1030,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let messages = allStoredMessages()
         let generation = generationSupport(for: agentStore.agent(for: storedChat.agentID))
         let systemInstructions = ModelPrompts.agentSystemInstructions(
-            agentName: storedChat.agentName,
+            agentName: agentName,
             soul: currentSoul(for: storedChat.agentID, fallback: storedChat.agentSoul),
             memory: currentMemory(for: storedChat.agentID),
             skillsPrompt: generation.skillsPrompt
@@ -972,7 +1060,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             systemPrompt: systemPrompt,
             toolsEnabled: toolsEnabled,
             isGroupChat: isGroupChat,
-            fallbackAgentName: storedChat.agentName,
+            fallbackAgentName: agentName,
             relativeTo: relativeTo,
             aggressive: aggressive,
             in: modelContext
@@ -1029,6 +1117,18 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     availabilityMessage = "Create an agent before starting this group discussion."
                 }
             } else {
+                if let unavailableParticipant = groupParticipants.first(where: {
+                    !ModelClient.availability(
+                        for: localModelStore.backend(for: $0.agentModelIdentifier)
+                    ).canSend
+                }) {
+                    let availability = ModelClient.availability(
+                        for: localModelStore.backend(for: unavailableParticipant.agentModelIdentifier)
+                    )
+                    canSend = false
+                    availabilityMessage = "\(unavailableParticipant.agentName): \(availability.message)"
+                    return
+                }
                 let count = groupParticipants.count
                 availabilityMessage = count == 1
                     ? "1 agent is in this discussion."

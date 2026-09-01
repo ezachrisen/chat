@@ -28,6 +28,7 @@ enum HeartbeatExecutionError: LocalizedError {
 final class AgentHeartbeat: Identifiable {
     @Attribute(.unique) var id: UUID
     @Attribute(originalName: "personaID") var agentID: UUID
+    var title: String?
     var instruction: String
     var intervalMinutes: Int
     var isEnabled: Bool
@@ -37,12 +38,15 @@ final class AgentHeartbeat: Identifiable {
     var lastRunAt: Date?
     var lastCompletedAt: Date?
     var nextRunAt: Date?
+    /// The error from the most recently completed run. Pair with `lastCompletedAt`
+    /// to distinguish a successful run from a heartbeat that has never run.
     var lastError: String?
     var createdAt: Date
 
     init(
         id: UUID = UUID(),
         agentID: UUID,
+        title: String? = nil,
         instruction: String = "Check whether you have anything useful to add.",
         intervalMinutes: Int = 60,
         isEnabled: Bool = false,
@@ -57,6 +61,7 @@ final class AgentHeartbeat: Identifiable {
     ) {
         self.id = id
         self.agentID = agentID
+        self.title = title
         self.instruction = instruction
         self.intervalMinutes = intervalMinutes
         self.isEnabled = isEnabled
@@ -76,6 +81,13 @@ final class AgentHeartbeat: Identifiable {
 
     var normalizedIntervalMinutes: Int {
         min(max(intervalMinutes, 1), 10_080)
+    }
+
+    var displayTitle: String {
+        let normalizedTitle = title?
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ") ?? ""
+        return normalizedTitle.isEmpty ? "Untitled heartbeat" : normalizedTitle
     }
 }
 

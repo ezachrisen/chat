@@ -1,15 +1,17 @@
 import Foundation
+import ShadSwift
 import SwiftUI
 
 struct MarkdownMessageView: View {
     let text: String
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         let blocks = MessageMarkdown.parse(text)
         if blocks.isEmpty {
             Text(text)
         } else {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: theme.spacing.md) {
                 ForEach(blocks) { block in
                     MarkdownBlockView(block: block, unorderedDepth: 0)
                 }
@@ -28,6 +30,7 @@ private struct MarkdownBlock: Identifiable {
 private struct MarkdownBlockView: View {
     let block: MarkdownBlock
     let unorderedDepth: Int
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         switch block.kind {
@@ -37,10 +40,9 @@ private struct MarkdownBlockView: View {
         case .header(let level):
             paragraph(block.text)
                 .font(headerFont(level))
-                .bold()
 
         case .orderedList:
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: theme.spacing.lg) {
                 ForEach(block.children) { child in
                     MarkdownListItemView(
                         block: child,
@@ -51,7 +53,7 @@ private struct MarkdownBlockView: View {
             }
 
         case .unorderedList:
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: theme.spacing.xs) {
                 ForEach(block.children) { child in
                     MarkdownListItemView(
                         block: child,
@@ -69,20 +71,19 @@ private struct MarkdownBlockView: View {
             )
 
         case .codeBlock:
-            Text(String(block.text.characters).trimmingCharacters(in: .newlines))
-                .font(.system(.body, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            ShadItem(variant: .muted, size: .xs) {
+                Text(String(block.text.characters).trimmingCharacters(in: .newlines))
+                    .font(theme.monoFont(theme.typography.sm))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
         case .blockQuote:
-            HStack(alignment: .top, spacing: 8) {
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(Color.secondary.opacity(0.45))
-                    .frame(width: 3)
+            HStack(alignment: .top, spacing: theme.spacing.md) {
+                ShadSeparator(.vertical, color: theme.colors.border)
+                    .frame(width: theme.borderWidth * 3)
 
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: theme.spacing.sm) {
                     if !block.text.characters.isEmpty {
                         paragraph(block.text)
                     }
@@ -93,11 +94,11 @@ private struct MarkdownBlockView: View {
             }
 
         case .thematicBreak:
-            Divider()
-                .padding(.vertical, 4)
+            ShadSeparator()
+                .padding(.vertical, theme.spacing.xs)
 
         default:
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: theme.spacing.xs) {
                 if !block.text.characters.isEmpty {
                     paragraph(block.text)
                 }
@@ -116,13 +117,13 @@ private struct MarkdownBlockView: View {
     private func headerFont(_ level: Int) -> Font {
         switch level {
         case 1:
-            return .title2
+            return theme.font(theme.typography.xxl, theme.typography.semibold)
         case 2:
-            return .title3
+            return theme.font(theme.typography.xl, theme.typography.semibold)
         case 3:
-            return .headline
+            return theme.font(theme.typography.lg, theme.typography.semibold)
         default:
-            return .body.weight(.semibold)
+            return theme.font(theme.typography.base, theme.typography.semibold)
         }
     }
 }
@@ -131,14 +132,15 @@ private struct MarkdownListItemView: View {
     let block: MarkdownBlock
     let unorderedDepth: Int
     let ordered: Bool
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: theme.spacing.md) {
             Text(marker)
-                .font(.body.monospacedDigit())
+                .font(theme.monoFont(theme.typography.sm).monospacedDigit())
                 .frame(minWidth: ordered ? 22 : 14, alignment: .trailing)
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: theme.spacing.xs) {
                 if !block.text.characters.isEmpty {
                     Text(block.text)
                         .fixedSize(horizontal: false, vertical: true)

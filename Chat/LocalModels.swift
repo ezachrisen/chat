@@ -3,8 +3,14 @@ import Foundation
 import Security
 import SwiftData
 
-enum ChatModelIdentifier {
+#if os(macOS)
+import AppKit
+#endif
+
+nonisolated enum ChatModelIdentifier {
     static let appleFoundation = "apple.foundation"
+    static let chatGPTDefault = "chatgpt.default"
+    private static let chatGPTModelPrefix = "chatgpt.model."
 
     static func localModelID(_ id: UUID) -> String {
         "local.\(id.uuidString.lowercased())"
@@ -13,6 +19,20 @@ enum ChatModelIdentifier {
     static func localModelUUID(from identifier: String) -> UUID? {
         guard identifier.hasPrefix("local.") else { return nil }
         return UUID(uuidString: String(identifier.dropFirst("local.".count)))
+    }
+
+    static func chatGPTModelID(_ modelID: String) -> String {
+        chatGPTModelPrefix + modelID
+    }
+
+    static func chatGPTModelID(from identifier: String) -> String? {
+        guard identifier.hasPrefix(chatGPTModelPrefix) else { return nil }
+        let modelID = String(identifier.dropFirst(chatGPTModelPrefix.count))
+        return modelID.isEmpty ? nil : modelID
+    }
+
+    static func isChatGPT(_ identifier: String) -> Bool {
+        identifier == chatGPTDefault || chatGPTModelID(from: identifier) != nil
     }
 }
 
@@ -129,15 +149,21 @@ struct LocalModelConfiguration: Sendable {
 
 enum ChatBackend {
     case appleFoundation
+    case chatGPT(ChatGPTProviderConfiguration)
     case openAICompatible(LocalModelConfiguration)
+    case missingChatGPTProvider
     case missingLocalModel
 
     var displayName: String {
         switch self {
         case .appleFoundation:
             return "Apple Foundation Model"
+        case .chatGPT(let configuration):
+            return configuration.displayName
         case .openAICompatible(let configuration):
             return configuration.name
+        case .missingChatGPTProvider:
+            return "ChatGPT"
         case .missingLocalModel:
             return "Missing local model"
         }
@@ -147,22 +173,78 @@ enum ChatBackend {
         switch self {
         case .appleFoundation:
             return "appleFoundation"
+        case .chatGPT:
+            return "chatGPTSubscription"
         case .openAICompatible:
             return "openAICompatible"
+        case .missingChatGPTProvider:
+            return "missingChatGPTProvider"
         case .missingLocalModel:
             return "missingLocalModel"
         }
     }
 }
 
+enum ChatGPTConnectionState {
+    case idle
+    case checking
+    case signedOut
+    case connecting
+    case connected(ChatGPTAccountSnapshot)
+    case unavailable(String)
+    case failed(String)
+
+    var isBusy: Bool {
+        switch self {
+        case .checking, .connecting:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var isAuthenticated: Bool? {
+        switch self {
+        case .connected:
+            return true
+        case .signedOut, .connecting:
+            return false
+        case .unavailable, .failed:
+            return false
+        case .idle, .checking:
+            return nil
+        }
+    }
+}
+
+struct ChatModelSelection: Identifiable, Equatable {
+    let identifier: String
+    let displayName: String
+
+    var id: String { identifier }
+}
+
 @MainActor
 final class LocalModelStore: ObservableObject {
     @Published private(set) var localModels: [LocalModel] = []
+    @Published private(set) var chatGPTModels: [ChatGPTModelDescriptor]
+    @Published private(set) var chatGPTConnectionState: ChatGPTConnectionState = .idle
+    @Published private(set) var configuredCodexExecutablePath: String
+    @Published private(set) var resolvedCodexExecutableURL: URL?
 
     private let modelContext: ModelContext
+    private static let codexExecutablePathDefaultsKey = "chatgptProvider.codexExecutablePath"
+    private var chatGPTOperationID = UUID()
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
+        configuredCodexExecutablePath = UserDefaults.standard.string(
+            forKey: Self.codexExecutablePathDefaultsKey
+        ) ?? ""
+        chatGPTModels = ChatGPTModelCatalogCache.load()
+        resolvedCodexExecutableURL = CodexExecutableResolver.resolve(
+            configuredPath: configuredCodexExecutablePath
+        )
         loadModels()
     }
 
@@ -236,10 +318,160 @@ final class LocalModelStore: ObservableObject {
         LocalModelCredentials.save(token, for: model.id)
     }
 
+    var selectableModels: [ChatModelSelection] {
+        var selections = [
+            ChatModelSelection(
+                identifier: ChatModelIdentifier.appleFoundation,
+                displayName: "Apple Foundation Model"
+            ),
+            ChatModelSelection(
+                identifier: ChatModelIdentifier.chatGPTDefault,
+                displayName: "ChatGPT (recommended model)"
+            )
+        ]
+        selections.append(contentsOf: chatGPTModels.map { model in
+            ChatModelSelection(
+                identifier: ChatModelIdentifier.chatGPTModelID(model.id),
+                displayName: "ChatGPT · \(model.displayName)"
+            )
+        })
+        selections.append(contentsOf: localModels.map { model in
+            ChatModelSelection(
+                identifier: ChatModelIdentifier.localModelID(model.id),
+                displayName: model.displayName
+            )
+        })
+        return selections
+    }
+
+    func isConfiguredModelIdentifier(_ identifier: String) -> Bool {
+        if identifier == ChatModelIdentifier.appleFoundation || ChatModelIdentifier.isChatGPT(identifier) {
+            return true
+        }
+        return localModels.contains {
+            ChatModelIdentifier.localModelID($0.id) == identifier
+        }
+    }
+
+    func updateCodexExecutablePath(_ path: String) {
+        chatGPTOperationID = UUID()
+        configuredCodexExecutablePath = path
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedPath.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.codexExecutablePathDefaultsKey)
+        } else {
+            UserDefaults.standard.set(trimmedPath, forKey: Self.codexExecutablePathDefaultsKey)
+        }
+        resolvedCodexExecutableURL = CodexExecutableResolver.resolve(configuredPath: trimmedPath)
+        chatGPTModels = []
+        ChatGPTModelCatalogCache.save([])
+        chatGPTConnectionState = .idle
+    }
+
+    func refreshChatGPT() async {
+        guard !chatGPTConnectionState.isBusy else { return }
+        let operationID = UUID()
+        chatGPTOperationID = operationID
+        chatGPTConnectionState = .checking
+
+        guard let executableURL = CodexExecutableResolver.resolve(
+            configuredPath: configuredCodexExecutablePath
+        ) else {
+            guard chatGPTOperationID == operationID else { return }
+            resolvedCodexExecutableURL = nil
+            chatGPTModels = []
+            ChatGPTModelCatalogCache.save([])
+            chatGPTConnectionState = .unavailable(ChatGPTProviderError.executableNotFound.localizedDescription)
+            return
+        }
+        resolvedCodexExecutableURL = executableURL
+
+        do {
+            let inspection = try await ChatGPTProviderClient.inspect(executableURL: executableURL)
+            guard chatGPTOperationID == operationID else { return }
+            applyChatGPTInspection(inspection)
+        } catch {
+            guard chatGPTOperationID == operationID else { return }
+            chatGPTConnectionState = .failed(error.localizedDescription)
+        }
+    }
+
+    func connectChatGPT() async {
+        guard !chatGPTConnectionState.isBusy else { return }
+        let operationID = UUID()
+        chatGPTOperationID = operationID
+
+        guard let executableURL = CodexExecutableResolver.resolve(
+            configuredPath: configuredCodexExecutablePath
+        ) else {
+            guard chatGPTOperationID == operationID else { return }
+            resolvedCodexExecutableURL = nil
+            chatGPTModels = []
+            ChatGPTModelCatalogCache.save([])
+            chatGPTConnectionState = .unavailable(ChatGPTProviderError.executableNotFound.localizedDescription)
+            return
+        }
+        resolvedCodexExecutableURL = executableURL
+        chatGPTConnectionState = .connecting
+
+        do {
+            let inspection = try await ChatGPTProviderClient.login(
+                executableURL: executableURL
+            ) { authorizationURL in
+#if os(macOS)
+                await MainActor.run {
+                    NSWorkspace.shared.open(authorizationURL)
+                }
+#else
+                false
+#endif
+            }
+            guard chatGPTOperationID == operationID else { return }
+            applyChatGPTInspection(inspection)
+        } catch {
+            guard chatGPTOperationID == operationID else { return }
+            chatGPTConnectionState = .failed(error.localizedDescription)
+        }
+    }
+
+    private func applyChatGPTInspection(_ inspection: ChatGPTProviderInspection) {
+        chatGPTModels = inspection.models
+        ChatGPTModelCatalogCache.save(inspection.models)
+
+        if let account = inspection.account {
+            chatGPTConnectionState = .connected(account)
+        } else {
+            chatGPTConnectionState = .signedOut
+        }
+    }
+
     func backend(for identifier: String?) -> ChatBackend {
         let selectedIdentifier = identifier ?? ChatModelIdentifier.appleFoundation
         guard selectedIdentifier != ChatModelIdentifier.appleFoundation else {
             return .appleFoundation
+        }
+
+        if ChatModelIdentifier.isChatGPT(selectedIdentifier) {
+            guard let executableURL = resolvedCodexExecutableURL
+                ?? CodexExecutableResolver.resolve(configuredPath: configuredCodexExecutablePath) else {
+                return .missingChatGPTProvider
+            }
+            let modelID = ChatModelIdentifier.chatGPTModelID(from: selectedIdentifier)
+            let descriptor = modelID.flatMap { selectedModelID in
+                chatGPTModels.first { $0.id == selectedModelID }
+            }
+            let displayName = modelID.map {
+                "ChatGPT · \(descriptor?.displayName ?? $0)"
+            } ?? "ChatGPT (recommended model)"
+            return .chatGPT(
+                ChatGPTProviderConfiguration(
+                    executableURL: executableURL,
+                    modelID: modelID,
+                    displayName: displayName,
+                    contextTokenLimit: ConversationCompaction.chatGPTDefaultContextTokens,
+                    isAuthenticated: chatGPTConnectionState.isAuthenticated
+                )
+            )
         }
 
         guard let modelID = ChatModelIdentifier.localModelUUID(from: selectedIdentifier),
@@ -340,6 +572,23 @@ private enum LocalModelCredentials {
             kSecAttrAccount as String: id.uuidString
         ]
         SecItemDelete(query as CFDictionary)
+    }
+}
+
+private enum ChatGPTModelCatalogCache {
+    private static let defaultsKey = "chatgptProvider.modelCatalog"
+
+    static func load() -> [ChatGPTModelDescriptor] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let models = try? JSONDecoder().decode([ChatGPTModelDescriptor].self, from: data) else {
+            return []
+        }
+        return models
+    }
+
+    static func save(_ models: [ChatGPTModelDescriptor]) {
+        guard let data = try? JSONEncoder().encode(models) else { return }
+        UserDefaults.standard.set(data, forKey: defaultsKey)
     }
 }
 

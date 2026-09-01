@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import ShadSwift
 import SwiftData
 import SwiftUI
 
@@ -53,6 +54,18 @@ struct ChatApp: App {
                 }
             } else {
                 heartbeatScheduler.start()
+                let usesChatGPT = agentStore.agents.contains {
+                    ChatModelIdentifier.isChatGPT($0.selectedModelIdentifier)
+                } || agentStore.heartbeats.contains {
+                    $0.modelIdentifier.map(ChatModelIdentifier.isChatGPT) == true
+                } || chatStore.chats.contains {
+                    $0.usesChatGPTModel
+                }
+                if usesChatGPT {
+                    Task { @MainActor in
+                        await localModelStore.refreshChatGPT()
+                    }
+                }
             }
         } catch {
             fatalError("Failed to create model container: \(error.localizedDescription)")
@@ -67,6 +80,7 @@ struct ChatApp: App {
                 chatStore: chatStore
             )
                 .modelContainer(modelContainer)
+                .shadTheme(ChatShadTheme.theme)
         }
         .commands {
 #if os(macOS)
@@ -83,6 +97,7 @@ struct ChatApp: App {
                 heartbeatScheduler: heartbeatScheduler
             )
                 .modelContainer(modelContainer)
+                .shadTheme(ChatShadTheme.theme)
         }
 
 #if os(macOS)
@@ -98,8 +113,43 @@ struct ChatApp: App {
                 navigation: preferencesNavigation
             )
             .modelContainer(modelContainer)
+            .shadTheme(ChatShadTheme.theme)
         }
 #endif
+    }
+}
+
+final class ChatSidebarPresentation: ObservableObject {
+    @Published var chatBeingRenamed: ChatViewModel?
+    @Published var renameDraft = ""
+    @Published var renameDialogIsPresented = false
+    @Published var chatPendingReset: ChatViewModel?
+    @Published var resetDialogIsPresented = false
+    @Published var chatPendingDelete: ChatViewModel?
+    @Published var deleteDialogIsPresented = false
+
+    func beginRenaming(_ chat: ChatViewModel) {
+        guard chat.canRename else { return }
+        chatBeingRenamed = chat
+        renameDraft = chat.title
+        renameDialogIsPresented = true
+    }
+
+    func beginReset(_ chat: ChatViewModel) {
+        chatPendingReset = chat
+        resetDialogIsPresented = true
+    }
+
+    func beginDelete(_ chat: ChatViewModel) {
+        guard chat.canDelete else { return }
+        chatPendingDelete = chat
+        deleteDialogIsPresented = true
+    }
+
+    func commitRename() {
+        chatBeingRenamed?.rename(to: renameDraft)
+        chatBeingRenamed = nil
+        renameDialogIsPresented = false
     }
 }
 
@@ -107,6 +157,15 @@ struct ContentView: View {
     @ObservedObject private var agentStore: AgentStore
     @ObservedObject private var textToSpeechToolStore: TextToSpeechToolStore
     @ObservedObject private var chatStore: ChatStore
+    @StateObject private var sidebarState = ShadSidebarState(
+        isOpen: true,
+        width: 280,
+        iconWidth: 48
+    )
+    @StateObject private var sidebarPresentation = ChatSidebarPresentation()
+    @State private var compactionStatusIsPresented = false
+    @State private var voiceErrorMessage: String?
+    @Environment(\.shadTheme) private var theme
 
     init(
         agentStore: AgentStore,
@@ -119,143 +178,198 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
-            ChatSidebar(agentStore: agentStore, chatStore: chatStore)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 280)
-        } detail: {
-            if let chat = chatStore.selectedChat {
-                ChatDetailView(
-                    chat: chat,
+        ShadSidebarProvider(state: sidebarState) {
+            ShadSidebar(variant: .sidebar, collapsible: .offcanvas) {
+                ChatSidebar(
                     agentStore: agentStore,
-                    textToSpeechToolStore: textToSpeechToolStore,
-                    chatStore: chatStore
+                    chatStore: chatStore,
+                    presentation: sidebarPresentation
                 )
-            } else {
-                Text("Start a new chat.")
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            ShadSidebarInset(variant: .sidebar) {
+                NavigationStack {
+                    if let chat = chatStore.selectedChat {
+                        ChatDetailView(
+                            chat: chat,
+                            agentStore: agentStore,
+                            textToSpeechToolStore: textToSpeechToolStore,
+                            voiceErrorMessage: $voiceErrorMessage,
+                            onPresentCompactionStatus: {
+                                compactionStatusIsPresented = true
+                            },
+                            onResetChat: {
+                                sidebarPresentation.beginReset(chat)
+                            },
+                            onDeleteChat: {
+                                sidebarPresentation.beginDelete(chat)
+                            }
+                        )
+                        .id(chat.id)
+                    } else {
+                        Text("Start a new chat.")
+                            .font(theme.font(theme.typography.sm))
+                            .foregroundStyle(theme.colors.mutedForeground)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        ShadSidebarTrigger()
+                    }
+                }
             }
         }
         .frame(minWidth: 820, minHeight: 560)
+        .shadDialog(isPresented: $sidebarPresentation.renameDialogIsPresented) {
+            ShadDialogContent(maxWidth: 420) {
+                ShadDialogHeader {
+                    ShadDialogTitle("Rename chat")
+                    ShadDialogDescription("Choose a name for this conversation.")
+                }
+                ShadInput(
+                    "Chat name",
+                    text: $sidebarPresentation.renameDraft,
+                    onSubmit: sidebarPresentation.commitRename
+                )
+                .accessibilityLabel("Chat name")
+                ShadDialogFooter {
+                    ShadDialogClose("Cancel") {
+                        sidebarPresentation.chatBeingRenamed = nil
+                    }
+                    ShadButton("Rename", action: sidebarPresentation.commitRename)
+                }
+            }
+        }
+        .shadAlertDialog(isPresented: $sidebarPresentation.resetDialogIsPresented) {
+            ShadAlertDialogContent {
+                ShadAlertDialogTitle("Reset chat?")
+                ShadAlertDialogDescription(
+                    "Previous messages stay saved but will no longer appear or be sent to the model."
+                )
+            } actions: {
+                ShadAlertDialogCancel {
+                    sidebarPresentation.chatPendingReset = nil
+                }
+                ShadAlertDialogAction("Reset Chat", variant: .destructive) {
+                    if let chat = sidebarPresentation.chatPendingReset {
+                        chatStore.resetChat(chat)
+                    }
+                    sidebarPresentation.chatPendingReset = nil
+                }
+            }
+        }
+        .shadAlertDialog(isPresented: $sidebarPresentation.deleteDialogIsPresented) {
+            ShadAlertDialogContent {
+                ShadAlertDialogTitle("Delete chat?")
+                ShadAlertDialogDescription(
+                    "This chat will be removed from the sidebar. This cannot be undone."
+                )
+            } actions: {
+                ShadAlertDialogCancel {
+                    sidebarPresentation.chatPendingDelete = nil
+                }
+                ShadAlertDialogAction("Delete Chat", variant: .destructive) {
+                    if let chat = sidebarPresentation.chatPendingDelete {
+                        chatStore.deleteChat(chat)
+                    }
+                    sidebarPresentation.chatPendingDelete = nil
+                }
+            }
+        }
+        .shadDialog(isPresented: $compactionStatusIsPresented) {
+            if let chat = chatStore.selectedChat {
+                ShadDialogContent(maxWidth: 560, showsCloseButton: false) {
+                    CompactionStatusView(chat: chat)
+                }
+            }
+        }
+        .shadDialog(isPresented: voiceErrorIsPresented) {
+            ShadDialogContent(maxWidth: 448, showsCloseButton: false) {
+                ShadDialogHeader {
+                    ShadDialogTitle("Voice error")
+                    ShadDialogDescription(
+                        voiceErrorMessage ?? "Voice input could not be started."
+                    )
+                }
+                ShadDialogFooter {
+                    ShadDialogClose("OK") {
+                        voiceErrorMessage = nil
+                    }
+                }
+            }
+        }
+        .onChange(of: chatStore.selectedChatID) {
+            compactionStatusIsPresented = false
+            voiceErrorMessage = nil
+        }
+    }
+
+    private var voiceErrorIsPresented: Binding<Bool> {
+        Binding(
+            get: { voiceErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented {
+                    voiceErrorMessage = nil
+                }
+            }
+        )
     }
 }
 
 struct ChatSidebar: View {
     @ObservedObject var agentStore: AgentStore
     @ObservedObject var chatStore: ChatStore
+    @ObservedObject var presentation: ChatSidebarPresentation
     @State private var collapsedAgentIDs: Set<Agent.ID> = []
     @State private var groupChatsAreCollapsed = false
-    @State private var chatBeingRenamed: ChatViewModel?
-    @State private var renameDraft = ""
-    @State private var renameAlertIsPresented = false
-    @State private var chatPendingReset: ChatViewModel?
-    @State private var resetConfirmationIsPresented = false
-    @State private var chatPendingDelete: ChatViewModel?
-    @State private var deleteConfirmationIsPresented = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            newChatControl
-                .padding(.top, 20)
-                .padding(.horizontal, 20)
+            ShadSidebarHeader {
+                newChatControl
+            }
 
-            Text("Chats")
-                .font(.body.weight(.medium))
-                .foregroundStyle(.secondary)
-                .padding(.top, 28)
-                .padding(.horizontal, 20)
-
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if !chatStore.groupChats.isEmpty {
-                        GroupChatSection(
-                            chats: chatStore.groupChats,
-                            selectedChatID: $chatStore.selectedChatID,
-                            isCollapsed: groupChatsAreCollapsed,
-                            onRenameChat: beginRenaming,
-                            onResetChat: beginReset,
-                            onDeleteChat: beginDelete
-                        ) {
-                            groupChatsAreCollapsed.toggle()
-                        }
-                    }
-
-                    ForEach(agentStore.agents) { agent in
-                        AgentSidebarSection(
-                            agent: agent,
-                            defaultChat: chatStore.defaultChat(for: agent.id),
-                            extraChats: chatStore.extraChats(for: agent.id),
-                            selectedChatID: $chatStore.selectedChatID,
-                            isCollapsed: collapsedAgentIDs.contains(agent.id),
-                            onRenameChat: beginRenaming,
-                            onResetChat: beginReset,
-                            onDeleteChat: beginDelete,
-                            onNewChat: {
-                                startChat(with: agent)
-                            },
-                            onSelectDefault: {
-                                chatStore.selectDefaultChat(for: agent)
+            ShadSidebarContent {
+                ShadSidebarGroup("Chats") {
+                    ShadSidebarMenu {
+                        if !chatStore.groupChats.isEmpty {
+                            GroupChatSection(
+                                chats: chatStore.groupChats,
+                                selectedChatID: $chatStore.selectedChatID,
+                                isCollapsed: groupChatsAreCollapsed,
+                                onRenameChat: presentation.beginRenaming,
+                                onResetChat: presentation.beginReset,
+                                onDeleteChat: presentation.beginDelete
+                            ) {
+                                groupChatsAreCollapsed.toggle()
                             }
-                        ) {
-                            toggleAgent(agent.id)
+                        }
+
+                        ForEach(agentStore.agents) { agent in
+                            AgentSidebarSection(
+                                agent: agent,
+                                defaultChat: chatStore.defaultChat(for: agent.id),
+                                extraChats: chatStore.extraChats(for: agent.id),
+                                selectedChatID: $chatStore.selectedChatID,
+                                isCollapsed: collapsedAgentIDs.contains(agent.id),
+                                onRenameChat: presentation.beginRenaming,
+                                onResetChat: presentation.beginReset,
+                                onDeleteChat: presentation.beginDelete,
+                                onNewChat: {
+                                    startChat(with: agent)
+                                },
+                                onSelectDefault: {
+                                    chatStore.selectDefaultChat(for: agent)
+                                }
+                            ) {
+                                toggleAgent(agent.id)
+                            }
                         }
                     }
                 }
-                .padding(.top, 14)
-                .padding(.horizontal, 12)
             }
         }
-        .alert("Rename chat", isPresented: $renameAlertIsPresented) {
-            TextField("Chat name", text: $renameDraft)
-
-            Button("Cancel", role: .cancel) { }
-            Button("Rename") {
-                chatBeingRenamed?.rename(to: renameDraft)
-            }
-        }
-        .confirmationDialog(
-            "Reset chat?",
-            isPresented: $resetConfirmationIsPresented,
-            titleVisibility: .visible,
-            presenting: chatPendingReset
-        ) { chat in
-            Button("Reset Chat", role: .destructive) {
-                chatStore.resetChat(chat)
-            }
-        } message: { _ in
-            Text("Previous messages stay saved but will no longer appear or be sent to the model.")
-        }
-        .confirmationDialog(
-            "Delete chat?",
-            isPresented: $deleteConfirmationIsPresented,
-            titleVisibility: .visible,
-            presenting: chatPendingDelete
-        ) { chat in
-            Button("Delete Chat", role: .destructive) {
-                chatStore.deleteChat(chat)
-            }
-        } message: { _ in
-            Text("This chat will be removed from the sidebar. This cannot be undone.")
-        }
-    }
-
-    private func beginRenaming(_ chat: ChatViewModel) {
-        guard chat.canRename else { return }
-        chatBeingRenamed = chat
-        renameDraft = chat.title
-        renameAlertIsPresented = true
-    }
-
-    private func beginReset(_ chat: ChatViewModel) {
-        chatPendingReset = chat
-        resetConfirmationIsPresented = true
-    }
-
-    private func beginDelete(_ chat: ChatViewModel) {
-        guard chat.canDelete else { return }
-        chatPendingDelete = chat
-        deleteConfirmationIsPresented = true
     }
 
     private func toggleAgent(_ agentID: Agent.ID) {
@@ -273,89 +387,68 @@ struct ChatSidebar: View {
 
     @ViewBuilder
     private var newChatControl: some View {
-        Menu {
-            Button {
+        ShadDropdownMenu(alignment: .bottomLeading, minWidth: 200) { _ in
+            NewChatLabel()
+        } content: {
+            ShadDropdownMenuItem("Group chat", icon: .users) {
                 chatStore.startGroupChat()
-            } label: {
-                Label("Group chat", systemImage: "person.2")
             }
 
             if !agentStore.agents.isEmpty {
-                Divider()
+                ShadDropdownMenuSeparator()
 
                 ForEach(agentStore.agents) { agent in
-                    Button(agent.displayName) {
+                    ShadDropdownMenuItem(agent.displayName, icon: .bot) {
                         startChat(with: agent)
                     }
                 }
             }
-        } label: {
-            NewChatLabel()
         }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
         .help("Start a new chat")
     }
 }
 
 struct NewChatLabel: View {
     var body: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "square.and.pencil")
-                .font(.body)
-                .frame(width: 20, height: 20)
-
-            Text("New chat")
-                .font(.body)
-
-            Spacer()
-        }
-        .foregroundStyle(.primary)
-        .contentShape(Rectangle())
+        ShadSidebarMenuButtonLabel(
+            title: "New chat",
+            icon: .custom("square.and.pencil")
+        )
     }
 }
 
 struct AgentAvatar: View {
-    let name: String
-    let id: UUID
+    let agent: Agent
     var size: CGFloat = 20
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(backgroundColor)
-
-            Text(initials)
-                .font(.system(size: max(9, size * 0.42), weight: .semibold))
-                .foregroundStyle(.white)
-        }
-        .frame(width: size, height: size)
-        .accessibilityHidden(true)
+        let paletteEntry = paletteEntry
+        ShadAvatar(photo: agent.avatarPhoto, fallback: agent.avatarInitials, customSize: size)
+            .shadTheme { localTheme in
+                localTheme.colors.muted = paletteEntry.background
+                localTheme.colors.mutedForeground = paletteEntry.foreground
+            }
+            .accessibilityHidden(true)
     }
 
-    private var initials: String {
-        let parts = name.split { $0.isWhitespace || $0.isNewline }.filter { !$0.isEmpty }
-        if parts.count >= 2 {
-            return String((parts[0].prefix(1) + parts[1].prefix(1))).uppercased()
-        }
-        if let first = parts.first, let character = first.first {
-            return String(character).uppercased()
-        }
-        return "?"
-    }
-
-    private var backgroundColor: Color {
-        let colors: [Color] = [
-            Color(red: 0.31, green: 0.45, blue: 0.85),
-            Color(red: 0.18, green: 0.60, blue: 0.52),
-            Color(red: 0.75, green: 0.35, blue: 0.38),
-            Color(red: 0.61, green: 0.38, blue: 0.75),
-            Color(red: 0.85, green: 0.52, blue: 0.22),
-            Color(red: 0.22, green: 0.55, blue: 0.72),
-            Color(red: 0.45, green: 0.52, blue: 0.38),
-            Color(red: 0.70, green: 0.32, blue: 0.55)
+    private var paletteEntry: (background: Color, foreground: Color) {
+        let colors: [(background: Color, foreground: Color)] = [
+            (theme.colors.primary, theme.colors.primaryForeground),
+            (theme.colors.success, theme.colors.successForeground),
+            (theme.colors.destructive, theme.colors.destructiveForeground),
+            (theme.colors.warning, theme.colors.warningForeground),
+            (theme.colors.info, theme.colors.infoForeground),
+            (theme.colors.chart1, theme.colors.bubbleSentForeground),
+            (theme.colors.chart2, theme.colors.successForeground),
+            (
+                theme.colors.chart4,
+                theme.colorScheme == .dark
+                    ? theme.colors.foreground
+                    : theme.colors.warningForeground
+            )
         ]
-        let index = id.uuidString.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
+        let index = agent.id.uuidString.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
         return colors[Int(UInt(bitPattern: index) % UInt(colors.count))]
     }
 }
@@ -372,6 +465,7 @@ struct AgentSidebarSection: View {
     let onNewChat: () -> Void
     let onSelectDefault: () -> Void
     let onToggle: () -> Void
+    @Environment(\.shadTheme) private var theme
 
     private var isDefaultSelected: Bool {
         defaultChat.map { selectedChatID == $0.id } ?? false
@@ -379,43 +473,41 @@ struct AgentSidebarSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 0) {
+            ShadSidebarMenuItem {
                 Button(action: onSelectDefault) {
                     HStack(spacing: 10) {
-                        AgentAvatar(name: agent.displayName, id: agent.id)
+                        AgentAvatar(agent: agent)
 
                         Text(agent.displayName)
-                            .font(.body)
+                            .font(theme.font(theme.typography.sm, theme.typography.medium))
                             .lineLimit(1)
 
                         Spacer(minLength: 0)
                     }
-                    .foregroundStyle(.primary)
-                    .padding(.leading, 12)
-                    .padding(.trailing, 8)
-                    .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32, alignment: .leading)
+                    .foregroundStyle(theme.colors.sidebarForeground)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.shad(.ghost, size: .sm, fillsWidth: true))
+                .background(
+                    ShadRoundedRectangle(cornerRadius: theme.radius.md)
+                        .fill(isDefaultSelected ? theme.colors.sidebarAccent : .clear)
+                )
+                .accessibilityAddTraits(isDefaultSelected ? .isSelected : [])
 
                 if !extraChats.isEmpty {
-                    Button(action: onToggle) {
-                        Image(systemName: "chevron.down")
-                            .font(.caption.weight(.semibold))
+                    ShadSidebarMenuAction(action: onToggle) {
+                        ShadIconView(.chevronDown, size: theme.typography.xs)
                             .rotationEffect(.degrees(isCollapsed ? -90 : 0))
-                            .frame(width: 28, height: 32)
-                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
                     .help(isCollapsed ? "Show chats" : "Hide chats")
+                    .accessibilityLabel(
+                        isCollapsed
+                            ? "Show chats for \(agent.displayName)"
+                            : "Hide chats for \(agent.displayName)"
+                    )
                 }
             }
-            .frame(maxWidth: .infinity)
-            .background(
-                isDefaultSelected ? Color.primary.opacity(0.10) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 8)
-            )
-            .contentShape(Rectangle())
             .contextMenu {
                 Button("New chat") {
                     onNewChat()
@@ -429,7 +521,7 @@ struct AgentSidebarSection: View {
             }
 
             if !isCollapsed, !extraChats.isEmpty {
-                VStack(alignment: .leading, spacing: 0) {
+                ShadSidebarMenuSub {
                     ForEach(extraChats) { chat in
                         ChatRow(
                             chat: chat,
@@ -448,10 +540,6 @@ struct AgentSidebarSection: View {
                         }
                     }
                 }
-                .padding(.leading, 30)
-                .padding(.bottom, 16)
-            } else {
-                Color.clear.frame(height: 4)
             }
         }
     }
@@ -468,30 +556,17 @@ struct GroupChatSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: onToggle) {
-                HStack(spacing: 10) {
-                    Image(systemName: "person.2")
-                        .font(.body)
-                        .frame(width: 20, height: 20)
-
-                    Text("Group chats")
-                        .font(.body.weight(.medium))
-
-                    Image(systemName: "chevron.down")
-                        .font(.caption.weight(.semibold))
+            ShadSidebarMenuButton(
+                "Group chats",
+                icon: .users,
+                action: onToggle
+            ) {
+                ShadIconView(.chevronDown, size: 12)
                         .rotationEffect(.degrees(isCollapsed ? -90 : 0))
-
-                    Spacer(minLength: 0)
-                }
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 12)
-                .frame(height: 32)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
 
             if !isCollapsed {
-                VStack(alignment: .leading, spacing: 0) {
+                ShadSidebarMenuSub {
                     ForEach(chats) { chat in
                         ChatRow(
                             chat: chat,
@@ -510,7 +585,6 @@ struct GroupChatSection: View {
                         }
                     }
                 }
-                .padding(.bottom, 16)
             }
         }
     }
@@ -525,23 +599,8 @@ struct ChatRow: View {
     let onSelect: () -> Void
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 0) {
-                Text(chat.title)
-                    .font(.body)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                Spacer(minLength: 0)
-            }
-            .foregroundStyle(.primary)
-            .padding(.leading, 12)
-            .padding(.trailing, 12)
-            .frame(height: 30)
-            .background(isSelected ? Color.primary.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
+        ShadSidebarMenuSubButton(chat.title, isActive: isSelected, action: onSelect)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .contextMenu {
             if let onRename {
                 Button("Rename chat") {
@@ -568,22 +627,26 @@ struct ChatDetailView: View {
     @ObservedObject var chat: ChatViewModel
     @ObservedObject var agentStore: AgentStore
     @ObservedObject var textToSpeechToolStore: TextToSpeechToolStore
-    @ObservedObject var chatStore: ChatStore
+    @Binding var voiceErrorMessage: String?
+    let onPresentCompactionStatus: () -> Void
+    let onResetChat: () -> Void
+    let onDeleteChat: () -> Void
     @StateObject private var voiceInput = VoiceInputService()
     @StateObject private var voicePlayback = TextToSpeechPlaybackService()
+    @StateObject private var messageScroller = ShadMessageScrollerModel(
+        autoScroll: true,
+        defaultScrollPosition: .end,
+        preserveScrollOnPrepend: true
+    )
     @FocusState private var composerIsFocused: Bool
     @State private var newestMessageID: ChatMessage.ID?
-    @State private var visibleMessageIDs: Set<ChatMessage.ID> = []
     @State private var hasUnreadNewMessages = false
     @State private var voiceDraftPrefix = ""
     @State private var voiceSendIsPending = false
     @State private var readRepliesOnlyIsEnabled = false
     @State private var automaticReplyReadingStartedAt: Date?
     @State private var voiceObservedMessageIDs: Set<ChatMessage.ID> = []
-    @State private var voiceErrorMessage: String?
-    @State private var isCompactionStatusPresented = false
-    @State private var resetConfirmationIsPresented = false
-    @State private var deleteConfirmationIsPresented = false
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         VStack(spacing: 0) {
@@ -597,92 +660,74 @@ struct ChatDetailView: View {
                     .padding(.top, 10)
             }
 
-            ScrollViewReader { proxy in
-                ZStack(alignment: .bottom) {
-                    ScrollView {
-                        LazyVStack(spacing: 14) {
+            ShadMessageScrollerProvider(messageScroller) {
+                ShadMessageScroller {
+                    ShadMessageScrollerViewport {
+                        ShadMessageScrollerContent(ids: transcriptRowIDs, spacing: theme.spacing.lg) {
                             if chat.isGroupChat, chat.messages.isEmpty {
                                 GroupChatEmptyState(mentions: chat.availableAgentMentions)
                             }
 
                             ForEach(chat.messages) { message in
-                                MessageBubble(
-                                    message: message,
-                                    rendersMarkdown: chat.rendersMarkdown,
-                                    audioChunkIndexes: voicePlayback
-                                        .generatedAudioChunkIndexesByMessageID[message.id] ?? [],
-                                    playingAudioChunkIndex: voicePlayback.playingMessageID == message.id
-                                        ? voicePlayback.playingChunkIndex
-                                        : nil,
-                                    playbackCurrentTime: voicePlayback.playingMessageID == message.id
-                                        ? voicePlayback.playbackCurrentTime
-                                        : 0,
-                                    playbackDuration: voicePlayback.playingMessageID == message.id
-                                        ? voicePlayback.playbackDuration
-                                        : 0,
-                                    onToggleAudio: { chunkIndex in
-                                        toggleAudio(for: message, chunkIndex: chunkIndex)
-                                    },
-                                    onSeekAudio: { time in
-                                        voicePlayback.seekPlayback(to: time)
-                                    }
-                                )
-                                    .id(message.id)
-                                    .onAppear {
-                                        visibleMessageIDs.insert(message.id)
-
-                                        if message.id == chat.messages.last?.id {
-                                            hasUnreadNewMessages = false
+                                ShadMessageScrollerItem(messageId: message.id) {
+                                    MessageBubble(
+                                        message: message,
+                                        rendersMarkdown: chat.rendersMarkdown,
+                                        audioChunkIndexes: voicePlayback
+                                            .generatedAudioChunkIndexesByMessageID[message.id] ?? [],
+                                        playingAudioChunkIndex: voicePlayback.playingMessageID == message.id
+                                            ? voicePlayback.playingChunkIndex
+                                            : nil,
+                                        playbackCurrentTime: voicePlayback.playingMessageID == message.id
+                                            ? voicePlayback.playbackCurrentTime
+                                            : 0,
+                                        playbackDuration: voicePlayback.playingMessageID == message.id
+                                            ? voicePlayback.playbackDuration
+                                            : 0,
+                                        onToggleAudio: { chunkIndex in
+                                            toggleAudio(for: message, chunkIndex: chunkIndex)
+                                        },
+                                        onSeekAudio: { time in
+                                            voicePlayback.seekPlayback(to: time)
                                         }
-
-                                        if message.id == chat.messages.first?.id {
-                                            chat.loadOlderMessages()
-                                        }
-                                    }
-                                    .onDisappear {
-                                        visibleMessageIDs.remove(message.id)
-                                    }
+                                    )
+                                }
                             }
 
                             if voicePlayback.isGenerating {
-                                VoiceGenerationIndicator {
-                                    voicePlayback.cancelGeneration()
+                                ShadMessageScrollerItem(messageId: Self.voiceGenerationIndicatorID) {
+                                    VoiceGenerationIndicator {
+                                        voicePlayback.cancelGeneration()
+                                    }
                                 }
-                                .id(Self.voiceGenerationIndicatorID)
                             }
 
                             if chat.isResponding {
-                                TypingBubble(agentName: chat.respondingAgentName)
-                                    .id(ChatViewModel.typingIndicatorID)
+                                ShadMessageScrollerItem(messageId: ChatViewModel.typingIndicatorID) {
+                                    TypingBubble(agentName: chat.respondingAgentName)
+                                }
                             }
                         }
-                        .padding()
                     }
-                    .background(Color.secondary.opacity(0.08))
 
                     if shouldShowMoreMessagesButton {
-                        Button {
-                            hasUnreadNewMessages = false
-                            scrollToBottom(with: proxy)
-                        } label: {
-                            Label(moreMessagesButtonTitle, systemImage: "arrow.down")
-                                .font(.callout.weight(.medium))
-                                .padding(.horizontal, 18)
-                                .padding(.vertical, 10)
-                                .background(.regularMaterial, in: Capsule())
-                                .overlay {
-                                    Capsule()
-                                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
-                        .padding(.bottom, 14)
+                        ShadMessageScrollerButton(edge: .end, title: moreMessagesButtonTitle)
+                            .simultaneousGesture(TapGesture().onEnded {
+                                hasUnreadNewMessages = false
+                            })
                     }
                 }
+                .background(theme.colors.muted.opacity(0.45))
                 .onAppear {
                     voiceObservedMessageIDs = Set(chat.messages.map(\.id))
-                    scrollToBottomAfterLayout(with: proxy)
+                    newestMessageID = chat.messages.last?.id
+                    hasUnreadNewMessages = false
+                    messageScroller.onReachStart = {
+                        chat.loadOlderMessages()
+                    }
+                    if messageScroller.isAtStart {
+                        chat.loadOlderMessages()
+                    }
                 }
                 .onChange(of: chat.id) {
                     stopVoiceModes()
@@ -690,106 +735,95 @@ struct ChatDetailView: View {
                     voiceSendIsPending = false
                     voiceDraftPrefix = chat.draft
                     voiceObservedMessageIDs = Set(chat.messages.map(\.id))
-                    visibleMessageIDs.removeAll()
                     hasUnreadNewMessages = false
-                    isCompactionStatusPresented = false
-                    scrollToBottomAfterLayout(with: proxy)
+                    messageScroller.scrollToEnd(animated: false)
                 }
                 .onChange(of: chat.messages) {
                     speakNewAssistantMessagesIfNeeded()
-                    scrollToNewestMessageIfNeeded(with: proxy)
+                    scrollToNewestMessageIfNeeded()
                 }
                 .onChange(of: chat.isResponding) {
                     submitPendingVoiceDraftIfPossible()
 
                     if chat.isResponding, latestMessageIsVisible {
-                        scrollToBottom(with: proxy)
+                        messageScroller.scrollToEnd()
                     }
                 }
                 .onChange(of: voicePlayback.isGenerating) {
                     if voicePlayback.isGenerating, latestMessageIsVisible {
-                        scrollToBottom(with: proxy)
+                        messageScroller.scrollToEnd()
+                    }
+                }
+                .onChange(of: messageScroller.visibleMessageIds) {
+                    if latestMessageIsVisible {
+                        hasUnreadNewMessages = false
                     }
                 }
             }
-
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             composer
-                .padding()
-                .background(.bar)
+                .padding(theme.spacing.xl)
+                .background(theme.colors.background)
         }
         .navigationTitle(chat.displayTitle)
         .toolbar {
             ToolbarItem {
-                Menu {
-                    Toggle("Render Markdown", isOn: rendersMarkdown)
+                ShadDropdownMenu(alignment: .bottomTrailing) { _ in
+                    Group {
+                        if chat.isCompacting {
+                            ShadSpinner(size: theme.typography.base)
+                        } else {
+                            ShadIconView(.moreHorizontal, size: theme.typography.base)
+                        }
+                    }
+                    .frame(width: theme.spacing.xxl, height: theme.spacing.xxl)
+                    .contentShape(
+                        ShadRoundedRectangle(cornerRadius: theme.radius.md)
+                    )
+                } content: {
+                    ShadDropdownMenuCheckboxItem("Render Markdown", isOn: rendersMarkdown)
 
-                    Divider()
+                    ShadDropdownMenuSeparator()
 
-                    Button {
+                    ShadDropdownMenuItem(
+                        chat.isCompacting ? "Compacting…" : "Compact",
+                        icon: chat.isCompacting
+                            ? .loaderCircle
+                            : .custom("rectangle.compress.vertical")
+                    ) {
                         Task {
                             await chat.compactConversation()
-                        }
-                    } label: {
-                        if chat.isCompacting {
-                            Label("Compacting…", systemImage: "ellipsis")
-                        } else {
-                            Label("Compact", systemImage: "rectangle.compress.vertical")
                         }
                     }
                     .disabled(chat.isResponding || chat.isCompacting)
 
-                    Button("Compaction Status") {
-                        isCompactionStatusPresented = true
+                    ShadDropdownMenuItem("Compaction Status", icon: .info) {
+                        onPresentCompactionStatus()
                     }
 
-                    Divider()
+                    ShadDropdownMenuSeparator()
 
-                    Button("Reset Chat") {
-                        resetConfirmationIsPresented = true
+                    ShadDropdownMenuItem("Reset Chat", icon: .refresh) {
+                        onResetChat()
                     }
                     .disabled(chat.isResponding || chat.isCompacting)
 
                     if chat.canDelete {
-                        Button("Delete Chat", role: .destructive) {
-                            deleteConfirmationIsPresented = true
+                        ShadDropdownMenuItem(
+                            "Delete Chat",
+                            icon: .trash,
+                            variant: .destructive
+                        ) {
+                            onDeleteChat()
                         }
                         .disabled(chat.isResponding)
                     }
-                } label: {
-                    if chat.isCompacting {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "ellipsis.circle")
-                    }
                 }
                 .help("Chat actions")
+                .accessibilityLabel("Chat actions")
             }
-        }
-        .sheet(isPresented: $isCompactionStatusPresented) {
-            CompactionStatusView(chat: chat)
-        }
-        .confirmationDialog(
-            "Reset chat?",
-            isPresented: $resetConfirmationIsPresented,
-            titleVisibility: .visible
-        ) {
-            Button("Reset Chat", role: .destructive) {
-                chatStore.resetChat(chat)
-            }
-        } message: {
-            Text("Previous messages stay saved but will no longer appear or be sent to the model.")
-        }
-        .confirmationDialog(
-            "Delete chat?",
-            isPresented: $deleteConfirmationIsPresented,
-            titleVisibility: .visible
-        ) {
-            Button("Delete Chat", role: .destructive) {
-                chatStore.deleteChat(chat)
-            }
-        } message: {
-            Text("This chat will be removed from the sidebar. This cannot be undone.")
         }
         .onDisappear {
             stopVoiceModes()
@@ -811,13 +845,6 @@ struct ChatDetailView: View {
                 VoiceChimePlayer.shared.play(.dictationStarted)
             }
         }
-        .alert("Voice error", isPresented: voiceErrorIsPresented) {
-            Button("OK") {
-                voiceErrorMessage = nil
-            }
-        } message: {
-            Text(voiceErrorMessage ?? "Voice input could not be started.")
-        }
     }
 
     private var rendersMarkdown: Binding<Bool> {
@@ -828,22 +855,36 @@ struct ChatDetailView: View {
     }
 
     private var modelStatus: some View {
-        HStack(spacing: 10) {
-            Image(
-                systemName: chat.isGroupChat
-                    ? "person.2.fill"
-                    : chat.canSend ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
-            )
-            .foregroundStyle(chat.isGroupChat ? Color.accentColor : chat.canSend ? .green : .orange)
-
-            Text(chat.availabilityMessage)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-
-            Spacer()
+        ShadItem(variant: .muted, size: .sm) {
+            ShadItemMedia(variant: .default, size: theme.spacing.xxl) {
+                ShadIconView(modelStatusIcon, size: theme.typography.base)
+                    .foregroundStyle(modelStatusColor)
+            }
+            ShadItemContent {
+                ShadItemDescription(chat.availabilityMessage)
+            }
         }
-        .padding(12)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var modelStatusIcon: ShadIcon {
+        if chat.isGroupChat { return .users }
+        return chat.canSend ? .circleCheck : .triangleAlert
+    }
+
+    private var modelStatusColor: Color {
+        if chat.isGroupChat { return theme.colors.primary }
+        return chat.canSend ? theme.colors.success : theme.colors.warning
+    }
+
+    private var transcriptRowIDs: [AnyHashable] {
+        var ids = chat.messages.map { AnyHashable($0.id) }
+        if voicePlayback.isGenerating {
+            ids.append(AnyHashable(Self.voiceGenerationIndicatorID))
+        }
+        if chat.isResponding {
+            ids.append(AnyHashable(ChatViewModel.typingIndicatorID))
+        }
+        return ids
     }
 
     private var shouldShowMoreMessagesButton: Bool {
@@ -856,13 +897,15 @@ struct ChatDetailView: View {
 
     private var latestMessageIsVisible: Bool {
         guard let latestMessageID = chat.messages.last?.id else { return true }
-        return visibleMessageIDs.contains(latestMessageID)
+        return messageScroller.visibleMessageIds.contains(AnyHashable(latestMessageID))
     }
 
     private var isScrolledMoreThanFiveMessagesFromLatest: Bool {
-        guard !visibleMessageIDs.isEmpty,
+        guard !messageScroller.visibleMessageIds.isEmpty,
               chat.messages.count > 5,
-              let newestVisibleIndex = chat.messages.lastIndex(where: { visibleMessageIDs.contains($0.id) }) else {
+              let newestVisibleIndex = chat.messages.lastIndex(where: {
+                  messageScroller.visibleMessageIds.contains(AnyHashable($0.id))
+              }) else {
             return false
         }
 
@@ -870,13 +913,15 @@ struct ChatDetailView: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            HStack(alignment: .bottom, spacing: 4) {
+        HStack(alignment: .bottom, spacing: theme.spacing.lg) {
+            HStack(alignment: .bottom, spacing: theme.spacing.xs) {
                 TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
                     .textFieldStyle(.plain)
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.foreground)
                     .lineLimit(1...5)
-                    .padding(.leading, 12)
-                    .padding(.vertical, 12)
+                    .padding(.leading, theme.spacing.lg)
+                    .padding(.vertical, theme.spacing.lg)
                     .focused($composerIsFocused)
                     .submitLabel(.send)
                     .onSubmit {
@@ -884,75 +929,81 @@ struct ChatDetailView: View {
                     }
                     .disabled(!chat.canSend || chat.isResponding || voiceInput.isActive)
 
-                HStack(spacing: 2) {
+                HStack(spacing: theme.spacing(0.5)) {
                     replyReadingModeButton
                     voiceModeButton
                 }
-                .padding(.trailing, 6)
-                .padding(.bottom, 4)
+                .padding(.trailing, theme.spacing.sm)
+                .padding(.bottom, theme.spacing.xs)
             }
-            .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .background(
+                ShadRoundedRectangle(cornerRadius: theme.radius.lg)
+                    .fill(theme.colors.muted.opacity(0.65))
+            )
+            .overlay {
+                ShadRoundedRectangle(cornerRadius: theme.radius.lg)
+                    .strokeBorder(theme.colors.input, lineWidth: theme.borderWidth)
+            }
             .modifier(VoiceDictationGlow(isActive: voiceInput.isTranscribing))
 
-            Button {
+            ShadButton(
+                icon: .custom("paperplane.fill"),
+                size: .iconLG,
+                accessibilityLabel: "Send message"
+            ) {
                 submitDraft()
-            } label: {
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 17, weight: .semibold))
-                    .frame(width: 40, height: 40)
             }
-            .buttonStyle(.borderedProminent)
             .disabled(!chat.canSubmitDraft || voiceInput.isActive)
             .help("Send message")
         }
     }
 
     private var voiceModeButton: some View {
-        Button {
+        let isLoading = voiceInput.state == .requestingPermission || voiceInput.state == .preparing
+        return ShadButton(
+            icon: .custom("mic.fill"),
+            variant: voiceInput.isActive ? .secondary : .ghost,
+            size: .icon,
+            shape: .pill,
+            accessibilityLabel: voiceModeAccessibilityLabel,
+            isLoading: isLoading
+        ) {
             toggleVoiceMode()
-        } label: {
-            Group {
-                if voiceInput.state == .requestingPermission || voiceInput.state == .preparing {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(voiceInput.isActive ? Color.red : Color.secondary)
-                }
-            }
-            .frame(width: 32, height: 32)
-            .background {
-                if voiceInput.isActive {
-                    Circle()
-                        .fill(Color.red.opacity(0.12))
-                }
-            }
-            .contentShape(Circle())
         }
-        .buttonStyle(.plain)
+        .shadTheme { localTheme in
+            if voiceInput.isActive {
+                localTheme.colors.secondary = localTheme.colors.destructive.opacity(
+                    localTheme.colorScheme == .dark ? 0.20 : 0.12
+                )
+                localTheme.colors.secondaryForeground = localTheme.colors.destructive
+            }
+        }
         .disabled(!voiceInput.isActive && (!chat.canSend || !voiceModeIsConfigured))
         .help(voiceModeHelpText)
         .accessibilityLabel(voiceModeAccessibilityLabel)
     }
 
     private var replyReadingModeButton: some View {
-        Button {
+        ShadButton(
+            icon: .custom(
+                readRepliesOnlyIsEnabled ? "speaker.wave.2.fill" : "speaker.wave.2"
+            ),
+            variant: readRepliesOnlyIsEnabled ? .secondary : .ghost,
+            size: .icon,
+            shape: .pill,
+            accessibilityLabel: readRepliesOnlyIsEnabled
+                ? "Turn off reading replies"
+                : "Turn on reading replies without dictation"
+        ) {
             toggleReplyReadingMode()
-        } label: {
-            Image(systemName: readRepliesOnlyIsEnabled ? "speaker.wave.2.fill" : "speaker.wave.2")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(readRepliesOnlyIsEnabled ? Color.accentColor : Color.secondary)
-                .frame(width: 32, height: 32)
-                .background {
-                    if readRepliesOnlyIsEnabled {
-                        Circle()
-                            .fill(Color.accentColor.opacity(0.12))
-                    }
-                }
-                .contentShape(Circle())
         }
-        .buttonStyle(.plain)
+        .shadTheme { localTheme in
+            if readRepliesOnlyIsEnabled {
+                let blueAccent = ChatShadTheme.blueAccent(for: localTheme.colorScheme)
+                localTheme.colors.secondary = blueAccent.opacity(0.15)
+                localTheme.colors.secondaryForeground = blueAccent
+            }
+        }
         .disabled(
             !readRepliesOnlyIsEnabled
                 && (!chat.canSend || !replyReadingIsConfigured)
@@ -1051,17 +1102,6 @@ struct ChatDetailView: View {
 
     private var automaticReplyReadingIsEnabled: Bool {
         voiceInput.isActive || readRepliesOnlyIsEnabled
-    }
-
-    private var voiceErrorIsPresented: Binding<Bool> {
-        Binding(
-            get: { voiceErrorMessage != nil },
-            set: { isPresented in
-                if !isPresented {
-                    voiceErrorMessage = nil
-                }
-            }
-        )
     }
 
     private func toggleVoiceMode() {
@@ -1225,49 +1265,21 @@ struct ChatDetailView: View {
         composerIsFocused = true
     }
 
-    private func scrollToNewestMessageIfNeeded(with proxy: ScrollViewProxy) {
+    private func scrollToNewestMessageIfNeeded() {
         let previousNewestMessageID = newestMessageID
         let latestMessageID = chat.messages.last?.id
         defer { newestMessageID = latestMessageID }
 
         guard latestMessageID != previousNewestMessageID else { return }
 
-        if previousNewestMessageID == nil || previousNewestMessageID.map(visibleMessageIDs.contains) == true {
+        if previousNewestMessageID == nil
+            || previousNewestMessageID.map({
+                messageScroller.visibleMessageIds.contains(AnyHashable($0))
+            }) == true {
             hasUnreadNewMessages = false
-            scrollToBottom(with: proxy)
+            messageScroller.scrollToEnd()
         } else {
             hasUnreadNewMessages = true
-        }
-    }
-
-    private func scrollToBottomAfterLayout(with proxy: ScrollViewProxy) {
-        newestMessageID = chat.messages.last?.id
-        hasUnreadNewMessages = false
-
-        Task { @MainActor in
-            await Task.yield()
-            scrollToBottom(with: proxy, animated: false)
-        }
-    }
-
-    private func scrollToBottom(with proxy: ScrollViewProxy, animated: Bool = true) {
-        let target: UUID?
-        if chat.isResponding {
-            target = ChatViewModel.typingIndicatorID
-        } else if voicePlayback.isGenerating {
-            target = Self.voiceGenerationIndicatorID
-        } else {
-            target = chat.messages.last?.id
-        }
-
-        guard let target else { return }
-
-        if animated {
-            withAnimation(.snappy) {
-                proxy.scrollTo(target, anchor: .bottom)
-            }
-        } else {
-            proxy.scrollTo(target, anchor: .bottom)
         }
     }
 }
@@ -1283,34 +1295,39 @@ struct MessageBubble: View {
     let onSeekAudio: (TimeInterval) -> Void
 
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.shadTheme) private var theme
     @State private var generationTurn: GenerationTurn?
 
     var body: some View {
         Group {
             if message.role == .assistant {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .bottom, spacing: 6) {
-                        bubble
+                ShadMessage(align: .start, spacing: theme.spacing.sm) {
+                    ShadMessageContent {
+                        if let authorName = message.authorName {
+                            ShadMessageHeader(authorName)
+                        }
 
-                        audioControls
-                        inspectorControl
+                        HStack(alignment: .bottom, spacing: theme.spacing.sm) {
+                            bubble
+                            audioControls
+                            inspectorControl
+                        }
 
-                        Spacer(minLength: 40)
-                    }
-
-                    if playingAudioChunkIndex != nil {
-                        AudioPlaybackTimeline(
-                            currentTime: playbackCurrentTime,
-                            duration: playbackDuration,
-                            onSeek: onSeekAudio
-                        )
-                        .frame(maxWidth: 340)
+                        if playingAudioChunkIndex != nil {
+                            AudioPlaybackTimeline(
+                                currentTime: playbackCurrentTime,
+                                duration: playbackDuration,
+                                onSeek: onSeekAudio
+                            )
+                            .frame(maxWidth: 340)
+                        }
                     }
                 }
             } else {
-                HStack(alignment: .bottom, spacing: 6) {
-                    Spacer(minLength: 40)
-                    bubble
+                ShadMessage(align: .end, spacing: theme.spacing.sm) {
+                    ShadMessageContent {
+                        bubble
+                    }
                 }
             }
         }
@@ -1322,28 +1339,37 @@ struct MessageBubble: View {
     @ViewBuilder
     private var audioControls: some View {
         if !audioChunkIndexes.isEmpty {
-            VStack(spacing: 4) {
+            VStack(spacing: theme.spacing.xs) {
                 ForEach(audioChunkIndexes, id: \.self) { chunkIndex in
                     let isPlaying = playingAudioChunkIndex == chunkIndex
-                    Button {
+                    ShadButton(
+                        variant: isPlaying ? .secondary : .ghost,
+                        size: .iconSM,
+                        shape: .pill
+                    ) {
                         onToggleAudio(chunkIndex)
                     } label: {
                         ZStack(alignment: .bottomTrailing) {
-                            Image(systemName: isPlaying ? "speaker.wave.2.fill" : "speaker.wave.2")
-                                .font(.system(size: 12, weight: .semibold))
+                            ShadIconView(
+                                .custom(isPlaying ? "speaker.wave.2.fill" : "speaker.wave.2"),
+                                size: theme.typography.xs,
+                                weight: theme.typography.semibold
+                            )
 
                             if audioChunkIndexes.count > 1 {
                                 Text("\(chunkIndex + 1)")
-                                    .font(.system(size: 8, weight: .bold))
+                                    .font(theme.font(theme.typography.xs * 0.67, .bold))
                                     .offset(x: 3, y: 3)
                             }
                         }
-                        .foregroundStyle(isPlaying ? Color.accentColor : Color.secondary)
-                        .frame(width: 26, height: 26)
-                        .background(Color.secondary.opacity(0.10), in: Circle())
-                        .contentShape(Circle())
                     }
-                    .buttonStyle(.plain)
+                    .shadTheme { localTheme in
+                        if isPlaying {
+                            let blueAccent = ChatShadTheme.blueAccent(for: localTheme.colorScheme)
+                            localTheme.colors.secondary = blueAccent.opacity(0.15)
+                            localTheme.colors.secondaryForeground = blueAccent
+                        }
+                    }
                     .help(isPlaying ? "Stop audio" : "Replay audio part \(chunkIndex + 1)")
                     .accessibilityLabel(isPlaying ? "Stop audio" : "Replay audio part \(chunkIndex + 1)")
                 }
@@ -1360,21 +1386,16 @@ struct MessageBubble: View {
     }
 
     private var bubble: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            if message.role == .assistant, let authorName = message.authorName {
-                Text(authorName)
-                    .font(.body.weight(.bold))
+        ShadBubble(
+            variant: message.role == .user ? .sent : .received,
+            align: message.role == .user ? .end : .start
+        ) {
+            ShadBubbleContent {
+                messageText
+                    .textSelection(.enabled)
             }
-
-            messageText
-                .textSelection(.enabled)
-                .font(.body)
         }
-            .foregroundStyle(message.role == .user ? .white : .primary)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(message.role == .user ? Color.accentColor : Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
-            .frame(maxWidth: 620, alignment: message.role == .user ? .trailing : .leading)
+        .frame(maxWidth: 620, alignment: message.role == .user ? .trailing : .leading)
     }
 
     @ViewBuilder
@@ -1401,6 +1422,7 @@ struct AudioPlaybackTimeline: View {
     let currentTime: TimeInterval
     let duration: TimeInterval
     let onSeek: (TimeInterval) -> Void
+    @Environment(\.shadTheme) private var theme
 
     private var safeDuration: TimeInterval {
         guard duration.isFinite, duration > 0 else { return 0.01 }
@@ -1413,29 +1435,27 @@ struct AudioPlaybackTimeline: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Text(formattedTime(safeCurrentTime))
-                .frame(minWidth: 30, alignment: .trailing)
+        ShadItem(variant: .muted, size: .xs) {
+            HStack(spacing: theme.spacing.md) {
+                Text(formattedTime(safeCurrentTime))
+                    .frame(minWidth: 30, alignment: .trailing)
 
-            Slider(
-                value: Binding(
-                    get: { safeCurrentTime },
-                    set: onSeek
-                ),
-                in: 0...safeDuration
-            )
-            .controlSize(.small)
-            .accessibilityLabel("Audio playback position")
-            .accessibilityValue("\(formattedTime(safeCurrentTime)) of \(formattedTime(duration))")
+                ShadSlider(
+                    value: Binding(
+                        get: { safeCurrentTime },
+                        set: onSeek
+                    ),
+                    in: 0...safeDuration
+                )
+                .accessibilityLabel("Audio playback position")
+                .accessibilityValue("\(formattedTime(safeCurrentTime)) of \(formattedTime(duration))")
 
-            Text(formattedTime(duration))
-                .frame(minWidth: 30, alignment: .leading)
+                Text(formattedTime(duration))
+                    .frame(minWidth: 30, alignment: .leading)
+            }
+            .font(theme.monoFont(theme.typography.xs).monospacedDigit())
+            .foregroundStyle(theme.colors.mutedForeground)
         }
-        .font(.caption2.monospacedDigit())
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(Color.secondary.opacity(0.10), in: Capsule())
     }
 
     private func formattedTime(_ time: TimeInterval) -> String {
@@ -1449,20 +1469,8 @@ struct TypingBubble: View {
     let agentName: String?
 
     var body: some View {
-        HStack {
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.small)
-
-                Text(agentName.map { "\($0) is thinking" } ?? "Thinking")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
-
-            Spacer(minLength: 40)
+        ShadMessage(align: .start) {
+            ShadTypingIndicator(agentName.map { "\($0) is thinking" } ?? "Thinking")
         }
     }
 }
@@ -1471,29 +1479,16 @@ struct VoiceGenerationIndicator: View {
     let onCancel: () -> Void
 
     var body: some View {
-        HStack {
-            Button(action: onCancel) {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-
-                    Text("Generating audio…")
-                        .font(.callout)
-
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.callout)
-                        .foregroundStyle(.tertiary)
+        ShadMessage(align: .start) {
+            ShadMarker(action: onCancel) {
+                ShadMarkerIcon {
+                    ShadSpinner(size: 14)
                 }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+                ShadMarkerContent("Generating audio…", shimmer: true)
+                ShadMarkerIcon(.circleX)
             }
-            .buttonStyle(.plain)
             .help("Cancel remaining audio generation")
             .accessibilityLabel("Cancel audio generation")
-
-            Spacer(minLength: 40)
         }
     }
 }
@@ -1501,53 +1496,79 @@ struct VoiceGenerationIndicator: View {
 struct GroupChatConfigurationView: View {
     @ObservedObject var chat: ChatViewModel
     @State private var instructionsAreExpanded = false
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Label("Participants", systemImage: "person.2")
-                    .font(.callout.weight(.medium))
+        ShadCard(size: .sm) {
+            ShadCardHeader {
+                HStack(spacing: theme.spacing.md) {
+                    ShadIconView(.users, size: theme.typography.sm)
+                        .foregroundStyle(theme.colors.primary)
+                    ShadCardTitle("Participants")
 
-                if chat.groupParticipantMentions.isEmpty {
-                    Text("Add one with an @mention")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(chat.groupParticipantMentions, id: \.self) { mention in
-                                Text(mention)
-                                    .font(.caption.weight(.medium))
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 4)
-                                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    if chat.groupParticipantMentions.isEmpty {
+                        ShadCardDescription("Add one with an @mention")
+                    } else {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: theme.spacing.sm) {
+                                ForEach(chat.groupParticipantMentions, id: \.self) { mention in
+                                    ShadBadge(
+                                        mention,
+                                        variant: .secondary,
+                                        color: .blue
+                                    )
+                                }
                             }
                         }
                     }
-                }
 
-                Spacer(minLength: 0)
+                    Spacer(minLength: 0)
+                }
             }
 
-            DisclosureGroup("Group instructions", isExpanded: $instructionsAreExpanded) {
-                VStack(alignment: .leading, spacing: 6) {
-                    TextEditor(text: groupInstructions)
-                        .font(.body)
-                        .frame(minHeight: 72, maxHeight: 120)
-                        .padding(6)
-                        .scrollContentBackground(.hidden)
-                        .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            ShadCardContent {
+                VStack(alignment: .leading, spacing: theme.spacing.md) {
+                    ShadButton(
+                        variant: .ghost,
+                        size: .sm,
+                        fillsWidth: true
+                    ) {
+                        withAnimation(theme.interactionAnimation) {
+                            instructionsAreExpanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: theme.spacing.sm) {
+                            Text("Group instructions")
+                            Spacer(minLength: 0)
+                            ShadIconView(.chevronDown, size: theme.typography.xs)
+                                .rotationEffect(.degrees(instructionsAreExpanded ? 0 : -90))
+                        }
+                    }
+                    .accessibilityValue(instructionsAreExpanded ? "Expanded" : "Collapsed")
+                    .accessibilityHint(
+                        instructionsAreExpanded
+                            ? "Collapse group instructions"
+                            : "Expand group instructions"
+                    )
 
-                    Text("These instructions are sent with each agent's individual instructions.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if instructionsAreExpanded {
+                        ShadField {
+                            ShadTextarea(
+                                "Instructions for every participant",
+                                text: groupInstructions,
+                                minHeight: 72,
+                                maxHeight: 120
+                            )
+                            .accessibilityLabel("Group instructions")
+                            ShadFieldDescription(
+                                "These instructions are sent with each agent's individual instructions."
+                            )
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                 }
-                .padding(.top, 8)
             }
-            .font(.callout.weight(.medium))
         }
-        .padding(12)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var groupInstructions: Binding<String> {
@@ -1560,23 +1581,24 @@ struct GroupChatConfigurationView: View {
 
 struct GroupChatEmptyState: View {
     let mentions: [String]
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "person.2")
-                .font(.system(size: 28))
-                .foregroundStyle(.secondary)
+        VStack(spacing: theme.spacing.lg) {
+            ShadIconView(.users, size: theme.typography.xxl)
+                .foregroundStyle(theme.colors.mutedForeground)
 
             Text("Start the discussion")
-                .font(.headline)
+                .font(theme.font(theme.typography.lg, theme.typography.semibold))
+                .foregroundStyle(theme.colors.foreground)
 
             Text(emptyStateDescription)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+                .font(theme.font(theme.typography.sm))
+                .foregroundStyle(theme.colors.mutedForeground)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: 420)
-        .padding(.vertical, 56)
+        .padding(.vertical, theme.spacing(14))
     }
 
     private var emptyStateDescription: String {
@@ -1605,7 +1627,7 @@ struct AgentCommands: Commands {
 
 private struct CompactionStatusView: View {
     @ObservedObject var chat: ChatViewModel
-    @Environment(\.dismiss) private var dismiss
+    @Environment(\.shadTheme) private var theme
     @State private var tokenCount: Int?
 
     private var status: ConversationCompactionStatus {
@@ -1613,67 +1635,60 @@ private struct CompactionStatusView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: theme.spacing.xl) {
             HStack {
-                Text("Compaction Status")
-                    .font(.headline)
+                ShadDialogTitle("Compaction Status")
                 Spacer()
-                Button("Done") {
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
+                ShadDialogClose("Done")
+                    .keyboardShortcut(.cancelAction)
             }
 
             if status.hasDigest {
-                VStack(alignment: .leading, spacing: 8) {
+                ShadItemGroup(isBordered: true) {
                     if let compactedAt = status.compactedAt {
-                        LabeledContent("Last compacted") {
-                            Text(compactedAt.formatted(date: .abbreviated, time: .shortened))
-                        }
+                        statusRow(
+                            "Last compacted",
+                            compactedAt.formatted(date: .abbreviated, time: .shortened)
+                        )
                     } else {
-                        LabeledContent("Last compacted") {
-                            Text("Unknown")
-                        }
+                        statusRow("Last compacted", "Unknown")
                     }
 
                     if let covered = status.coveredMessageCount {
-                        LabeledContent("Messages covered") {
-                            Text("\(covered)")
-                        }
+                        ShadItemSeparator()
+                        statusRow("Messages covered", "\(covered)")
                     }
 
-                    LabeledContent("Summary tokens") {
-                        if let tokenCount {
-                            Text("\(tokenCount)")
-                        } else {
-                            Text("About \(status.estimatedTokens)")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
+                    ShadItemSeparator()
+                    statusRow(
+                        "Summary tokens",
+                        tokenCount.map(String.init) ?? "About \(status.estimatedTokens)"
+                    )
                 }
-                .font(.callout)
 
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: theme.spacing.sm) {
                     Text("Current summary")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .font(theme.font(theme.typography.xs, theme.typography.semibold))
+                        .foregroundStyle(theme.colors.mutedForeground)
 
-                    ScrollView {
-                        Text(status.summary)
-                            .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    ShadItem(variant: .muted, size: .sm) {
+                        ScrollView {
+                            Text(status.summary)
+                                .font(theme.monoFont(theme.typography.sm))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
-                    .padding(10)
-                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                 }
             } else {
-                Text("This chat has not been compacted yet. Older messages are sent in full until they exceed the model’s context window.")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                ShadItem(variant: .muted, size: .sm) {
+                    ShadItemDescription(
+                        "This chat has not been compacted yet. Older messages are sent in full until they exceed the model’s context window."
+                    )
+                }
+                .frame(maxHeight: .infinity, alignment: .top)
             }
         }
-        .padding(20)
         .frame(minWidth: 480, idealWidth: 560, minHeight: 360, idealHeight: 480)
         .task(id: status.summary) {
             guard status.hasDigest else {
@@ -1682,6 +1697,19 @@ private struct CompactionStatusView: View {
             }
             tokenCount = nil
             tokenCount = await ConversationCompaction.tokenCount(for: status.summary)
+        }
+    }
+
+    private func statusRow(_ title: String, _ value: String) -> some View {
+        ShadItem(size: .xs) {
+            ShadItemContent {
+                ShadItemTitle(title)
+            }
+            ShadItemActions {
+                Text(value)
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.mutedForeground)
+            }
         }
     }
 }
@@ -1757,5 +1785,6 @@ struct ContentViewPreview: View {
             chatStore: chatStore
         )
             .modelContainer(modelContainer)
+            .shadTheme(ChatShadTheme.theme)
     }
 }

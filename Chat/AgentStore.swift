@@ -1,14 +1,18 @@
 import Combine
 import Foundation
+import os
 import SwiftData
 
 @MainActor
 final class AgentStore: ObservableObject {
+    private static let logger = Logger(subsystem: "Chat", category: "Agents")
+
     @Published private(set) var agents: [Agent] = []
     @Published private(set) var heartbeats: [AgentHeartbeat] = []
     @Published private(set) var heartbeatRuns: [HeartbeatRun] = []
     @Published private(set) var hasOlderHeartbeatRuns = false
     @Published var selectedAgentID: Agent.ID?
+    let agentConfigurationDidChange = PassthroughSubject<Agent.ID, Never>()
 
     private static let heartbeatRunBatchSize = 200
 
@@ -18,6 +22,10 @@ final class AgentStore: ObservableObject {
     var selectedAgent: Agent? {
         guard let selectedAgentID else { return nil }
         return agents.first { $0.id == selectedAgentID }
+    }
+
+    var defaultAgent: Agent? {
+        agents.first
     }
 
     init(modelContext: ModelContext) {
@@ -34,12 +42,25 @@ final class AgentStore: ObservableObject {
         loadAgents(selecting: agent.id)
     }
 
-    func removeSelectedAgent() {
-        guard let selectedAgentID,
-              let index = agents.firstIndex(where: { $0.id == selectedAgentID }) else {
-            return
+    func isDefaultAgent(_ agent: Agent) -> Bool {
+        defaultAgent?.id == agent.id
+    }
+
+    func canDeleteAgent(_ agent: Agent) -> Bool {
+        !isDefaultAgent(agent)
+    }
+
+    @discardableResult
+    func removeAgent(
+        id agentID: Agent.ID,
+        beforeSaving: () -> Void
+    ) -> Bool {
+        guard let index = agents.firstIndex(where: { $0.id == agentID }),
+              index > agents.startIndex else {
+            return false
         }
 
+        let previousSelection = selectedAgentID
         let nextSelection: Agent.ID?
         if agents.count <= 1 {
             nextSelection = nil
@@ -48,14 +69,21 @@ final class AgentStore: ObservableObject {
             nextSelection = agents[nextIndex == index ? index + 1 : nextIndex].id
         }
 
-        let heartbeatsToDelete = heartbeats.filter { $0.agentID == selectedAgentID }
+        let heartbeatsToDelete = heartbeats.filter { $0.agentID == agentID }
         for heartbeat in heartbeatsToDelete {
             modelContext.delete(heartbeat)
         }
-        heartbeats.removeAll { $0.agentID == selectedAgentID }
+        heartbeats.removeAll { $0.agentID == agentID }
         modelContext.delete(agents[index])
-        saveChanges()
+        beforeSaving()
+        guard saveChanges() else {
+            modelContext.rollback()
+            loadAgents(selecting: previousSelection)
+            loadHeartbeats()
+            return false
+        }
         loadAgents(selecting: nextSelection)
+        return true
     }
 
     func updateAgentName(id: Agent.ID, name: String) {
@@ -64,12 +92,31 @@ final class AgentStore: ObservableObject {
         agent.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         saveChanges()
         objectWillChange.send()
+        agentConfigurationDidChange.send(id)
     }
 
     func updateAgentSoul(id: Agent.ID, soul: String) {
         guard let agent = agents.first(where: { $0.id == id }) else { return }
 
         agent.soul = soul
+        saveChanges()
+        objectWillChange.send()
+        agentConfigurationDidChange.send(id)
+    }
+
+    func updateAgentAvatar(
+        id: Agent.ID,
+        imageData: Data?,
+        cropZoom: Double,
+        cropOffsetX: Double,
+        cropOffsetY: Double
+    ) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
+
+        agent.avatarImageData = imageData
+        agent.avatarCropZoom = imageData == nil ? nil : max(1, cropZoom)
+        agent.avatarCropOffsetX = imageData == nil ? nil : cropOffsetX
+        agent.avatarCropOffsetY = imageData == nil ? nil : cropOffsetY
         saveChanges()
         objectWillChange.send()
     }
@@ -137,6 +184,7 @@ final class AgentStore: ObservableObject {
         agent.modelIdentifier = modelIdentifier
         saveChanges()
         objectWillChange.send()
+        agentConfigurationDidChange.send(id)
     }
 
     func setTool(_ toolID: AgentToolID, enabled: Bool, for agentID: Agent.ID) {
@@ -208,24 +256,46 @@ final class AgentStore: ObservableObject {
         heartbeats.filter { $0.agentID == agentID }
     }
 
-    func addHeartbeat(to agentID: Agent.ID) {
-        let heartbeat = AgentHeartbeat(agentID: agentID)
+    @discardableResult
+    func addHeartbeat(to agentID: Agent.ID) -> AgentHeartbeat? {
+        let heartbeat = AgentHeartbeat(
+            agentID: agentID,
+            title: nextAvailableHeartbeatTitle(for: agentID)
+        )
         modelContext.insert(heartbeat)
         heartbeats.append(heartbeat)
-        saveChanges()
+        guard saveChanges() else {
+            modelContext.rollback()
+            heartbeats.removeAll { $0.id == heartbeat.id }
+            objectWillChange.send()
+            return nil
+        }
         objectWillChange.send()
+        return heartbeat
     }
 
-    func removeHeartbeat(_ heartbeat: AgentHeartbeat) {
+    @discardableResult
+    func removeHeartbeat(_ heartbeat: AgentHeartbeat) -> Bool {
         modelContext.delete(heartbeat)
         heartbeats.removeAll { $0.id == heartbeat.id }
-        saveChanges()
+        guard saveChanges() else {
+            modelContext.rollback()
+            loadHeartbeats()
+            objectWillChange.send()
+            return false
+        }
         objectWillChange.send()
+        return true
     }
 
     func updateHeartbeatInstruction(_ heartbeat: AgentHeartbeat, instruction: String) {
         heartbeat.instruction = instruction
-        heartbeat.lastError = nil
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatTitle(_ heartbeat: AgentHeartbeat, title: String) {
+        heartbeat.title = title
         saveChanges()
         objectWillChange.send()
     }
@@ -244,7 +314,6 @@ final class AgentStore: ObservableObject {
         heartbeat.nextRunAt = isEnabled
             ? Date().addingTimeInterval(TimeInterval(heartbeat.normalizedIntervalMinutes * 60))
             : nil
-        heartbeat.lastError = nil
         saveChanges()
         objectWillChange.send()
     }
@@ -256,7 +325,6 @@ final class AgentStore: ObservableObject {
     ) {
         heartbeat.targetKindRawValue = targetKind.rawValue
         heartbeat.targetChatID = targetChatID
-        heartbeat.lastError = nil
         saveChanges()
         objectWillChange.send()
     }
@@ -266,7 +334,6 @@ final class AgentStore: ObservableObject {
         modelIdentifier: String?
     ) {
         heartbeat.modelIdentifier = modelIdentifier
-        heartbeat.lastError = nil
         saveChanges()
         objectWillChange.send()
     }
@@ -301,7 +368,6 @@ final class AgentStore: ObservableObject {
         claimedHeartbeat.nextRunAt = date.addingTimeInterval(
             TimeInterval(claimedHeartbeat.normalizedIntervalMinutes * 60)
         )
-        claimedHeartbeat.lastError = nil
 
         for heartbeat in dueHeartbeats.dropFirst() {
             deferHeartbeatByInterval(heartbeat, from: date)
@@ -343,7 +409,6 @@ final class AgentStore: ObservableObject {
         heartbeat.nextRunAt = scheduledDate.addingTimeInterval(
             TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
         )
-        heartbeat.lastError = nil
         saveChanges()
         objectWillChange.send()
     }
@@ -360,7 +425,6 @@ final class AgentStore: ObservableObject {
         heartbeat.nextRunAt = date.addingTimeInterval(
             TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
         )
-        heartbeat.lastError = nil
         saveChanges()
         objectWillChange.send()
         return heartbeat
@@ -487,6 +551,8 @@ final class AgentStore: ObservableObject {
             heartbeats = []
         }
 
+        backfillHeartbeatTitles()
+
         let now = Date()
         for heartbeat in heartbeats where heartbeat.isEnabled && heartbeat.nextRunAt == nil {
             heartbeat.nextRunAt = now.addingTimeInterval(
@@ -494,6 +560,56 @@ final class AgentStore: ObservableObject {
             )
         }
         saveChanges()
+    }
+
+    private func nextAvailableHeartbeatTitle(for agentID: Agent.ID) -> String {
+        let usedTitles = Set(
+            heartbeats(for: agentID).map { $0.displayTitle.lowercased() }
+        )
+        var number = 1
+        while usedTitles.contains("heartbeat \(number)") {
+            number += 1
+        }
+        return "Heartbeat \(number)"
+    }
+
+    private func backfillHeartbeatTitles() {
+        var usedTitlesByAgent: [Agent.ID: Set<String>] = [:]
+        for heartbeat in heartbeats {
+            guard let title = normalizedHeartbeatTitle(heartbeat.title) else { continue }
+            usedTitlesByAgent[heartbeat.agentID, default: []].insert(title.lowercased())
+        }
+
+        for heartbeat in heartbeats where heartbeat.title == nil {
+            let baseTitle = heartbeatTitleSeed(from: heartbeat.instruction)
+            var candidate = baseTitle
+            var suffix = 2
+            var usedTitles = usedTitlesByAgent[heartbeat.agentID, default: []]
+            while usedTitles.contains(candidate.lowercased()) {
+                candidate = "\(baseTitle) \(suffix)"
+                suffix += 1
+            }
+            heartbeat.title = candidate
+            usedTitles.insert(candidate.lowercased())
+            usedTitlesByAgent[heartbeat.agentID] = usedTitles
+        }
+    }
+
+    private func heartbeatTitleSeed(from instruction: String) -> String {
+        let normalizedInstruction = instruction
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !normalizedInstruction.isEmpty else { return "Heartbeat" }
+        guard normalizedInstruction.count > 60 else { return normalizedInstruction }
+        return String(normalizedInstruction.prefix(59)) + "…"
+    }
+
+    private func normalizedHeartbeatTitle(_ title: String?) -> String? {
+        guard let title else { return nil }
+        let normalizedTitle = title
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        return normalizedTitle.isEmpty ? nil : normalizedTitle
     }
 
     private func loadHeartbeatRuns() {
@@ -510,25 +626,41 @@ final class AgentStore: ObservableObject {
             hasOlderHeartbeatRuns = false
         }
 
-        for heartbeat in heartbeats where heartbeat.lastCompletedAt == nil {
+        let heartbeatsByID = Dictionary(uniqueKeysWithValues: heartbeats.map { ($0.id, $0) })
+        var synchronizedHeartbeatIDs = Set<AgentHeartbeat.ID>()
+
+        for run in heartbeatRuns where synchronizedHeartbeatIDs.insert(run.heartbeatID).inserted {
+            guard let heartbeat = heartbeatsByID[run.heartbeatID] else { continue }
+            heartbeat.lastCompletedAt = run.completedAt
+            heartbeat.lastError = run.errorMessage
+        }
+
+        for heartbeat in heartbeats
+        where heartbeat.lastCompletedAt == nil && !synchronizedHeartbeatIDs.contains(heartbeat.id) {
             let heartbeatID = heartbeat.id
             var latestRunDescriptor = FetchDescriptor<HeartbeatRun>(
                 predicate: #Predicate { $0.heartbeatID == heartbeatID },
                 sortBy: [SortDescriptor(\.completedAt, order: .reverse)]
             )
             latestRunDescriptor.fetchLimit = 1
-            heartbeat.lastCompletedAt = try? modelContext.fetch(latestRunDescriptor).first?.completedAt
+            if let latestRun = try? modelContext.fetch(latestRunDescriptor).first {
+                heartbeat.lastCompletedAt = latestRun.completedAt
+                heartbeat.lastError = latestRun.errorMessage
+            }
         }
         saveChanges()
     }
 
-    private func saveChanges() {
-        guard modelContext.hasChanges else { return }
+    @discardableResult
+    private func saveChanges() -> Bool {
+        guard modelContext.hasChanges else { return true }
 
         do {
             try modelContext.save()
+            return true
         } catch {
-            assertionFailure("Failed to save agents: \(error.localizedDescription)")
+            Self.logger.error("Failed to save agents: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 }
@@ -549,6 +681,10 @@ final class Agent: Identifiable {
     var debugLogEnabled: Bool?
     var calendarAccessAll: Bool?
     var allowedCalendarIDsJSON: String?
+    @Attribute(.externalStorage) var avatarImageData: Data?
+    var avatarCropZoom: Double?
+    var avatarCropOffsetX: Double?
+    var avatarCropOffsetY: Double?
     var createdAt: Date
 
     init(
@@ -566,6 +702,10 @@ final class Agent: Identifiable {
         debugLogEnabled: Bool? = nil,
         calendarAccessAll: Bool? = nil,
         allowedCalendarIDsJSON: String? = nil,
+        avatarImageData: Data? = nil,
+        avatarCropZoom: Double? = nil,
+        avatarCropOffsetX: Double? = nil,
+        avatarCropOffsetY: Double? = nil,
         createdAt: Date = .now
     ) {
         self.id = id
@@ -582,6 +722,10 @@ final class Agent: Identifiable {
         self.debugLogEnabled = debugLogEnabled
         self.calendarAccessAll = calendarAccessAll
         self.allowedCalendarIDsJSON = allowedCalendarIDsJSON
+        self.avatarImageData = avatarImageData
+        self.avatarCropZoom = avatarCropZoom
+        self.avatarCropOffsetX = avatarCropOffsetX
+        self.avatarCropOffsetY = avatarCropOffsetY
         self.createdAt = createdAt
     }
 

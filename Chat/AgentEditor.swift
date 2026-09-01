@@ -1,9 +1,6 @@
+import ShadSwift
 import SwiftUI
 import SwiftData
-
-#if os(macOS)
-import AppKit
-#endif
 
 struct AgentsPreferencesView: View {
     @ObservedObject var store: AgentStore
@@ -13,6 +10,25 @@ struct AgentsPreferencesView: View {
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
     @State private var isPresentingEditor = false
+    @State private var avatarEditorState = ShadAvatarEditorState()
+    @State private var editingHeartbeatID: AgentHeartbeat.ID?
+    @Environment(\.shadTheme) private var theme
+
+    private var editingHeartbeat: AgentHeartbeat? {
+        guard let editingHeartbeatID else { return nil }
+        return store.heartbeats.first { $0.id == editingHeartbeatID }
+    }
+
+    private var heartbeatEditorIsPresented: Binding<Bool> {
+        Binding(
+            get: { editingHeartbeat != nil },
+            set: { isPresented in
+                if !isPresented {
+                    editingHeartbeatID = nil
+                }
+            }
+        )
+    }
 
     var body: some View {
         Group {
@@ -22,54 +38,70 @@ struct AgentsPreferencesView: View {
                 agentList
             }
         }
-        .background(OpenUITheme.background)
+        .background(theme.colors.background)
+        .shadAvatarEditor(
+            $avatarEditorState,
+            title: "Agent avatar",
+            description: "Drop an image onto the circle, then drag and zoom to choose its framing.",
+            saveTitle: "Save Avatar",
+            onSave: saveAvatar
+        )
+        .shadDialog(isPresented: heartbeatEditorIsPresented) {
+            heartbeatEditorDialog
+        }
+        .onChange(of: store.selectedAgentID) {
+            editingHeartbeatID = nil
+        }
+        .onChange(of: store.heartbeats.map(\.id)) {
+            guard let editingHeartbeatID,
+                  !store.heartbeats.contains(where: { $0.id == editingHeartbeatID }) else {
+                return
+            }
+            self.editingHeartbeatID = nil
+        }
     }
 
     private var agentList: some View {
         VStack(alignment: .leading, spacing: 24) {
             HStack(alignment: .center) {
                 Text("Agents")
-                    .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(OpenUITheme.foreground)
+                    .font(theme.font(theme.typography.xxl, theme.typography.semibold))
+                    .foregroundStyle(theme.colors.foreground)
 
                 Spacer()
 
-                Button {
+                ShadButton("Add Agent", icon: .plus) {
                     store.addAgent()
                     isPresentingEditor = true
-                } label: {
-                    Label("Add Agent", systemImage: "plus")
                 }
-                .buttonStyle(OpenUIPrimaryButtonStyle())
             }
 
             VStack(spacing: 0) {
                 ForEach(Array(store.agents.enumerated()), id: \.element.id) { index, agent in
-                    Button {
+                    ShadItem(size: .sm, action: {
                         store.selectedAgentID = agent.id
                         isPresentingEditor = true
-                    } label: {
-                        HStack {
-                            Text(agent.displayName)
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(OpenUITheme.foreground)
-                                .lineLimit(1)
-
-                            Spacer(minLength: 0)
+                    }) {
+                        ShadItemMedia {
+                            AgentAvatar(agent: agent, size: 32)
                         }
-                        .contentShape(Rectangle())
-                        .padding(.horizontal, 18)
-                        .frame(minHeight: 56)
+                        ShadItemContent {
+                            ShadItemTitle(agent.displayName)
+                        }
+                        if store.isDefaultAgent(agent) {
+                            ShadItemActions {
+                                ShadBadge("Default", variant: .secondary)
+                            }
+                        }
                     }
-                    .buttonStyle(.plain)
                     .accessibilityLabel("Edit \(agent.displayName)")
 
                     if index < store.agents.count - 1 {
-                        OpenUIDivider()
+                        ShadSeparator()
                     }
                 }
             }
-            .openUICard()
+            .shadSettingsCard()
 
             Spacer(minLength: 0)
         }
@@ -81,23 +113,20 @@ struct AgentsPreferencesView: View {
     private var agentEditor: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 28) {
-                HStack(spacing: 16) {
-                    Button("Agents") {
-                        isPresentingEditor = false
+                ShadBreadcrumb {
+                    ShadBreadcrumbList {
+                        ShadBreadcrumbItem {
+                            ShadBreadcrumbLink("Agents", icon: .users) {
+                                editingHeartbeatID = nil
+                                isPresentingEditor = false
+                            }
+                            .accessibilityHint("Return to the agent list")
+                        }
+                        ShadBreadcrumbSeparator()
+                        ShadBreadcrumbItem {
+                            ShadBreadcrumbPage(store.selectedAgent?.displayName ?? "Agent")
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 26, weight: .bold))
-                    .foregroundStyle(OpenUITheme.foregroundMuted)
-                    .accessibilityHint("Return to the agent list")
-
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(OpenUITheme.foregroundSubtle)
-
-                    Text(store.selectedAgent?.displayName ?? "Agent")
-                        .font(.system(size: 26, weight: .semibold))
-                        .foregroundStyle(OpenUITheme.foreground)
-                        .lineLimit(1)
                 }
 
                 AgentEditor(
@@ -106,7 +135,15 @@ struct AgentsPreferencesView: View {
                     textToSpeechToolStore: textToSpeechToolStore,
                     skillCatalog: skillCatalog,
                     chatStore: chatStore,
-                    heartbeatScheduler: heartbeatScheduler
+                    heartbeatScheduler: heartbeatScheduler,
+                    avatarEditorState: $avatarEditorState,
+                    onEditHeartbeat: { heartbeatID in
+                        editingHeartbeatID = heartbeatID
+                    },
+                    onAgentDeleted: {
+                        editingHeartbeatID = nil
+                        isPresentingEditor = false
+                    }
                 )
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -115,10 +152,55 @@ struct AgentsPreferencesView: View {
             .padding(.vertical, 36)
         }
     }
+
+    private func saveAvatar(_ photo: ShadAvatarPhoto) {
+        guard let agentID = store.selectedAgent?.id else { return }
+
+        let imageData = photo.persistentImageData
+        guard photo.image == nil || imageData != nil else { return }
+
+        store.updateAgentAvatar(
+            id: agentID,
+            imageData: imageData,
+            cropZoom: photo.crop.zoom,
+            cropOffsetX: Double(photo.crop.offset.width),
+            cropOffsetY: Double(photo.crop.offset.height)
+        )
+    }
+
+    @ViewBuilder
+    private var heartbeatEditorDialog: some View {
+        if let editingHeartbeat {
+            HeartbeatEditorDialog(
+                heartbeat: editingHeartbeat,
+                store: store,
+                localModelStore: localModelStore,
+                chatStore: chatStore,
+                heartbeatScheduler: heartbeatScheduler
+            )
+            .id(editingHeartbeat.id)
+        }
+    }
 }
 
 private let minimumAgentTextEditorHeight: CGFloat = 170
 private let maximumAgentTextEditorHeight: CGFloat = 720
+
+private enum VoiceToolChoice: Hashable {
+    case none
+    case tool(TextToSpeechTool.ID)
+}
+
+private enum AgentEditorTab: String, CaseIterable, Hashable {
+    case identity = "Identity"
+    case soul = "Soul"
+    case memory = "Memory"
+    case voice = "Voice"
+    case tools = "Tools"
+    case skills = "Skills"
+    case heartbeats = "Heartbeats"
+    case advanced = "Advanced"
+}
 
 struct AgentEditor: View {
     @ObservedObject var store: AgentStore
@@ -127,11 +209,17 @@ struct AgentEditor: View {
     @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+    @Binding var avatarEditorState: ShadAvatarEditorState
+    var onEditHeartbeat: (AgentHeartbeat.ID) -> Void = { _ in }
+    var onAgentDeleted: () -> Void = {}
     @ObservedObject private var calendarDirectory = CalendarDirectory.shared
+    @State private var selectedTab = AgentEditorTab.identity
     @State private var draftSoul = ""
     @State private var soulEditorHeight: CGFloat = 360
     @State private var draftMemory = ""
     @State private var memoryEditorHeight: CGFloat = 240
+    @State private var deleteDialogIsPresented = false
+    @Environment(\.shadTheme) private var theme
 
     private var selectedAgent: Agent? {
         store.selectedAgent
@@ -155,6 +243,29 @@ struct AgentEditor: View {
         }
     }
 
+    private var optionalAgentModel: Binding<String?> {
+        Binding(
+            get: { agentModel.wrappedValue },
+            set: { value in
+                guard let value else { return }
+                agentModel.wrappedValue = value
+            }
+        )
+    }
+
+    private var agentModelOptions: [ShadSelectOption<String>] {
+        var options = localModelStore.selectableModels.map { model in
+            ShadSelectOption(model.displayName, value: model.identifier)
+        }
+        if let identifier = selectedAgent?.selectedModelIdentifier,
+           !options.contains(where: { $0.value == identifier }) {
+            options.append(
+                ShadSelectOption(localModelStore.displayName(for: identifier), value: identifier)
+            )
+        }
+        return options
+    }
+
     private var voiceTriggerPhrasesText: Binding<String> {
         Binding {
             selectedAgent?.voiceTriggerPhrase ?? ""
@@ -171,6 +282,38 @@ struct AgentEditor: View {
             guard let agentID = selectedAgent?.id else { return }
             store.updateAgentTextToSpeechTool(id: agentID, toolID: newValue)
         }
+    }
+
+    private var voiceToolChoice: Binding<VoiceToolChoice?> {
+        Binding(
+            get: {
+                if let id = textToSpeechToolID.wrappedValue {
+                    return .tool(id)
+                }
+                return VoiceToolChoice.none
+            },
+            set: { choice in
+                guard let choice else { return }
+                switch choice {
+                case .none:
+                    textToSpeechToolID.wrappedValue = nil
+                case .tool(let id):
+                    textToSpeechToolID.wrappedValue = id
+                }
+            }
+        )
+    }
+
+    private var voiceToolOptions: [ShadSelectOption<VoiceToolChoice>] {
+        var options = [ShadSelectOption("None", value: VoiceToolChoice.none)]
+        options.append(contentsOf: textToSpeechToolStore.tools.map { tool in
+            ShadSelectOption(tool.displayName, value: VoiceToolChoice.tool(tool.id))
+        })
+        if let selectedToolID = selectedAgent?.textToSpeechToolID,
+           !textToSpeechToolStore.tools.contains(where: { $0.id == selectedToolID }) {
+            options.append(ShadSelectOption("Missing tool", value: VoiceToolChoice.tool(selectedToolID)))
+        }
+        return options
     }
 
     private var textToSpeechVoiceName: Binding<String> {
@@ -205,19 +348,18 @@ struct AgentEditor: View {
                 editor(for: selectedAgent)
             } else {
                 VStack(spacing: 10) {
-                    Image(systemName: "person.crop.circle.badge.plus")
-                        .font(.system(size: 26))
-                        .foregroundStyle(OpenUITheme.accent)
+                    ShadIconView(.custom("person.crop.circle.badge.plus"), size: theme.typography.xxl)
+                        .foregroundStyle(theme.colors.primary)
 
                     Text("Select or add an agent")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(theme.font(theme.typography.base, theme.typography.semibold))
 
                     Text("Agent settings will appear here.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(OpenUITheme.foregroundMuted)
+                        .font(theme.font(theme.typography.sm))
+                        .foregroundStyle(theme.colors.mutedForeground)
                 }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .openUICard()
+                    .shadSettingsCard()
             }
         }
         .onAppear {
@@ -226,58 +368,81 @@ struct AgentEditor: View {
             prepareCalendarsIfNeeded()
         }
         .onChange(of: store.selectedAgentID) {
+            selectedTab = .identity
+            deleteDialogIsPresented = false
             loadSelectedAgent()
             prepareCalendarsIfNeeded()
         }
     }
 
     private func editor(for agent: Agent) -> some View {
-        VStack(alignment: .leading, spacing: 28) {
+        ShadTabs(selection: $selectedTab, variant: .line, spacing: 24) {
+            ShadTabsList {
+                ForEach(AgentEditorTab.allCases, id: \.self) { tab in
+                    ShadTabsTrigger(tab.rawValue, value: tab)
+                }
+            }
+            ShadTabsContent(value: AgentEditorTab.identity) {
                 VStack(alignment: .leading, spacing: 10) {
-                    OpenUISectionHeader(
-                        title: "Identity"
-                        )
+                    ShadSettingsSectionHeader(
+                        title: "Identity",
+                        description: "Choose how this agent appears and which model it uses."
+                    )
 
                     VStack(spacing: 0) {
-                        OpenUISettingsRow(
+                        ShadSettingsRow(
+                            title: "Avatar",
+                            description: "Click the image to open the ShadSwift crop and zoom editor, or drop an image onto it."
+                        ) {
+                            HStack(spacing: 10) {
+                                ShadEditableAvatar(
+                                    $avatarEditorState,
+                                    fallback: agent.avatarInitials,
+                                    customSize: 72
+                                )
+
+                                if !avatarEditorState.photo.isEmpty {
+                                    ShadButton("Remove", variant: .outline, size: .sm, icon: .trash) {
+                                        removeAvatar(from: agent)
+                                    }
+                                    .accessibilityLabel("Remove avatar image")
+                                }
+                            }
+                        }
+
+                        ShadSeparator()
+
+                        ShadSettingsRow(
                             title: "Name",
                             description: "Used in chat labels and @mentions."
                         ) {
-                            TextField("Agent name", text: agentName)
-                                .openUIInput()
+                            ShadInput("Agent name", text: agentName)
                                 .frame(width: 320)
+                                .accessibilityLabel("Agent name")
                         }
 
-                        OpenUIDivider()
+                        ShadSeparator()
 
-                        OpenUISettingsRow(
+                        ShadSettingsRow(
                             title: "Default model",
-                            description: "Heartbeats can override this selection individually."
+                            description: "Used by the default chat and new chats. Heartbeats can override it."
                         ) {
-                            Picker("Model", selection: agentModel) {
-                                Text("Apple Foundation Model")
-                                    .tag(ChatModelIdentifier.appleFoundation)
-
-                                ForEach(localModelStore.localModels) { model in
-                                    Text(model.displayName)
-                                        .tag(ChatModelIdentifier.localModelID(model.id))
-                                }
-
-                                if !isSelectedModelConfigured(agent.selectedModelIdentifier) {
-                                    Text("Missing local model")
-                                        .tag(agent.selectedModelIdentifier)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                            .frame(width: 320)
+                            ShadSelect(
+                                selection: optionalAgentModel,
+                                options: agentModelOptions,
+                                width: 320
+                            )
+                            .accessibilityLabel("Default model")
+                            .accessibilityValue(localModelStore.displayName(for: agent.selectedModelIdentifier))
                         }
                     }
-                    .openUICard()
+                    .shadSettingsCard()
                 }
+            }
 
+            ShadTabsContent(value: AgentEditorTab.soul) {
                 VStack(alignment: .leading, spacing: 10) {
-                    OpenUISectionHeader(
+                    ShadSettingsSectionHeader(
                         title: "Soul",
                         description: "Your agent's personality and motivations."
                     )
@@ -290,115 +455,92 @@ struct AgentEditor: View {
                         )
                             .padding(16)
 
-                        OpenUIDivider()
+                        ShadSeparator()
 
                         HStack {
                             Text("Soul changes are applied when you save.")
-                                .font(.system(size: 12))
-                                .foregroundStyle(OpenUITheme.foregroundSubtle)
+                                .font(theme.font(theme.typography.xs))
+                                .foregroundStyle(theme.colors.mutedForeground)
 
                             Spacer()
 
                             if hasUnsavedSoulChanges {
-                                Button("Save Soul") {
+                                ShadButton("Save Soul", size: .sm, icon: .check) {
                                     store.updateAgentSoul(id: agent.id, soul: draftSoul)
                                 }
-                                .buttonStyle(OpenUIPrimaryButtonStyle())
                             }
                         }
                         .padding(14)
                     }
-                    .openUICard()
+                    .shadSettingsCard()
                 }
+            }
 
+            ShadTabsContent(value: AgentEditorTab.voice) {
                 VStack(alignment: .leading, spacing: 10) {
-                    OpenUISectionHeader(
+                    ShadSettingsSectionHeader(
                         title: "Voice",
                         description: "Configure voice input and text-to-speech output for this agent."
                     )
 
                     VStack(spacing: 0) {
-                        OpenUISettingsRow(
+                        ShadSettingsRow(
                             title: "Key phrases",
                             description: "Enter one phrase per line. Voice mode ignores speech until it hears one."
                         ) {
-                            ZStack(alignment: .topLeading) {
-                                TextEditor(text: voiceTriggerPhrasesText)
-                                    .font(.system(size: 14))
-                                    .scrollContentBackground(.hidden)
-                                    .padding(6)
-
-                                if voiceTriggerPhrasesText.wrappedValue.isEmpty {
-                                    Text("Hey \(agent.displayName)\nWake up \(agent.displayName)")
-                                        .font(.system(size: 14))
-                                        .foregroundStyle(OpenUITheme.foregroundSubtle)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 10)
-                                        .allowsHitTesting(false)
-                                }
-                            }
-                            .frame(height: 82)
-                            .background(OpenUITheme.surface, in: RoundedRectangle(cornerRadius: 10))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(OpenUITheme.border, lineWidth: 1)
-                            }
+                            ShadTextarea(
+                                "Hey \(agent.displayName)\nWake up \(agent.displayName)",
+                                text: voiceTriggerPhrasesText,
+                                minHeight: 64,
+                                maxHeight: 64
+                            )
                             .frame(width: 320)
+                            .accessibilityLabel("Voice key phrases")
                         }
 
-                        OpenUIDivider()
+                        ShadSeparator()
 
-                        OpenUISettingsRow(
+                        ShadSettingsRow(
                             title: "Voice tool",
                             description: "Choose a tool configured in Text to Speech preferences."
                         ) {
-                            Picker("Voice tool", selection: textToSpeechToolID) {
-                                Text("None")
-                                    .tag(nil as TextToSpeechTool.ID?)
-
-                                ForEach(textToSpeechToolStore.tools) { tool in
-                                    Text(tool.displayName)
-                                        .tag(tool.id as TextToSpeechTool.ID?)
-                                }
-
-                                if let selectedToolID = agent.textToSpeechToolID,
-                                   !textToSpeechToolStore.tools.contains(where: { $0.id == selectedToolID }) {
-                                    Text("Missing tool")
-                                        .tag(selectedToolID as TextToSpeechTool.ID?)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                            .frame(width: 320)
+                            ShadSelect(
+                                selection: voiceToolChoice,
+                                options: voiceToolOptions,
+                                width: 320
+                            )
+                            .accessibilityLabel("Voice tool")
                         }
 
-                        OpenUIDivider()
+                        ShadSeparator()
 
-                        OpenUISettingsRow(
+                        ShadSettingsRow(
                             title: "Voice name",
                             description: "Free-form voice identifier passed to the selected tool."
                         ) {
-                            TextField("Voice name", text: textToSpeechVoiceName)
-                                .openUIInput()
+                            ShadInput("Voice name", text: textToSpeechVoiceName)
                                 .frame(width: 320)
+                                .accessibilityLabel("Voice name")
                         }
 
-                        OpenUIDivider()
+                        ShadSeparator()
 
-                        OpenUISettingsRow(
+                        ShadSettingsRow(
                             title: "Voice model",
                             description: "Free-form model identifier passed to the selected tool."
                         ) {
-                            TextField("Voice model", text: textToSpeechVoiceModel)
-                                .openUIInput()
+                            ShadInput("Voice model", text: textToSpeechVoiceModel)
                                 .frame(width: 320)
+                                .accessibilityLabel("Voice model")
                         }
                     }
-                    .openUICard()
+                    .shadSettingsCard()
                 }
+            }
 
+            ShadTabsContent(value: AgentEditorTab.tools) {
                 VStack(alignment: .leading, spacing: 10) {
-                    OpenUISectionHeader(
+                    ShadSettingsSectionHeader(
                         title: "Tools",
                         description: "Off until you enable them. The agent can only call tools that are on."
                     )
@@ -406,37 +548,34 @@ struct AgentEditor: View {
                     VStack(spacing: 0) {
                         ForEach(Array(AgentToolID.allCases.enumerated()), id: \.element.id) { index, toolID in
                             VStack(spacing: 0) {
-                                OpenUISettingsRow(
+                                ShadSettingsRow(
                                     title: toolID.title,
                                     description: toolID.description
                                 ) {
-                                    Toggle(
-                                        toolID.title,
-                                        isOn: toolEnabled(toolID)
-                                    )
-                                    .toggleStyle(.switch)
-                                    .labelsHidden()
-                                    .tint(OpenUITheme.accent)
+                                    ShadSwitch(isOn: toolEnabled(toolID))
+                                    .accessibilityLabel(toolID.title)
                                     .disabled(selectedAgent == nil)
                                 }
 
                                 if toolID == .readCalendarEvents,
                                    selectedAgent?.isToolEnabled(.readCalendarEvents) == true {
-                                    OpenUIDivider()
+                                    ShadSeparator()
                                     calendarAccessPanel
                                 }
 
                                 if index < AgentToolID.allCases.count - 1 {
-                                    OpenUIDivider()
+                                    ShadSeparator()
                                 }
                             }
                         }
                     }
-                    .openUICard()
+                    .shadSettingsCard()
                 }
+            }
 
+            ShadTabsContent(value: AgentEditorTab.skills) {
                 VStack(alignment: .leading, spacing: 10) {
-                    OpenUISectionHeader(
+                    ShadSettingsSectionHeader(
                         title: "Skills",
                         description: "Off until you enable them here. A skill must also be on in Settings."
                     )
@@ -444,66 +583,63 @@ struct AgentEditor: View {
                     if skillCatalog.enabledSkills.isEmpty {
                         VStack(spacing: 8) {
                             Text("No skills are enabled")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(theme.font(theme.typography.sm, theme.typography.medium))
 
                             Text("Turn on a skill in Settings → Skills, then it will appear here.")
-                                .font(.system(size: 13))
-                                .foregroundStyle(OpenUITheme.foregroundMuted)
+                                .font(theme.font(theme.typography.sm))
+                                .foregroundStyle(theme.colors.mutedForeground)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 28)
-                        .openUICard()
+                        .shadSettingsCard()
                     } else {
                         VStack(spacing: 0) {
                             ForEach(Array(skillCatalog.enabledSkills.enumerated()), id: \.element.id) { index, skill in
-                                OpenUISettingsRow(
+                                ShadSettingsRow(
                                     title: skill.name,
                                     description: skill.description.isEmpty
                                         ? "No description in SKILL.md."
                                         : skill.description
                                 ) {
-                                    Toggle(
-                                        skill.name,
-                                        isOn: skillEnabled(skill.name)
-                                    )
-                                    .toggleStyle(.switch)
-                                    .labelsHidden()
-                                    .tint(OpenUITheme.accent)
+                                    ShadSwitch(isOn: skillEnabled(skill.name))
+                                    .accessibilityLabel(skill.name)
                                     .disabled(selectedAgent == nil)
                                 }
 
                                 if index < skillCatalog.enabledSkills.count - 1 {
-                                    OpenUIDivider()
+                                    ShadSeparator()
                                 }
                             }
                         }
-                        .openUICard()
+                        .shadSettingsCard()
                     }
                 }
+            }
 
+            ShadTabsContent(value: AgentEditorTab.advanced) {
                 VStack(alignment: .leading, spacing: 10) {
-                    OpenUISectionHeader(
+                    ShadSettingsSectionHeader(
                         title: "Diagnostics",
                         description: "Optional logs for inspecting prompts and tool traces."
                     )
 
                     VStack(spacing: 0) {
-                        OpenUISettingsRow(
+                        ShadSettingsRow(
                             title: "Debug log",
                             description: "Store the full model prompt and intermediate output for this agent’s chats and heartbeats. Off by default — this is a lot of data."
                         ) {
-                            Toggle("Debug log", isOn: debugLogEnabled)
-                                .toggleStyle(.switch)
-                                .labelsHidden()
-                                .tint(OpenUITheme.accent)
+                            ShadSwitch(isOn: debugLogEnabled)
+                                .accessibilityLabel("Debug log")
                                 .disabled(selectedAgent == nil)
                         }
                     }
-                    .openUICard()
+                    .shadSettingsCard()
                 }
+            }
 
+            ShadTabsContent(value: AgentEditorTab.memory) {
                 VStack(alignment: .leading, spacing: 10) {
-                    OpenUISectionHeader(
+                    ShadSettingsSectionHeader(
                         title: "Memory",
                         description: "You can edit all memory; the agent can only append new entries."
                     )
@@ -516,82 +652,81 @@ struct AgentEditor: View {
                         )
                             .padding(16)
 
-                        OpenUIDivider()
+                        ShadSeparator()
 
                         HStack {
                             Text("Memory changes are applied when you save.")
-                                .font(.system(size: 12))
-                                .foregroundStyle(OpenUITheme.foregroundSubtle)
+                                .font(theme.font(theme.typography.xs))
+                                .foregroundStyle(theme.colors.mutedForeground)
 
                             Spacer()
 
                             if hasUnsavedMemoryChanges {
-                                Button("Save Memory") {
+                                ShadButton("Save Memory", size: .sm, icon: .check) {
                                     store.updateAgentMemory(id: agent.id, memory: draftMemory)
                                 }
-                                .buttonStyle(OpenUIPrimaryButtonStyle())
                             }
                         }
                         .padding(14)
                     }
-                    .openUICard()
+                    .shadSettingsCard()
                 }
+            }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(alignment: .center, spacing: 16) {
-                        OpenUISectionHeader(
-                            title: "Heartbeats",
-                            description: "Run recurring agent instructions while Chat is open."
-                        )
+            ShadTabsContent(value: AgentEditorTab.heartbeats) {
+                AgentHeartbeatsTab(
+                    agentID: agent.id,
+                    store: store,
+                    heartbeatScheduler: heartbeatScheduler,
+                    onEditHeartbeat: onEditHeartbeat
+                )
+                .id(agent.id)
+            }
 
-                        Spacer()
+            ShadTabsContent(value: AgentEditorTab.advanced) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ShadSettingsSectionHeader(
+                        title: "Agent",
+                        description: "Manage this agent's lifecycle."
+                    )
 
-                        Button {
-                            store.addHeartbeat(to: agent.id)
-                        } label: {
-                            Label("Add heartbeat", systemImage: "plus")
-                        }
-                        .buttonStyle(OpenUISecondaryButtonStyle())
-                    }
-
-                    if store.heartbeats(for: agent.id).isEmpty {
-                        VStack(spacing: 8) {
-                            Image(systemName: "waveform.path.ecg")
-                                .font(.system(size: 22))
-                                .foregroundStyle(OpenUITheme.foregroundSubtle)
-
-                            Text("No heartbeats configured")
-                                .font(.system(size: 14, weight: .medium))
-
-                            Text("Add one to let this agent check in on a schedule.")
-                                .font(.system(size: 13))
-                                .foregroundStyle(OpenUITheme.foregroundMuted)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 32)
-                        .openUICard()
-                    } else {
-                        VStack(spacing: 16) {
-                            ForEach(store.heartbeats(for: agent.id)) { heartbeat in
-                                AgentHeartbeatEditor(
-                                    heartbeat: heartbeat,
-                                    store: store,
-                                    localModelStore: localModelStore,
-                                    chatStore: chatStore,
-                                    heartbeatScheduler: heartbeatScheduler
-                                )
+                    VStack(spacing: 0) {
+                        ShadSettingsRow(
+                            title: store.isDefaultAgent(agent) ? "Default agent" : "Delete agent",
+                            description: deletionDescription(for: agent)
+                        ) {
+                            ShadButton("Delete Agent", variant: .outline, size: .sm, icon: .trash) {
+                                beginDeleting(agent)
                             }
+                            .disabled(!canBeginDeleting(agent))
+                            .accessibilityHint(deletionDescription(for: agent))
                         }
                     }
+                    .shadSettingsCard()
                 }
+            }
         }
         .frame(maxWidth: 720, alignment: .topLeading)
+        .shadAlertDialog(isPresented: $deleteDialogIsPresented) {
+            ShadAlertDialogContent {
+                ShadAlertDialogTitle("Delete \(agent.displayName)?")
+                ShadAlertDialogDescription(
+                    "The agent and its heartbeat schedules will be deleted. Existing messages and generation history are preserved. This cannot be undone."
+                )
+            } actions: {
+                ShadAlertDialogCancel()
+                ShadAlertDialogAction("Delete Agent", variant: .destructive) {
+                    confirmAgentDeletion(agent)
+                }
+            }
+        }
     }
 
     private func loadSelectedAgent() {
         guard let selectedAgent else {
             draftSoul = ""
             draftMemory = ""
+            avatarEditorState = ShadAvatarEditorState()
             return
         }
 
@@ -601,12 +736,75 @@ struct AgentEditor: View {
     private func load(_ agent: Agent) {
         draftSoul = agent.soul
         draftMemory = agent.memoryText
+        avatarEditorState = ShadAvatarEditorState(photo: agent.avatarPhoto)
     }
 
-    private func isSelectedModelConfigured(_ identifier: String) -> Bool {
-        identifier == ChatModelIdentifier.appleFoundation || localModelStore.localModels.contains {
-            ChatModelIdentifier.localModelID($0.id) == identifier
+    private func removeAvatar(from agent: Agent) {
+        avatarEditorState = ShadAvatarEditorState()
+        store.updateAgentAvatar(
+            id: agent.id,
+            imageData: nil,
+            cropZoom: 1,
+            cropOffsetX: 0,
+            cropOffsetY: 0
+        )
+    }
+
+    private func canBeginDeleting(_ agent: Agent) -> Bool {
+        store.canDeleteAgent(agent) && !hasActiveWork(for: agent)
+    }
+
+    private func hasActiveWork(for agent: Agent) -> Bool {
+        let hasRunningHeartbeat = heartbeatScheduler.runningHeartbeats.contains {
+            $0.agentID == agent.id
         }
+        let hasActiveDirectChat = chatStore.chats(for: agent.id).contains {
+            $0.isResponding || $0.isCompacting
+        }
+        let hasActiveGroupChat = chatStore.groupChats.contains { chat in
+            (chat.isResponding || chat.isCompacting)
+                && chat.groupParticipants.contains { $0.agentID == agent.id }
+        }
+        return hasRunningHeartbeat || hasActiveDirectChat || hasActiveGroupChat
+    }
+
+    private func deletionDescription(for agent: Agent) -> String {
+        if store.isDefaultAgent(agent) {
+            return "The default agent anchors Chat and cannot be deleted."
+        }
+        if hasActiveWork(for: agent) {
+            return "Wait for this agent's active chat or heartbeat work to finish before deleting it."
+        }
+        return "Delete this agent and its heartbeat schedules. Existing messages and generation history are preserved."
+    }
+
+    private func beginDeleting(_ agent: Agent) {
+        guard canBeginDeleting(agent) else { return }
+        deleteDialogIsPresented = true
+    }
+
+    private func confirmAgentDeletion(_ agent: Agent) {
+        guard canBeginDeleting(agent) else {
+            return
+        }
+
+        let agentID = agent.id
+        var deactivationPlan: ChatStore.AgentDeactivationPlan?
+        guard store.removeAgent(
+            id: agentID,
+            beforeSaving: {
+                deactivationPlan = chatStore.stageAgentDeactivation(agentID)
+            }
+        ) else {
+            return
+        }
+
+        guard let deactivationPlan else { return }
+        let deletedChatWasSelected = chatStore.applyAgentDeactivation(deactivationPlan)
+        if deletedChatWasSelected, let nextAgent = store.selectedAgent {
+            chatStore.selectDefaultChat(for: nextAgent)
+        }
+        onAgentDeleted()
     }
 
     private func toolEnabled(_ toolID: AgentToolID) -> Binding<Bool> {
@@ -636,46 +834,45 @@ struct AgentEditor: View {
 
     @ViewBuilder
     private var calendarAccessPanel: some View {
-        OpenUISettingsRow(
+        ShadSettingsRow(
             title: "Calendars",
             description: calendarAccessDescription
         ) {
             HStack(spacing: 10) {
                 if calendarDirectory.isRequestingAccess {
-                    ProgressView()
-                        .controlSize(.small)
+                    ShadSpinner(size: theme.typography.base)
                 }
 
-                Picker("Calendars", selection: calendarAccessAll) {
-                    Text("All").tag(true)
-                    Text("Selected").tag(false)
+                ShadTabs(selection: calendarAccessAll, spacing: 0) {
+                    ShadTabsList {
+                        ShadTabsTrigger("All", value: true)
+                        ShadTabsTrigger("Selected", value: false)
+                    }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
                 .frame(width: 200)
                 .disabled(selectedAgent == nil)
+                .accessibilityLabel("Calendar access")
             }
         }
 
         if let message = calendarDirectory.accessMessage {
-            OpenUIDivider()
-            OpenUISettingsRow(
+            ShadSeparator()
+            ShadSettingsRow(
                 title: "Calendar access",
                 description: message
             ) {
                 if calendarDirectory.canRequestAccess {
-                    Button("Allow") {
+                    ShadButton("Allow", variant: .outline, size: .sm) {
                         Task { await calendarDirectory.prepare() }
                     }
-                    .buttonStyle(.bordered)
                 }
             }
         }
 
         if calendarAccessAll.wrappedValue == false, calendarDirectory.hasFullAccess {
             if calendarDirectory.calendars.isEmpty {
-                OpenUIDivider()
-                OpenUISettingsRow(
+                ShadSeparator()
+                ShadSettingsRow(
                     title: "No calendars",
                     description: "No calendars were found on this Mac."
                 ) {
@@ -683,8 +880,8 @@ struct AgentEditor: View {
                 }
             } else {
                 ForEach(calendarDirectory.calendars) { calendar in
-                    OpenUIDivider()
-                    OpenUISettingsRow(
+                    ShadSeparator()
+                    ShadSettingsRow(
                         title: calendar.title,
                         description: calendar.subtitle.isEmpty
                             ? "Stored as calendar ID \(calendar.calendarIdentifier)."
@@ -700,13 +897,8 @@ struct AgentEditor: View {
                                     )
                                 )
                                 .frame(width: 8, height: 8)
-                            Toggle(
-                                calendar.title,
-                                isOn: calendarAllowed(calendar.calendarIdentifier)
-                            )
-                            .toggleStyle(.switch)
-                            .labelsHidden()
-                            .tint(OpenUITheme.accent)
+                            ShadSwitch(isOn: calendarAllowed(calendar.calendarIdentifier))
+                            .accessibilityLabel(calendar.title)
                             .disabled(selectedAgent == nil)
                         }
                     }
@@ -769,8 +961,344 @@ struct AgentEditor: View {
     }
 }
 
+private struct AgentHeartbeatsTab: View {
+    let agentID: Agent.ID
+    @ObservedObject var store: AgentStore
+    @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+    let onEditHeartbeat: (AgentHeartbeat.ID) -> Void
+    @Environment(\.shadTheme) private var theme
+
+    private var heartbeats: [AgentHeartbeat] {
+        store.heartbeats(for: agentID)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 16) {
+                ShadSettingsSectionHeader(
+                    title: "Heartbeats",
+                    description: "Manage recurring agent instructions while Chat is open."
+                )
+
+                Spacer()
+
+                ShadButton("Add heartbeat", variant: .outline, size: .sm, icon: .plus) {
+                    if let heartbeat = store.addHeartbeat(to: agentID) {
+                        onEditHeartbeat(heartbeat.id)
+                    }
+                }
+            }
+
+            ShadTable(
+                heartbeats,
+                columns: heartbeatColumns,
+                bordered: true,
+                emptyMessage: "No heartbeats configured"
+            )
+            .accessibilityLabel("Heartbeats")
+        }
+    }
+
+    private var heartbeatColumns: [ShadTableColumn<AgentHeartbeat>] {
+        [
+            ShadTableColumn(
+                "Title",
+                width: .flexible(min: 180),
+                canHide: false,
+                searchValue: { $0.displayTitle }
+            ) { heartbeat in
+                HeartbeatEditCellButton(title: heartbeat.displayTitle) {
+                    onEditHeartbeat(heartbeat.id)
+                } content: {
+                    HStack(spacing: 8) {
+                        Text(heartbeat.displayTitle)
+                            .font(theme.font(theme.typography.sm, theme.typography.medium))
+                            .foregroundStyle(theme.colors.foreground)
+                            .lineLimit(1)
+
+                        Spacer(minLength: 8)
+
+                        ShadIconView(.chevronRight, size: theme.typography.xs)
+                            .foregroundStyle(theme.colors.mutedForeground)
+                            .accessibilityHidden(true)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Edit heartbeat \(heartbeat.displayTitle)")
+                }
+            },
+            ShadTableColumn(
+                "On",
+                alignment: .center,
+                width: .fixed(48),
+                canHide: false,
+                searchValue: nil
+            ) { heartbeat in
+                let isRunning = isHeartbeatRunning(heartbeat)
+                ShadSwitch(
+                    isOn: Binding(
+                        get: { heartbeat.isEnabled },
+                        set: { store.updateHeartbeatEnabled(heartbeat, isEnabled: $0) }
+                    ),
+                    size: .sm
+                )
+                .disabled(isRunning)
+                .accessibilityLabel("\(heartbeat.displayTitle) enabled")
+                .accessibilityValue(heartbeat.isEnabled ? "On" : "Off")
+                .accessibilityHint(isRunning ? "Wait for the current run to finish before changing this setting." : "Turns future runs on or off.")
+                .help(isRunning ? "This heartbeat cannot be changed while it is running." : "Turn this heartbeat on or off.")
+            },
+            ShadTableColumn(
+                "Frequency",
+                width: .fixed(120),
+                canHide: false,
+                searchValue: nil
+            ) { heartbeat in
+                HeartbeatEditCellButton(title: heartbeat.displayTitle) {
+                    onEditHeartbeat(heartbeat.id)
+                } content: {
+                    Text(heartbeatFrequencyText(heartbeat.normalizedIntervalMinutes))
+                        .font(theme.font(theme.typography.sm))
+                        .monospacedDigit()
+                }
+            },
+            ShadTableColumn(
+                "Last run",
+                width: .fixed(120),
+                canHide: false,
+                searchValue: nil
+            ) { heartbeat in
+                let runningHeartbeat = runningHeartbeat(for: heartbeat)
+                HeartbeatEditCellButton(title: heartbeat.displayTitle) {
+                    onEditHeartbeat(heartbeat.id)
+                } content: {
+                    HeartbeatLastRunCell(
+                        date: runningHeartbeat?.startedAt ?? heartbeat.lastCompletedAt,
+                        isRunning: runningHeartbeat != nil
+                    )
+                }
+            },
+            ShadTableColumn(
+                "Result",
+                width: .fixed(120),
+                canHide: false,
+                searchValue: nil
+            ) { heartbeat in
+                HeartbeatEditCellButton(title: heartbeat.displayTitle) {
+                    onEditHeartbeat(heartbeat.id)
+                } content: {
+                    HeartbeatLastResultCell(
+                        heartbeat: heartbeat,
+                        isRunning: isHeartbeatRunning(heartbeat)
+                    )
+                }
+            },
+            ShadTableColumn(
+                "",
+                id: "delete",
+                alignment: .trailing,
+                width: .fixed(48),
+                canHide: false,
+                searchValue: nil
+            ) { heartbeat in
+                let isRunning = isHeartbeatRunning(heartbeat)
+                ShadButton(
+                    icon: .trash,
+                    variant: .destructive,
+                    size: .icon,
+                    accessibilityLabel: "Delete \(heartbeat.displayTitle)"
+                ) {
+                    deleteHeartbeat(heartbeat)
+                }
+                .disabled(isRunning)
+                .accessibilityHint(isRunning ? "Wait for the current run to finish before deleting this heartbeat." : "Permanently deletes this heartbeat.")
+                .help(isRunning ? "Wait for this heartbeat to finish before deleting it." : "Delete this heartbeat")
+            },
+        ]
+    }
+
+    private func isHeartbeatRunning(_ heartbeat: AgentHeartbeat) -> Bool {
+        runningHeartbeat(for: heartbeat) != nil
+    }
+
+    private func runningHeartbeat(for heartbeat: AgentHeartbeat) -> RunningHeartbeat? {
+        heartbeatScheduler.runningHeartbeats.first { $0.id == heartbeat.id }
+    }
+
+    private func deleteHeartbeat(_ heartbeat: AgentHeartbeat) {
+        guard !isHeartbeatRunning(heartbeat) else { return }
+        store.removeHeartbeat(heartbeat)
+    }
+}
+
+private struct HeartbeatEditCellButton<Content: View>: View {
+    let title: String
+    let action: () -> Void
+    private let content: Content
+
+    init(
+        title: String,
+        action: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.action = action
+        self.content = content()
+    }
+
+    var body: some View {
+        ShadButton(
+            variant: .ghost,
+            size: .sm,
+            fillsWidth: true,
+            action: action
+        ) {
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityHint("Opens heartbeat settings for \(title).")
+        .help("Edit \(title)")
+    }
+}
+
+private struct HeartbeatLastRunCell: View {
+    let date: Date?
+    let isRunning: Bool
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        Group {
+            if let date {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(date.formatted(date: .abbreviated, time: .omitted))
+                    Text(date.formatted(date: .omitted, time: .shortened))
+                }
+                .help(date.formatted(date: .complete, time: .standard))
+            } else {
+                Text("Never")
+                    .foregroundStyle(theme.colors.mutedForeground)
+            }
+        }
+        .font(theme.font(theme.typography.xs))
+        .monospacedDigit()
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        guard let date else { return "Never run" }
+        let formattedDate = date.formatted(date: .complete, time: .standard)
+        return isRunning ? "Current run started \(formattedDate)" : "Last run completed \(formattedDate)"
+    }
+}
+
+private struct HeartbeatLastResultCell: View {
+    let heartbeat: AgentHeartbeat
+    let isRunning: Bool
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        Group {
+            if isRunning {
+                HStack(spacing: 5) {
+                    ShadSpinner(size: theme.typography.sm)
+                    statusText("Running", color: theme.colors.foreground)
+                }
+            } else if let lastCompletedAt = heartbeat.lastCompletedAt {
+                let succeeded = heartbeat.lastError == nil
+                HStack(spacing: 5) {
+                    ShadIconView(succeeded ? .circleCheck : .triangleAlert, size: theme.typography.sm)
+                    statusText(
+                        succeeded ? "Succeeded" : "Failed",
+                        color: succeeded ? theme.colors.success : theme.colors.warning
+                    )
+                }
+                .foregroundStyle(succeeded ? theme.colors.success : theme.colors.warning)
+                .help(heartbeat.lastError ?? "Completed \(lastCompletedAt.formatted(date: .abbreviated, time: .shortened)).")
+            } else {
+                HStack(spacing: 5) {
+                    ShadIconView(.minus, size: theme.typography.sm)
+                    statusText("Not run", color: theme.colors.mutedForeground)
+                }
+                .foregroundStyle(theme.colors.mutedForeground)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Last result: \(statusLabel)")
+    }
+
+    private var statusLabel: String {
+        if isRunning {
+            return "Running"
+        }
+        guard heartbeat.lastCompletedAt != nil else {
+            return "Not run"
+        }
+        return heartbeat.lastError == nil ? "Succeeded" : "Failed"
+    }
+
+    private func statusText(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(theme.font(theme.typography.xs, theme.typography.medium))
+            .foregroundStyle(color)
+            .lineLimit(1)
+    }
+}
+
+private func heartbeatFrequencyText(_ minutes: Int) -> String {
+    let minutes = min(max(minutes, 1), 10_080)
+    if minutes == 10_080 {
+        return "Every week"
+    }
+    if minutes.isMultiple(of: 1_440) {
+        let days = minutes / 1_440
+        return days == 1 ? "Every day" : "Every \(days) days"
+    }
+    if minutes.isMultiple(of: 60) {
+        let hours = minutes / 60
+        return hours == 1 ? "Every hour" : "Every \(hours) hours"
+    }
+    return minutes == 1 ? "Every minute" : "Every \(minutes) min"
+}
+
+private struct HeartbeatEditorDialog: View {
+    let heartbeat: AgentHeartbeat
+    @ObservedObject var store: AgentStore
+    @ObservedObject var localModelStore: LocalModelStore
+    @ObservedObject var chatStore: ChatStore
+    @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+
+    var body: some View {
+        ShadDialogContent(maxWidth: 820) {
+            ShadDialogHeader {
+                ShadDialogTitle(heartbeat.displayTitle)
+                ShadDialogDescription(
+                    "\(heartbeatFrequencyText(heartbeat.normalizedIntervalMinutes)). Changes save automatically."
+                )
+            }
+
+            AgentHeartbeatEditor(
+                heartbeat: heartbeat,
+                store: store,
+                localModelStore: localModelStore,
+                chatStore: chatStore,
+                heartbeatScheduler: heartbeatScheduler
+            )
+            .id(heartbeat.id)
+        } footer: {
+            ShadDialogClose("Done", variant: .default)
+        }
+    }
+}
+
+private enum HeartbeatEditorTab: Hashable {
+    case info
+    case prompt
+    case history
+}
+
 struct AgentHeartbeatEditor: View {
     private static let executionHistoryLimit = 50
+    private static let tabPanelHeight: CGFloat = 320
 
     let heartbeat: AgentHeartbeat
     @ObservedObject var store: AgentStore
@@ -778,6 +1306,8 @@ struct AgentHeartbeatEditor: View {
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
     @Query private var executions: [HeartbeatRun]
+    @State private var selectedTab = HeartbeatEditorTab.info
+    @Environment(\.shadTheme) private var theme
 
     init(
         heartbeat: AgentHeartbeat,
@@ -805,185 +1335,208 @@ struct AgentHeartbeatEditor: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 14) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Heartbeat")
-                        .font(.system(size: 15, weight: .semibold))
-
-                    Text("Runs every \(heartbeat.normalizedIntervalMinutes) minutes")
-                        .font(.system(size: 12))
-                        .foregroundStyle(OpenUITheme.foregroundSubtle)
-                        .monospacedDigit()
-                }
-
-                Spacer()
-
-                Toggle("Enabled", isOn: isEnabled)
-                    .toggleStyle(.switch)
-                    .tint(OpenUITheme.accent)
-
-                Button(role: .destructive) {
-                    store.removeHeartbeat(heartbeat)
-                } label: {
-                    Label("Remove", systemImage: "trash")
-                }
-                .buttonStyle(OpenUIDangerButtonStyle())
+        ShadTabs(selection: $selectedTab, variant: .line, spacing: 12) {
+            ShadTabsList {
+                ShadTabsTrigger("Info", value: HeartbeatEditorTab.info)
+                ShadTabsTrigger("Prompt", value: HeartbeatEditorTab.prompt)
+                ShadTabsTrigger("History", value: HeartbeatEditorTab.history)
             }
-            .padding(16)
+            .accessibilityLabel("Heartbeat editor sections")
 
-            OpenUIDivider()
-
-            VStack(alignment: .leading, spacing: 7) {
-                Text("Instruction")
-                    .font(.system(size: 14, weight: .medium))
-
-                Text("Tell the agent what to consider when this heartbeat runs.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(OpenUITheme.foregroundMuted)
-
-                TextEditor(text: instruction)
-                    .font(.system(size: 14))
-                    .frame(minHeight: 76, maxHeight: 110)
-                    .padding(8)
-                    .scrollContentBackground(.hidden)
-                    .background(OpenUITheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 12))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(OpenUITheme.border, lineWidth: 1)
-                    }
-            }
-            .padding(16)
-
-            OpenUIDivider()
-
-            OpenUISettingsRow(
-                title: "Model",
-                description: "Override the agent's default for this heartbeat."
-            ) {
-                Picker("Model", selection: modelIdentifier) {
-                    Text("Agent default (\(agentDefaultModelName))")
-                        .tag("")
-
-                    Section("Override") {
-                        Text("Apple Foundation Model")
-                            .tag(ChatModelIdentifier.appleFoundation)
-
-                        ForEach(localModelStore.localModels) { model in
-                            Text(model.displayName)
-                                .tag(ChatModelIdentifier.localModelID(model.id))
-                        }
-                    }
-
-                    if let selectedIdentifier = heartbeat.modelIdentifier,
-                       !isModelConfigured(selectedIdentifier) {
-                        Text("Missing local model")
-                            .tag(selectedIdentifier)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 300)
+            ShadTabsContent(value: HeartbeatEditorTab.info) {
+                infoTab
+                    .frame(height: Self.tabPanelHeight, alignment: .topLeading)
             }
 
-            OpenUIDivider()
-
-            OpenUISettingsRow(
-                title: "Schedule",
-                description: "Choose an interval from one minute to one week."
-            ) {
-                Stepper(value: intervalMinutes, in: 1...10_080) {
-                    Text("Every \(heartbeat.normalizedIntervalMinutes) minutes")
-                        .font(.system(size: 13))
-                        .monospacedDigit()
-                }
-                .frame(width: 300)
+            ShadTabsContent(value: HeartbeatEditorTab.prompt) {
+                promptTab
+                    .frame(height: Self.tabPanelHeight, alignment: .topLeading)
             }
 
-            OpenUIDivider()
-
-            OpenUISettingsRow(
-                title: "Post to",
-                description: "Heartbeats post to this agent's default chat unless you pick another chat."
-            ) {
-                Picker("Post to", selection: destination) {
-                    Text("Default chat")
-                        .tag("private")
-
-                    if !extraDirectChats.isEmpty {
-                        Section("Other chats") {
-                            ForEach(extraDirectChats) { chat in
-                                Text(chat.title)
-                                    .tag("direct.\(chat.id.uuidString)")
-                            }
-                        }
-                    }
-
-                    if !chatStore.groupChats.isEmpty {
-                        Section("Group chats") {
-                            ForEach(chatStore.groupChats) { chat in
-                                Text(chat.title)
-                                    .tag("group.\(chat.id.uuidString)")
-                            }
-                        }
-                    }
-
-                    if heartbeat.targetKind == .privateChat,
-                       let targetChatID = heartbeat.targetChatID,
-                       !extraDirectChats.contains(where: { $0.id == targetChatID }) {
-                        Text("Missing private chat")
-                            .tag("direct.\(targetChatID.uuidString)")
-                    }
-
-                    if heartbeat.targetKind == .groupChat,
-                       let targetChatID = heartbeat.targetChatID,
-                       !chatStore.groupChats.contains(where: { $0.id == targetChatID }) {
-                        Text("Missing group chat")
-                            .tag("group.\(targetChatID.uuidString)")
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 300)
+            ShadTabsContent(value: HeartbeatEditorTab.history) {
+                historyTab
             }
-
-            OpenUIDivider()
-
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Executions")
-                    .font(.system(size: 14, weight: .medium))
-
-                Text("Each run is recorded even if the agent posts nothing. Open a run to view tools and the debug log.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(OpenUITheme.foregroundMuted)
-
-                if runningHeartbeat != nil || !executions.isEmpty {
-                    VStack(spacing: 0) {
-                        if let runningHeartbeat {
-                            HeartbeatRunningExecutionRow(startedAt: runningHeartbeat.startedAt)
-                            if !executions.isEmpty {
-                                OpenUIDivider()
-                            }
-                        }
-
-                        ForEach(Array(executions.enumerated()), id: \.element.id) { index, run in
-                            if index > 0 {
-                                OpenUIDivider()
-                            }
-                            HeartbeatExecutionRow(run: run)
-                        }
-                    }
-                    .padding(.top, 4)
-                } else {
-                    Text("No executions yet. The agent may post a reply, append memory, or pass.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(OpenUITheme.foregroundSubtle)
-                        .padding(.top, 4)
-                }
-            }
-            .padding(16)
         }
-        .openUICard()
+        .frame(maxWidth: .infinity)
+    }
+
+    private var infoTab: some View {
+        VStack(spacing: 0) {
+            ShadSettingsRow(
+                title: "Title",
+                description: "Shown in the heartbeats table."
+            ) {
+                ShadInput("Heartbeat title", text: title)
+                    .frame(width: 300)
+                    .accessibilityLabel("Heartbeat title")
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Enabled",
+                description: runningHeartbeat == nil
+                    ? "Run this heartbeat on its schedule."
+                    : "Wait for the current run to finish."
+            ) {
+                ShadSwitch(
+                    isOn: isEnabled,
+                    size: .sm
+                )
+                .disabled(runningHeartbeat != nil)
+                .accessibilityLabel("Heartbeat enabled")
+                .accessibilityValue(heartbeat.isEnabled ? "On" : "Off")
+                .accessibilityHint(
+                    runningHeartbeat == nil
+                        ? "Turns future runs on or off."
+                        : "Wait for the current run to finish before changing this setting."
+                )
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Schedule",
+                description: "How often this heartbeat runs."
+            ) {
+                HStack(spacing: theme.spacing.md) {
+                    ShadButton(
+                        icon: .minus,
+                        variant: .outline,
+                        size: .iconSM,
+                        accessibilityLabel: "Decrease interval"
+                    ) {
+                        intervalMinutes.wrappedValue = max(1, intervalMinutes.wrappedValue - 1)
+                    }
+                    .buttonRepeatBehavior(.enabled)
+                    .disabled(intervalMinutes.wrappedValue <= 1)
+
+                    ShadSelect(
+                        selection: optionalIntervalMinutes,
+                        options: intervalOptions,
+                        width: 200
+                    )
+                    .accessibilityLabel("Heartbeat frequency")
+                    .accessibilityValue(heartbeatFrequencyText(heartbeat.normalizedIntervalMinutes))
+
+                    ShadButton(
+                        icon: .plus,
+                        variant: .outline,
+                        size: .iconSM,
+                        accessibilityLabel: "Increase interval"
+                    ) {
+                        intervalMinutes.wrappedValue = min(10_080, intervalMinutes.wrappedValue + 1)
+                    }
+                    .buttonRepeatBehavior(.enabled)
+                    .disabled(intervalMinutes.wrappedValue >= 10_080)
+                }
+                .frame(width: 300)
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Model",
+                description: "Model used for this heartbeat."
+            ) {
+                ShadSelect(
+                    selection: optionalModelIdentifier,
+                    sections: heartbeatModelSections,
+                    width: 300
+                )
+                .accessibilityLabel("Heartbeat model")
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Post to",
+                description: "Chat that receives heartbeat output."
+            ) {
+                ShadSelect(
+                    selection: optionalDestination,
+                    sections: destinationSections,
+                    width: 300
+                )
+                .accessibilityLabel("Heartbeat destination")
+            }
+        }
+        .shadSettingsCard()
+    }
+
+    private var promptTab: some View {
+        ShadField {
+            ShadFieldLabel("Prompt")
+            ShadFieldDescription("Tell the agent what to consider when this heartbeat runs.")
+            ShadTextarea(
+                "Tell the agent what to consider",
+                text: instruction,
+                minHeight: 220,
+                maxHeight: 220
+            )
+            .accessibilityLabel("Heartbeat prompt")
+        }
+        .padding(16)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .shadSettingsCard()
+    }
+
+    private var historyTab: some View {
+        ShadDialogBody(maxHeight: Self.tabPanelHeight) {
+            historyContent
+        }
+        .frame(height: Self.tabPanelHeight, alignment: .topLeading)
+    }
+
+    private var historyContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Executions")
+                .font(theme.font(theme.typography.sm, theme.typography.medium))
+
+            Text("Each run is recorded even if the agent posts nothing. Open a run to view tools and the debug log.")
+                .font(theme.font(theme.typography.sm))
+                .foregroundStyle(theme.colors.mutedForeground)
+
+            if runningHeartbeat != nil || !executions.isEmpty {
+                VStack(spacing: 0) {
+                    if let runningHeartbeat {
+                        HeartbeatRunningExecutionRow(startedAt: runningHeartbeat.startedAt)
+                        if !executions.isEmpty {
+                            ShadSeparator()
+                        }
+                    }
+
+                    ForEach(Array(executions.enumerated()), id: \.element.id) { index, run in
+                        if index > 0 {
+                            ShadSeparator()
+                        }
+                        HeartbeatExecutionRow(run: run)
+                    }
+                }
+                .padding(.top, 4)
+            } else {
+                Text("No executions yet. The agent may post a reply, append memory, or pass.")
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.mutedForeground)
+                    .padding(.top, 4)
+            }
+        }
+        .padding(16)
+        .shadSettingsCard()
+    }
+
+    private var isEnabled: Binding<Bool> {
+        Binding(
+            get: { heartbeat.isEnabled },
+            set: { store.updateHeartbeatEnabled(heartbeat, isEnabled: $0) }
+        )
+    }
+
+    private var title: Binding<String> {
+        Binding(
+            get: { heartbeat.title ?? "" },
+            set: { store.updateHeartbeatTitle(heartbeat, title: $0) }
+        )
     }
 
     private var instruction: Binding<String> {
@@ -1000,11 +1553,25 @@ struct AgentHeartbeatEditor: View {
         )
     }
 
-    private var isEnabled: Binding<Bool> {
+    private var optionalIntervalMinutes: Binding<Int?> {
         Binding(
-            get: { heartbeat.isEnabled },
-            set: { store.updateHeartbeatEnabled(heartbeat, isEnabled: $0) }
+            get: { intervalMinutes.wrappedValue },
+            set: { value in
+                guard let value else { return }
+                intervalMinutes.wrappedValue = value
+            }
         )
+    }
+
+    private var intervalOptions: [ShadSelectOption<Int>] {
+        let presets = [1, 5, 15, 30, 60, 120, 360, 720, 1_440, 2_880, 10_080]
+        let values = Set(presets + [heartbeat.normalizedIntervalMinutes]).sorted()
+        return values.map { minutes in
+            ShadSelectOption(
+                heartbeatFrequencyText(minutes),
+                value: minutes
+            )
+        }
     }
 
     private var modelIdentifier: Binding<String> {
@@ -1019,6 +1586,46 @@ struct AgentHeartbeatEditor: View {
         )
     }
 
+    private var optionalModelIdentifier: Binding<String?> {
+        Binding(
+            get: { modelIdentifier.wrappedValue },
+            set: { newValue in
+                guard let newValue else { return }
+                modelIdentifier.wrappedValue = newValue
+            }
+        )
+    }
+
+    private var heartbeatModelSections: [ShadSelectSection<String>] {
+        var overrides = localModelStore.selectableModels.map { model in
+            ShadSelectOption(
+                model.displayName,
+                value: model.identifier
+            )
+        }
+        if let selectedIdentifier = heartbeat.modelIdentifier,
+           !overrides.contains(where: { $0.value == selectedIdentifier }) {
+            overrides.append(
+                ShadSelectOption(
+                    localModelStore.displayName(for: selectedIdentifier),
+                    value: selectedIdentifier
+                )
+            )
+        }
+
+        return [
+            ShadSelectSection(
+                options: [
+                    ShadSelectOption(
+                        "Agent default (\(agentDefaultModelName))",
+                        value: ""
+                    )
+                ]
+            ),
+            ShadSelectSection("Override", options: overrides),
+        ]
+    }
+
     private var extraDirectChats: [ChatViewModel] {
         chatStore.extraChats(for: heartbeat.agentID)
     }
@@ -1028,12 +1635,6 @@ struct AgentHeartbeatEditor: View {
             return "Missing agent"
         }
         return localModelStore.displayName(for: agent.selectedModelIdentifier)
-    }
-
-    private func isModelConfigured(_ identifier: String) -> Bool {
-        identifier == ChatModelIdentifier.appleFoundation || localModelStore.localModels.contains {
-            ChatModelIdentifier.localModelID($0.id) == identifier
-        }
     }
 
     private var destination: Binding<String> {
@@ -1071,25 +1672,79 @@ struct AgentHeartbeatEditor: View {
             )
         }
     }
+
+    private var optionalDestination: Binding<String?> {
+        Binding(
+            get: { destination.wrappedValue },
+            set: { newValue in
+                guard let newValue else { return }
+                destination.wrappedValue = newValue
+            }
+        )
+    }
+
+    private var destinationSections: [ShadSelectSection<String>] {
+        var sections = [
+            ShadSelectSection(
+                options: [ShadSelectOption("Default chat", value: "private")]
+            )
+        ]
+
+        var directOptions = extraDirectChats.map { chat in
+            ShadSelectOption(chat.title, value: "direct.\(chat.id.uuidString)")
+        }
+        if heartbeat.targetKind == .privateChat,
+           let targetChatID = heartbeat.targetChatID,
+           !extraDirectChats.contains(where: { $0.id == targetChatID }) {
+            directOptions.append(
+                ShadSelectOption(
+                    "Missing private chat",
+                    value: "direct.\(targetChatID.uuidString)"
+                )
+            )
+        }
+        if !directOptions.isEmpty {
+            sections.append(ShadSelectSection("Other chats", options: directOptions))
+        }
+
+        var groupOptions = chatStore.groupChats.map { chat in
+            ShadSelectOption(chat.title, value: "group.\(chat.id.uuidString)")
+        }
+        if heartbeat.targetKind == .groupChat,
+           let targetChatID = heartbeat.targetChatID,
+           !chatStore.groupChats.contains(where: { $0.id == targetChatID }) {
+            groupOptions.append(
+                ShadSelectOption(
+                    "Missing group chat",
+                    value: "group.\(targetChatID.uuidString)"
+                )
+            )
+        }
+        if !groupOptions.isEmpty {
+            sections.append(ShadSelectSection("Group chats", options: groupOptions))
+        }
+
+        return sections
+    }
 }
 
 private struct HeartbeatRunningExecutionRow: View {
     let startedAt: Date
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            ProgressView()
-                .controlSize(.small)
+            ShadSpinner(size: theme.typography.base)
                 .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Running")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(theme.font(theme.typography.sm, theme.typography.medium))
 
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(elapsedText(at: context.date))
-                        .font(.system(size: 12).monospacedDigit())
-                        .foregroundStyle(OpenUITheme.foregroundSubtle)
+                        .font(theme.typography.monoFont(theme.typography.xs))
+                        .foregroundStyle(theme.colors.mutedForeground)
                 }
             }
 
@@ -1110,27 +1765,27 @@ private struct HeartbeatExecutionRow: View {
     let run: HeartbeatRun
 
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.shadTheme) private var theme
     @State private var turn: GenerationTurn?
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: run.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .font(.system(size: 14))
-                .foregroundStyle(run.succeeded ? Color(red: 22 / 255, green: 163 / 255, blue: 74 / 255) : OpenUITheme.warningForeground)
+            ShadIconView(run.succeeded ? .circleCheck : .triangleAlert, size: theme.typography.sm)
+                .foregroundStyle(run.succeeded ? theme.colors.success : theme.colors.warning)
                 .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(run.completedAt.formatted(date: .abbreviated, time: .shortened))
-                    .font(.system(size: 13, weight: .medium))
+                    .font(theme.font(theme.typography.sm, theme.typography.medium))
 
                 Text(run.errorMessage ?? run.actionSummary)
-                    .font(.system(size: 12))
-                    .foregroundStyle(run.succeeded ? OpenUITheme.foregroundMuted : OpenUITheme.warningForeground)
+                    .font(theme.font(theme.typography.xs))
+                    .foregroundStyle(run.succeeded ? theme.colors.mutedForeground : theme.colors.warning)
                     .lineLimit(2)
 
                 Text(HeartbeatRun.metricsLine(duration: run.formattedDuration, tokens: run.formattedTokenUsage))
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundStyle(OpenUITheme.foregroundSubtle)
+                    .font(theme.typography.monoFont(theme.typography.xs))
+                    .foregroundStyle(theme.colors.mutedForeground)
                     .help(run.tokenUsageHelp ?? "Duration of this heartbeat run")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1159,19 +1814,19 @@ struct ResizableAgentTextEditor: View {
     @Binding var height: CGFloat
     let resizeHelpText: String
     @State private var dragStartHeight: CGFloat?
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
-        SoulTextView(text: $text)
-            .padding(12)
-            .padding(.bottom, 8)
-            .background(OpenUITheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(OpenUITheme.border, lineWidth: 1)
-            }
+        ShadTextarea(
+            "",
+            text: $text,
+            minHeight: textareaContentHeight,
+            maxHeight: textareaContentHeight
+        )
+            .accessibilityLabel(editorAccessibilityLabel)
             .overlay(alignment: .bottomTrailing) {
                 ResizeGrip(helpText: resizeHelpText)
-                    .padding(5)
+                    .padding(theme.spacing.sm)
                     .gesture(
                         DragGesture()
                             .onChanged { value in
@@ -1190,86 +1845,24 @@ struct ResizableAgentTextEditor: View {
             .frame(maxWidth: .infinity)
             .frame(height: height)
     }
-}
 
-#if os(macOS)
-struct SoulTextView: NSViewRepresentable {
-    @Binding var text: String
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
-
-        guard let textView = scrollView.documentView as? NSTextView else {
-            return scrollView
-        }
-
-        textView.delegate = context.coordinator
-        textView.string = text
-        textView.font = .systemFont(ofSize: 15)
-        textView.drawsBackground = false
-        textView.isRichText = false
-        textView.allowsUndo = true
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.textContainerInset = .zero
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: scrollView.contentSize.width, height: .greatestFiniteMagnitude)
-
-        return scrollView
+    private var textareaContentHeight: CGFloat {
+        max(0, height - (theme.spacing.xl + theme.borderWidth * 2))
     }
 
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
-
-        if textView.string != text {
-            textView.string = text
-        }
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
-    }
-
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        @Binding var text: String
-
-        init(text: Binding<String>) {
-            _text = text
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else { return }
-            text = textView.string
-        }
+    private var editorAccessibilityLabel: String {
+        resizeHelpText.replacingOccurrences(of: "Resize ", with: "")
     }
 }
-#else
-struct SoulTextView: View {
-    @Binding var text: String
-
-    var body: some View {
-        TextEditor(text: $text)
-            .font(.system(size: 15))
-            .scrollContentBackground(.hidden)
-            .scrollIndicators(.automatic)
-    }
-}
-#endif
 
 struct ResizeGrip: View {
     let helpText: String
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         Canvas { context, size in
-            let stroke = StrokeStyle(lineWidth: 1.2, lineCap: .round)
-            let color = Color.gray.opacity(0.55)
+            let stroke = StrokeStyle(lineWidth: theme.borderWidth, lineCap: .round)
+            let color = theme.colors.mutedForeground.opacity(0.6)
 
             for offset in stride(from: 0.0, through: 8.0, by: 4.0) {
                 var path = Path()
@@ -1359,6 +1952,7 @@ private struct AgentsPreferencesViewPreview: View {
             heartbeatScheduler: heartbeatScheduler
         )
         .modelContainer(modelContainer)
+        .shadTheme(ChatShadTheme.theme)
         .frame(width: 900, height: 680)
     }
 }

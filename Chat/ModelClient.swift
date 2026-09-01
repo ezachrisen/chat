@@ -59,6 +59,14 @@ enum ModelClient {
                 tools: tools,
                 captureDebug: captureDebug
             )
+        case .chatGPT(let configuration):
+            return try await ChatGPTProviderClient.generate(
+                configuration: configuration,
+                systemPrompt: systemPrompt,
+                prompt: prompt,
+                tools: tools,
+                captureDebug: captureDebug
+            )
         case .openAICompatible(let configuration):
             return try await OpenAICompatibleClient(configuration: configuration).respond(
                 systemPrompt: systemPrompt,
@@ -66,6 +74,8 @@ enum ModelClient {
                 tools: tools,
                 captureDebug: captureDebug
             )
+        case .missingChatGPTProvider:
+            throw ChatGPTProviderError.executableNotFound
         case .missingLocalModel:
             throw OpenAICompatibleError.server(statusCode: 0, message: missingLocalModelMessage)
         }
@@ -90,6 +100,14 @@ enum ModelClient {
                 captureDebug: captureDebug,
                 missingLocalModelMessage: missingLocalModelMessage
             )
+        case .chatGPT(let configuration):
+            return try await ChatGPTProviderClient.generate(
+                configuration: configuration,
+                systemPrompt: systemPrompt,
+                prompt: appleFoundationPrompt,
+                tools: tools,
+                captureDebug: captureDebug
+            )
         case .openAICompatible(let configuration):
             return try await OpenAICompatibleClient(configuration: configuration).respond(
                 systemPrompt: systemPrompt,
@@ -97,6 +115,8 @@ enum ModelClient {
                 tools: tools,
                 captureDebug: captureDebug
             )
+        case .missingChatGPTProvider:
+            throw ChatGPTProviderError.executableNotFound
         case .missingLocalModel:
             throw OpenAICompatibleError.server(statusCode: 0, message: missingLocalModelMessage)
         }
@@ -160,11 +180,18 @@ enum ModelClient {
     @MainActor
     static func availability(for backend: ChatBackend) -> (canSend: Bool, message: String) {
         switch backend {
+        case .chatGPT(let configuration):
+            if let validationError = configuration.validationError {
+                return (false, "ChatGPT: \(validationError)")
+            }
+            return (true, "\(configuration.displayName) is ready.")
         case .openAICompatible(let configuration):
             if let validationError = configuration.validationError {
                 return (false, "\(configuration.name): \(validationError)")
             }
             return (true, "\(configuration.name) is ready.")
+        case .missingChatGPTProvider:
+            return (false, "Install the ChatGPT app or Codex CLI, then connect ChatGPT in Settings → Models.")
         case .missingLocalModel:
             return (false, "This chat's local model is no longer configured.")
         case .appleFoundation:

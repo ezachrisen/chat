@@ -6,6 +6,10 @@
 	objectVersion = 90;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		BE84101C05424B86B1397511 /* ShadSwift in Frameworks */ = {isa = PBXBuildFile; productRef = C946EF664C914BF2B9F33EC5 /* ShadSwift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* Chat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Chat.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -22,6 +26,7 @@
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				BE84101C05424B86B1397511 /* ShadSwift in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -60,6 +65,9 @@
 				000000000000000000000010 /* Chat */,
 			);
 			name = Chat;
+			packageProductDependencies = (
+				C946EF664C914BF2B9F33EC5 /* ShadSwift */,
+			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* Chat.app */;
 			productType = "com.apple.product-type.application";
@@ -88,6 +96,9 @@
 			);
 			mainGroup = 000000000000000000000001;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				34DB52C6049A4D97BB860A8C /* XCRemoteSwiftPackageReference "shadswift" */,
+			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
 			projectDirPath = "";
@@ -353,6 +364,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		34DB52C6049A4D97BB860A8C /* XCRemoteSwiftPackageReference "shadswift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ezachrisen/shadswift.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.1.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C946EF664C914BF2B9F33EC5 /* ShadSwift */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 34DB52C6049A4D97BB860A8C /* XCRemoteSwiftPackageReference "shadswift" */;
+			productName = ShadSwift;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 000000000000000000000000 /* Project object */;
 }

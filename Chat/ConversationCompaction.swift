@@ -34,9 +34,10 @@ struct ConversationDigest {
 
 @MainActor
 enum ConversationCompaction {
-    static let localModelDefaultContextTokens = 8_192
-    static let minimumContextTokens = 1_024
-    static let maximumContextTokens = 1_000_000
+    nonisolated static let localModelDefaultContextTokens = 8_192
+    nonisolated static let chatGPTDefaultContextTokens = 128_000
+    nonisolated static let minimumContextTokens = 1_024
+    nonisolated static let maximumContextTokens = 1_000_000
 
     private static let logger = Logger(subsystem: "Chat", category: "Compaction")
     private static let appleFillRatio = 0.88
@@ -59,8 +60,12 @@ enum ConversationCompaction {
         case .appleFoundation:
             let size = SystemLanguageModel.default.contextSize
             return size > 0 ? size : 4_096
+        case .chatGPT(let configuration):
+            return configuration.contextTokenLimit
         case .openAICompatible(let configuration):
             return configuration.contextTokenLimit
+        case .missingChatGPTProvider:
+            return chatGPTDefaultContextTokens
         case .missingLocalModel:
             return localModelDefaultContextTokens
         }

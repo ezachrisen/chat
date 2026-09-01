@@ -1,7 +1,9 @@
+import ShadSwift
 import SwiftUI
 
 struct VoiceDictationGlow: ViewModifier {
     let isActive: Bool
+    @Environment(\.shadTheme) private var theme
 
     func body(content: Content) -> some View {
         content
@@ -11,37 +13,37 @@ struct VoiceDictationGlow: ViewModifier {
                         let cycle = context.date.timeIntervalSinceReferenceDate
                             .truncatingRemainder(dividingBy: 3.6) / 3.6
 
-                        RoundedRectangle(cornerRadius: 8)
+                        ShadRoundedRectangle(cornerRadius: theme.radius.lg)
                             .stroke(
                                 AngularGradient(
                                     colors: [
-                                        Color(red: 1.00, green: 0.91, blue: 0.57),
-                                        Color(red: 0.57, green: 0.82, blue: 1.00),
-                                        Color(red: 0.80, green: 0.68, blue: 1.00),
-                                        Color(red: 1.00, green: 0.91, blue: 0.57),
+                                        theme.colors.warning,
+                                        theme.colors.info,
+                                        theme.colors.primary,
+                                        theme.colors.warning,
                                     ],
                                     center: .center,
                                     angle: .degrees(cycle * 360)
                                 ),
-                                lineWidth: 2
+                                lineWidth: theme.borderWidth * 2
                             )
                             .shadow(
-                                color: Color(red: 1.00, green: 0.91, blue: 0.57).opacity(0.36),
-                                radius: 8
+                                color: theme.colors.warning.opacity(0.36),
+                                radius: theme.spacing.md
                             )
                             .shadow(
-                                color: Color(red: 0.57, green: 0.82, blue: 1.00).opacity(0.34),
-                                radius: 10
+                                color: theme.colors.info.opacity(0.34),
+                                radius: theme.radius.lg
                             )
                             .shadow(
-                                color: Color(red: 0.80, green: 0.68, blue: 1.00).opacity(0.30),
-                                radius: 12
+                                color: theme.colors.primary.opacity(0.30),
+                                radius: theme.spacing.lg
                             )
                     }
                     .allowsHitTesting(false)
                     .transition(.opacity)
                 }
             }
-            .animation(.easeInOut(duration: 0.18), value: isActive)
+            .animation(theme.interactionAnimation, value: isActive)
     }
 }

@@ -2,11 +2,12 @@
 
 This document describes the context the chat harness sends to a model for normal replies and scheduled heartbeats. Keep it updated whenever persistence, prompt construction, memory handling, message loading, or orchestration changes.
 
-Implementation snapshot: August 27, 2026.
+Implementation snapshot: September 1, 2026.
 
 Primary implementation:
 
-- `Chat/ModelClient.swift`: Apple Foundation and OpenAI-compatible model calls, including tool loops
+- `Chat/ModelClient.swift`: Apple Foundation, ChatGPT subscription, and OpenAI-compatible model dispatch
+- `Chat/ChatGPTProvider.swift`: Codex app-server authentication, model discovery, generation, and dynamic-tool bridging
 - `Chat/ModelPrompts.swift`: system and conversation prompt construction
 - `Chat/AgentMemory.swift`: memory protocol sent to models and parsed from replies
 - `Chat/SkillCatalog.swift`: `~/.chat/skills` discovery and global enablement
@@ -22,6 +23,7 @@ Primary implementation:
 An agent has:
 
 - A display name
+- An optional avatar image and crop used only by the app UI
 - Individual instructions, stored as `soul`
 - Persistent memory
 - A selected model
@@ -31,9 +33,9 @@ An agent has:
 
 Text-to-speech settings are live agent configuration and are not included in model prompts. While voice mode is active, each visible assistant response is sent to the responding agent's selected command-line tool using its configured voice name and voice model, then the generated WAV file is played.
 
-Direct chats snapshot the agent ID, name, individual instructions, and model selection when the chat is created. Ordinary replies continue using the snapshotted name and model selection, but read the agent's current individual instructions immediately before generation. The instruction snapshot is retained as a fallback if the agent is later deleted.
+An agent's default direct chat follows the agent's current name, individual instructions, and model selection. Its stored snapshot is synchronized whenever the agent changes and again before a send, so a newly configured agent cannot remain pinned to its creation-time `Untitled Agent` and Apple model defaults. Extra direct chats snapshot the agent ID, name, and model selection when the chat is created, while still reading the agent's current individual instructions immediately before generation. Those snapshots keep stored history self-describing if the agent is later deleted.
 
-Group chats snapshot the same fields when an agent first joins through an `@mention` or heartbeat. Ordinary group replies continue using the participant's snapshotted name and model selection, but read the agent's current individual instructions immediately before generation. The participant's instruction snapshot is retained as a fallback if the agent is later deleted.
+Group chats snapshot the same fields when an agent first joins through an `@mention` or heartbeat. Ordinary group replies continue using the participant's snapshotted name and model selection, but read the agent's current individual instructions immediately before generation. Deleting an agent removes it from live group participant rosters while preserving authored messages and generation history.
 
 Individual instructions and memory are live agent state. Normal direct replies, normal group replies, and heartbeats read the agent's current instructions and memory immediately before generation. Edits and model-appended memory entries therefore apply across existing chats on the next turn.
 
@@ -119,6 +121,8 @@ If the output contains only memory blocks, memory is updated without posting a c
 
 Each agent has one **default direct chat**. It is created with the agent, always appears in the sidebar as the agent's avatar and name, and cannot be deleted. Extra direct chats with the same agent are created from the agent's context menu (`New chat`) and are listed indented under that row, showing only the chat title.
 
+The oldest agent is the **default agent** and cannot be deleted. Other agents can be deleted from the Advanced editor tab. Deletion removes their heartbeat schedules, detaches them from live group participation, and hides their direct chats while preserving stored messages and generation history.
+
 Heartbeats whose destination is the agent's private chat post to that default chat unless a specific extra chat is selected. Resetting a chat records `clearedThroughMessageID` on `StoredChat`: messages through that id stay in the database but are omitted from the visible transcript and from model context. Reset also clears the chat's compaction digest and watermark so the prior session is not summarized into the next one.
 
 ## Direct chats
@@ -149,13 +153,23 @@ The newly submitted user message is persisted before this transcript is built. E
 
 No Apple session is reused between turns. All conversational memory comes from the digest plus tail and agent memory included in the current request.
 
+### ChatGPT subscription
+
+The ChatGPT subscription backend uses the supported Codex app-server protocol over a local JSONL subprocess. It accepts only an account reported by Codex as `chatgpt` whose configuration requires OpenAI authentication; an API-key session or custom model provider is rejected so this provider cannot silently switch to metered or third-party billing. Threads explicitly request the built-in `openai` provider and verify the provider returned by Codex before a turn starts. Chat does not read, copy, or persist Codex authentication tokens. Codex owns sign-in, credential refresh, and account storage.
+
+Each generation starts an ephemeral Codex thread in a newly created empty temporary directory. The thread uses no approvals, a read-only sandbox with network disabled, no workspace roots or execution environments, and chat-specific base instructions that prohibit built-in Codex shell, file, workspace, browser, web, MCP, collaboration, and patch tools. The temporary directory is removed after the turn. SwiftData remains the sole authority for conversation history.
+
+The direct-chat digest and tail are flattened into the same conversation prompt used by Apple Foundation Model and passed as one text input. The effective agent system instructions are supplied as developer instructions. Selecting `ChatGPT (recommended model)` omits a model override so Codex chooses the account default; selecting a discovered model sends its Codex model ID.
+
+Enabled agent tools are translated into app-server dynamic function tools. A dynamic call is routed back through `AgentToolBox`, including the existing skill, notification, and calendar policy checks, and the result is returned to the same Codex turn. Command-execution and file-change approval requests are always declined.
+
 ### OpenAI-compatible model
 
 The harness sends native chat-completion roles for the **tail** only. The digest is appended to the system message when present:
 
 ```json
 {
-  "model": "<chat's snapshotted model ID>",
+      "model": "<default chat's current model ID, or extra chat's snapshotted model ID>",
   "messages": [
     {
       "role": "system",
@@ -179,7 +193,7 @@ Author IDs and names are not sent in the native message entries because a direct
 
 The visible `StoredChatMessage` log is never rewritten in place. Reset and extra-chat deletion are the exceptions to “never deleted from the UI”: reset hides rows via `clearedThroughMessageID` without deleting them; deleting an extra or group chat removes that chat and its messages. Default chats cannot be deleted. Each chat stores an optional rolling digest (`compactedSummary`) and a watermark (`compactedThroughMessageID`). Compaction only sees the active session (messages after `clearedThroughMessageID`).
 
-Before a direct reply or group participant reply, the harness budgets the destination model's context window (Apple `contextSize` at runtime, or the local model's configured token limit, default 8192). It keeps as much recent verbatim history as fits after system instructions, memory, tools, and a reply reserve. Messages that no longer fit are folded into the digest with the on-device Apple Foundation Model: existing digest + overflow span → replacement digest covering the whole span through the new watermark. Long overflow is chunked to fit the summarizer's own window, then merged.
+Before a direct reply or group participant reply, the harness budgets the destination model's context window (Apple `contextSize` at runtime, 128,000 tokens for ChatGPT subscription models, or the local model's configured token limit, default 8192). It keeps as much recent verbatim history as fits after system instructions, memory, tools, and a reply reserve. Messages that no longer fit are folded into the digest with the on-device Apple Foundation Model: existing digest + overflow span → replacement digest covering the whole span through the new watermark. Long overflow is chunked to fit the summarizer's own window, then merged.
 
 If Apple Intelligence is unavailable or summarization throws, those overflow messages are omitted from the **prompt only** for that turn.
 
@@ -193,7 +207,7 @@ Compaction is serialized per chat. The digest is chat-local and is not written t
 
 The harness extracts case-insensitive tokens matching `@[letters, numbers, or underscore]`. An agent's mention is its display name with non-alphanumeric characters removed; `Product Critic` becomes `@ProductCritic`.
 
-Newly mentioned agents are snapshotted and added before the user message is persisted. The snapshot supplies the participant's name and model selection and serves as a fallback for individual instructions if the agent is later deleted. The `@mention` remains in the stored message and model transcript.
+Newly mentioned agents are snapshotted and added before the user message is persisted. The snapshot supplies the participant's name and model selection. Deleting the agent later removes that participant from the live roster, while the `@mention`, authored messages, and generation history remain stored.
 
 Every stored participant is offered a response on each user turn:
 
@@ -277,6 +291,8 @@ The latest user message does not directly mention you. You may still respond if 
 
 For Apple Foundation Models, a new session is created with the group system prompt and the conversation prompt is passed to `respond(to:)`.
 
+For ChatGPT subscription models, the complete group prompt is passed as one text input to a new ephemeral Codex app-server thread with the group system prompt as developer instructions.
+
 For OpenAI-compatible models, the request contains exactly one `system` message and one `user` message. The complete transcript exists inside that single user message rather than native per-turn roles.
 
 ## Heartbeats
@@ -355,7 +371,7 @@ Follow that instruction completely, including any tools it names.
 Then decide whether to post as <agent name>. Return [[PASS]] if no chat message should be posted.
 ```
 
-For both backends this is one prompt. Apple uses a new `LanguageModelSession`; OpenAI-compatible models receive one `system` and one `user` message.
+For all backends this is one prompt. Apple uses a new `LanguageModelSession`; ChatGPT uses a new ephemeral Codex app-server thread; OpenAI-compatible models receive one `system` and one `user` message.
 
 The prior-completion age uses a compact, truncated representation: seconds, minutes, hours, days, weeks, 30-day months, or 365-day years, measured from the heartbeat's start time. A heartbeat with no prior completed attempt receives `never`. “Completed” includes a post, pass, empty response, generation or destination error, user abort, and timeout; skipping a scheduled occurrence does not count as completion.
 
@@ -393,10 +409,10 @@ Memory blocks are removed before this check, so an agent can append memory and p
 - Heartbeat scheduling metadata other than the compact age of the prior completed attempt
 - The complete list of silent group participants
 - Model display names
-- Server URLs or bearer tokens
+- Server URLs, bearer tokens, or ChatGPT authentication tokens
 - UI state such as selection and availability messages
 
-The configured OpenAI-compatible model ID is sent in the request's `model` field. URLs and bearer tokens are transport configuration.
+The configured OpenAI-compatible model ID is sent in the request's `model` field. A specifically selected ChatGPT model ID is sent to Codex app-server; the recommended selection leaves model choice to Codex. URLs, bearer tokens, and Codex-managed ChatGPT credentials are transport configuration.
 
 ## Issues and design risks
 
@@ -408,28 +424,30 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 
 3. **The memory protocol is marker-based.** A malformed or incomplete marker becomes visible text. A model can append low-quality, duplicated, or misleading memory, and there is no confirmation, provenance, size limit, or deduplication.
 
+4. **Codex app-server does not expose a stable per-thread allowlist for its built-in tools.** The ChatGPT provider supplies an empty temporary working directory, a read-only/no-network sandbox, no workspace roots or execution environments, declines mutation approvals, and instructs the model to use only host-supplied dynamic tools. Those controls prevent writes and intentionally supplied workspace context, but prompt instructions are not a technical guarantee against a built-in read command targeting another host path. Stronger isolation requires a supported app-server tool allowlist or a separately sandboxed subprocess.
+
 ### Medium priority
 
-4. **Heartbeats run only while Chat is open.** There is no OS background task, launch agent, or catch-up queue. Sleep, termination, and prolonged suspension delay execution.
+5. **Heartbeats run only while Chat is open.** There is no OS background task, launch agent, or catch-up queue. Sleep, termination, and prolonged suspension delay execution.
 
-5. **Single-flight deferral can create schedule drift.** A heartbeat that becomes due while another heartbeat is running is postponed by its complete configured interval. Repeated contention can defer a heartbeat more than once, especially when a long-interval heartbeat happens to become due during frequent runs.
+6. **Single-flight deferral can create schedule drift.** A heartbeat that becomes due while another heartbeat is running is postponed by its complete configured interval. Repeated contention can defer a heartbeat more than once, especially when a long-interval heartbeat happens to become due during frequent runs.
 
-6. **Execution control is in-memory and backend cancellation is cooperative.** If the app terminates after a heartbeat is claimed, the model request stops without a completed or aborted audit record, while the already-advanced next-run date remains persisted. At the five-minute UI timeout the global heartbeat slot is released; a non-cooperative backend may continue consuming resources and overlap a later heartbeat until it returns, although its late output is discarded.
+7. **Execution control is in-memory and backend cancellation is cooperative.** If the app terminates after a heartbeat is claimed, the model request stops without a completed or aborted audit record, while the already-advanced next-run date remains persisted. At the five-minute UI timeout the global heartbeat slot is released; a non-cooperative backend may continue consuming resources and overlap a later heartbeat until it returns, although its late output is discarded.
 
-7. **Heartbeat history has no retention limit.** Each completed attempt stores the full model input and raw output. Long conversations and frequent schedules can make the SwiftData store grow quickly.
+8. **Heartbeat history has no retention limit.** Each completed attempt stores the full model input and raw output. Long conversations and frequent schedules can make the SwiftData store grow quickly.
 
-8. **Ordinary turns and heartbeat turns use different name and model snapshot rules.** Existing chats use snapshotted names and model choices for normal replies, while heartbeats use current agent configuration plus an optional per-heartbeat model override. Both paths use current individual instructions and memory, but a heartbeat post can still differ from the agent's next ordinary reply in the same chat because of its name or model.
+9. **Extra-chat turns and heartbeat turns use different name and model snapshot rules.** Default chats and heartbeats use current agent configuration, with an optional per-heartbeat model override. Extra chats retain snapshotted names and model choices. All paths use current individual instructions and memory, but a heartbeat post can still differ from the agent's next ordinary reply in an extra chat because of its name or model.
 
-9. **Group turns remain asymmetric.** Later agents see earlier replies from the same turn; earlier agents cannot react to later replies until another user turn or heartbeat.
+10. **Group turns remain asymmetric.** Later agents see earlier replies from the same turn; earlier agents cannot react to later replies until another user turn or heartbeat.
 
-10. **Normal group-generation errors are still agent speech.** The error bubble is attributed to the agent and enters the transcript seen by later participants.
+11. **Normal group-generation errors are still agent speech.** The error bubble is attributed to the agent and enters the transcript seen by later participants.
 
-11. **Mention handles can collide.** Removing spaces and punctuation can map multiple agent names to one handle, adding or emphasizing every match.
+12. **Mention handles can collide.** Removing spaces and punctuation can map multiple agent names to one handle, adding or emphasizing every match.
 
 ### Lower priority
 
-12. **Pass detection is exact and fragile.** Extra punctuation or explanation around the marker produces a visible post.
+13. **Pass detection is exact and fragile.** Extra punctuation or explanation around the marker produces a visible post.
 
-13. **Silent group participants are absent from context.** An agent learns who else is present only after those participants post.
+14. **Silent group participants are absent from context.** An agent learns who else is present only after those participants post.
 
-14. **Memory edits can race with generation.** The user can edit memory while a request is running. The request uses the memory captured at prompt construction, while any model additions are appended to whatever text exists when the result returns.
+15. **Memory edits can race with generation.** The user can edit memory while a request is running. The request uses the memory captured at prompt construction, while any model additions are appended to whatever text exists when the result returns.

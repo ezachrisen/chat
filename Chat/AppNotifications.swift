@@ -12,7 +12,7 @@ nonisolated enum AppNotificationError: LocalizedError {
         case .emptyBody:
             return "A notification body is required."
         case .denied:
-            return "Notifications are turned off for Chat. Enable them in System Settings → Notifications → Chat."
+            return "Chat isn’t authorized to send notifications. Enable it in System Settings → Notifications → Chat. If Chat isn’t listed, run a signed app build first."
         case .deliveryFailed(let message):
             return "The notification could not be sent. \(message)"
         }
@@ -56,9 +56,6 @@ enum AppNotifications {
 
     static func prepare() {
         UNUserNotificationCenter.current().delegate = NotificationPresentationDelegate.shared
-        Task {
-            await requestAuthorizationIfNeeded()
-        }
     }
 
     static func resolvedTitle(title: String?, fallback: String) -> String {
@@ -103,7 +100,7 @@ enum AppNotifications {
         do {
             try await center.add(request)
         } catch {
-            throw AppNotificationError.deliveryFailed(error.localizedDescription)
+            throw mappedError(error)
         }
 
         return "Notification sent."
@@ -135,13 +132,6 @@ enum AppNotifications {
         }
     }
 
-    static func requestAuthorizationIfNeeded() async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .notDetermined else { return }
-        _ = try? await center.requestAuthorization(options: authorizationOptions)
-    }
-
     private static func ensureAuthorized() async throws {
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
@@ -149,7 +139,12 @@ enum AppNotifications {
         case .authorized, .provisional, .ephemeral:
             return
         case .notDetermined:
-            let granted = try await center.requestAuthorization(options: authorizationOptions)
+            let granted: Bool
+            do {
+                granted = try await center.requestAuthorization(options: authorizationOptions)
+            } catch {
+                throw mappedError(error)
+            }
             guard granted else {
                 throw AppNotificationError.denied
             }
@@ -158,6 +153,15 @@ enum AppNotifications {
         @unknown default:
             throw AppNotificationError.denied
         }
+    }
+
+    private static func mappedError(_ error: Error) -> AppNotificationError {
+        let nsError = error as NSError
+        if nsError.domain == UNErrorDomain,
+           nsError.code == UNError.Code.notificationsNotAllowed.rawValue {
+            return .denied
+        }
+        return .deliveryFailed(error.localizedDescription)
     }
 
     private static func presentAlert(title: String, text: String) {

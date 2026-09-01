@@ -100,6 +100,11 @@ final class StoredChatMessage: Identifiable {
 
 @MainActor
 final class ChatStore: ObservableObject {
+    struct AgentDeactivationPlan {
+        let agentID: Agent.ID
+        fileprivate let groupParticipantObjectIDs: [ChatViewModel.ID: Set<ObjectIdentifier>]
+    }
+
     private static let messageBatchSize = 40
 
     @Published var chats: [ChatViewModel] = []
@@ -111,6 +116,8 @@ final class ChatStore: ObservableObject {
     private let skillCatalog: SkillCatalog
     private let replyFilterStore: ReplyFilterStore
     private var agentsCancellable: AnyCancellable?
+    private var agentConfigurationCancellable: AnyCancellable?
+    private var chatActivityCancellables: [ChatViewModel.ID: AnyCancellable] = [:]
 
     var selectedChat: ChatViewModel? {
         guard let selectedChatID else { return nil }
@@ -136,6 +143,12 @@ final class ChatStore: ObservableObject {
         agentsCancellable = agentStore.$agents
             .sink { [weak self] agents in
                 self?.ensureDefaultChats(for: agents)
+            }
+        agentConfigurationCancellable = agentStore.agentConfigurationDidChange
+            .sink { [weak self] agentID in
+                guard let self,
+                      let agent = self.agentStore.agent(for: agentID) else { return }
+                self.defaultChat(for: agentID)?.synchronizeDefaultChat(with: agent)
             }
     }
 
@@ -186,6 +199,7 @@ final class ChatStore: ObservableObject {
         } else {
             chats.insert(chat, at: 0)
         }
+        refreshChatActivityObservations()
         return chat
     }
 
@@ -212,6 +226,7 @@ final class ChatStore: ObservableObject {
             modelContext: modelContext
         )
         chats.insert(chat, at: 0)
+        refreshChatActivityObservations()
         selectedChatID = chat.id
     }
 
@@ -237,6 +252,38 @@ final class ChatStore: ObservableObject {
         chats.filter(\.isGroupChat)
     }
 
+    func stageAgentDeactivation(_ agentID: Agent.ID) -> AgentDeactivationPlan {
+        var groupParticipantObjectIDs: [ChatViewModel.ID: Set<ObjectIdentifier>] = [:]
+        for chat in groupChats {
+            let objectIDs = chat.stageGroupParticipantRemoval(agentID: agentID)
+            if !objectIDs.isEmpty {
+                groupParticipantObjectIDs[chat.id] = objectIDs
+            }
+        }
+        return AgentDeactivationPlan(
+            agentID: agentID,
+            groupParticipantObjectIDs: groupParticipantObjectIDs
+        )
+    }
+
+    @discardableResult
+    func applyAgentDeactivation(_ plan: AgentDeactivationPlan) -> Bool {
+        for chat in groupChats {
+            guard let objectIDs = plan.groupParticipantObjectIDs[chat.id] else { continue }
+            chat.removeGroupParticipantsFromLiveRoster(objectIDs: objectIDs)
+        }
+
+        let selectedChatWasRemoved = selectedChat.map {
+            !$0.isGroupChat && $0.agentID == plan.agentID
+        } ?? false
+        chats.removeAll { !$0.isGroupChat && $0.agentID == plan.agentID }
+        if selectedChatWasRemoved {
+            selectedChatID = nil
+        }
+        refreshChatActivityObservations()
+        return selectedChatWasRemoved
+    }
+
     func resetChat(_ chat: ChatViewModel) {
         chat.resetActiveHistory()
     }
@@ -249,6 +296,7 @@ final class ChatStore: ObservableObject {
         let wasSelected = selectedChatID == chatID
         chat.deletePersistedRecords()
         chats.removeAll { $0.id == chatID }
+        refreshChatActivityObservations()
         if wasSelected {
             selectedChatID = defaultChat(for: agentID)?.id ?? chats.first?.id
         }
@@ -259,6 +307,7 @@ final class ChatStore: ObservableObject {
             let directs = chats.filter { !$0.isGroupChat && $0.agentID == agent.id }
             let defaults = directs.filter(\.isDefaultChat)
             if defaults.count == 1 {
+                defaults[0].synchronizeDefaultChat(with: agent)
                 continue
             }
             if defaults.count > 1 {
@@ -266,10 +315,12 @@ final class ChatStore: ObservableObject {
                 for chat in defaults where chat.id != keepID {
                     chat.setDefaultChat(false)
                 }
+                preferredDefault(from: defaults)?.synchronizeDefaultChat(with: agent)
                 continue
             }
             if let candidate = preferredDefault(from: directs) {
                 candidate.setDefaultChat(true)
+                candidate.synchronizeDefaultChat(with: agent)
             } else {
                 _ = makeDirectChat(with: agent, isDefault: true)
             }
@@ -590,8 +641,12 @@ final class ChatStore: ObservableObject {
 
         do {
             let storedChats = try modelContext.fetch(descriptor)
-            chats = storedChats.map { storedChat in
-                ChatViewModel(
+            let activeAgentIDs = Set(agentStore.agents.map(\.id))
+            chats = storedChats.compactMap { storedChat in
+                guard storedChat.kind == .group || activeAgentIDs.contains(storedChat.agentID) else {
+                    return nil
+                }
+                return ChatViewModel(
                     storedChat: storedChat,
                     storedMessages: ActiveChatMessages.fetch(
                         chatID: storedChat.id,
@@ -599,7 +654,10 @@ final class ChatStore: ObservableObject {
                         limit: ChatStore.messageBatchSize,
                         in: modelContext
                     ),
-                    storedGroupParticipants: fetchGroupParticipants(for: storedChat.id),
+                    storedGroupParticipants: fetchGroupParticipants(
+                        for: storedChat.id,
+                        activeAgentIDs: activeAgentIDs
+                    ),
                     agentStore: agentStore,
                     localModelStore: localModelStore,
                     skillCatalog: skillCatalog,
@@ -610,9 +668,13 @@ final class ChatStore: ObservableObject {
         } catch {
             chats = []
         }
+        refreshChatActivityObservations()
     }
 
-    private func fetchGroupParticipants(for chatID: UUID) -> [StoredGroupChatParticipant] {
+    private func fetchGroupParticipants(
+        for chatID: UUID,
+        activeAgentIDs: Set<Agent.ID>
+    ) -> [StoredGroupChatParticipant] {
         let descriptor = FetchDescriptor<StoredGroupChatParticipant>(
             predicate: #Predicate { participant in
                 participant.chatID == chatID
@@ -621,10 +683,21 @@ final class ChatStore: ObservableObject {
         )
 
         do {
-            return try modelContext.fetch(descriptor)
+            return try modelContext.fetch(descriptor).filter {
+                activeAgentIDs.contains($0.agentID)
+            }
         } catch {
             return []
         }
+    }
+
+    private func refreshChatActivityObservations() {
+        chatActivityCancellables = Dictionary(uniqueKeysWithValues: chats.map { chat in
+            let cancellable = chat.objectWillChange.sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            return (chat.id, cancellable)
+        })
     }
 
     private func saveChanges() {
