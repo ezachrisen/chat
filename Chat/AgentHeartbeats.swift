@@ -106,6 +106,9 @@ final class HeartbeatRun: Identifiable {
     var actionSummary: String
     var errorMessage: String?
     var generationTurnID: UUID?
+    /// Snapshotted when the run starts so failures that happen before a
+    /// generation turn exists can still describe their debug-capture state.
+    var debugCaptureEnabled: Bool?
     var promptTokenCount: Int?
     var completionTokenCount: Int?
 
@@ -123,6 +126,7 @@ final class HeartbeatRun: Identifiable {
         actionSummary: String,
         errorMessage: String?,
         generationTurnID: UUID? = nil,
+        debugCaptureEnabled: Bool? = nil,
         promptTokenCount: Int? = nil,
         completionTokenCount: Int? = nil
     ) {
@@ -139,12 +143,19 @@ final class HeartbeatRun: Identifiable {
         self.actionSummary = actionSummary
         self.errorMessage = errorMessage
         self.generationTurnID = generationTurnID
+        self.debugCaptureEnabled = debugCaptureEnabled
         self.promptTokenCount = promptTokenCount
         self.completionTokenCount = completionTokenCount
     }
 
     var succeeded: Bool {
         errorMessage == nil
+    }
+
+    var passedWithoutDebugLog: Bool {
+        generationTurnID == nil
+            && errorMessage == nil
+            && actionSummary.hasPrefix("The model passed, so no chat message was posted.")
     }
 
     var duration: TimeInterval {
@@ -212,6 +223,7 @@ struct HeartbeatExecutionReport {
     let backendRawValue: String
     let toolInvocations: [CapturedToolInvocation]
     let debug: GenerationDebugPayloadDraft?
+    var omitDetailedTrace: Bool = false
     var promptTokenCount: Int? = nil
     var completionTokenCount: Int? = nil
 }
@@ -257,6 +269,7 @@ struct HeartbeatModelFailure: LocalizedError {
     var toolInvocations: [CapturedToolInvocation]
     var debug: GenerationDebugPayloadDraft?
     var backendRawValue: String
+    var omitDetailedTrace: Bool = false
     var tokenUsage: TokenUsage = .zero
 
     var errorDescription: String? {
@@ -419,6 +432,7 @@ final class HeartbeatScheduler: ObservableObject {
             )
             guard executionTasks[heartbeat.id]?.token == executionToken,
                   executionTasks[heartbeat.id]?.outcome == .running else {
+                agentStore.refreshTimedOutHeartbeatTrace(report: report)
                 return
             }
 

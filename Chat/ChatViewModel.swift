@@ -1,11 +1,13 @@
 import Combine
 import Foundation
+import os
 import SwiftData
 
 @MainActor
 final class ChatViewModel: ObservableObject, Identifiable {
     static let typingIndicatorID = UUID()
     private static let messageBatchSize = 40
+    private static let logger = Logger(subsystem: "Chat", category: "ChatViewModel")
 
     var id: UUID { storedChat.id }
     var agentID: Agent.ID { storedChat.agentID }
@@ -67,6 +69,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private let localModelStore: LocalModelStore
     private let skillCatalog: SkillCatalog
     private let replyFilterStore: ReplyFilterStore
+    private let collaborationCoordinator: AgentCollaborationCoordinator
     private var modelStoreCancellable: AnyCancellable?
 
     private var backend: ChatBackend {
@@ -113,6 +116,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         localModelStore: LocalModelStore,
         skillCatalog: SkillCatalog,
         replyFilterStore: ReplyFilterStore,
+        collaborationCoordinator: AgentCollaborationCoordinator,
         modelContext: ModelContext
     ) {
         self.storedChat = storedChat
@@ -120,6 +124,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         self.localModelStore = localModelStore
         self.skillCatalog = skillCatalog
         self.replyFilterStore = replyFilterStore
+        self.collaborationCoordinator = collaborationCoordinator
         self.modelContext = modelContext
         title = storedChat.title
         let fallbackAssistantName: String?
@@ -330,6 +335,52 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
     }
 
+    func receiveDelegatedResult(
+        _ text: String,
+        agentID: Agent.ID,
+        agentName: String,
+        invocationID: UUID
+    ) -> Bool {
+        let visibleText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !visibleText.isEmpty else { return true }
+        let sourceInvocationID = invocationID
+        var descriptor = FetchDescriptor<StoredChatMessage>(
+            predicate: #Predicate { message in
+                message.sourceInvocationID == sourceInvocationID
+            }
+        )
+        descriptor.fetchLimit = 1
+        do {
+            if try modelContext.fetch(descriptor).first != nil {
+                return true
+            }
+        } catch {
+            Self.logger.error(
+                "Failed to check delegated-message idempotency: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+
+        let previousUpdatedAt = storedChat.updatedAt
+        let storedMessage = StoredChatMessage(
+            chatID: id,
+            role: .assistant,
+            text: visibleText,
+            authorAgentID: agentID,
+            authorName: agentName,
+            sourceInvocationID: invocationID
+        )
+        modelContext.insert(storedMessage)
+        storedChat.updatedAt = .now
+        guard saveChanges() else {
+            modelContext.delete(storedMessage)
+            storedChat.updatedAt = previousUpdatedAt
+            return false
+        }
+        messages.append(ChatMessage(storedMessage: storedMessage))
+        return true
+    }
+
     func send() {
         if let agent = agentStore.agent(for: agentID) {
             synchronizeDefaultChat(with: agent)
@@ -351,7 +402,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
             let directlyMentionedAgentIDs = Set(
                 groupParticipants
-                    .filter { mentionedHandles.contains(AgentMention.handle(for: $0.agentName).lowercased()) }
+                    .filter { $0.isMentioned(in: mentionedHandles) }
                     .map(\.agentID)
             )
 
@@ -404,7 +455,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
             wasAborted: Bool,
             partial: ModelGenerationResult? = nil,
             systemPrompt: String = "",
-            conversationPrompt: String = ""
+            conversationPrompt: String = "",
+            omitDetailedTrace: Bool = false
         ) -> HeartbeatModelFailure {
             HeartbeatModelFailure(
                 modelInput: "",
@@ -430,8 +482,29 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     )
                     : nil,
                 backendRawValue: backend.persistenceName,
+                omitDetailedTrace: omitDetailedTrace,
                 tokenUsage: partial?.tokenUsage ?? .zero
             )
+        }
+
+        func omitDetailedTraceIfPass(_ partial: ModelGenerationResult?) async -> Bool {
+            guard let partial,
+                  sanitizedReply(
+                    partial.finalText,
+                    modelIdentifier: modelIdentifier
+                  ).isPass else {
+                return false
+            }
+
+            // Cancellation is cooperative. A provider can return an exact
+            // PASS after an abort or the scheduler's five-minute timeout, so
+            // establish the same collaboration suppression fence before the
+            // terminal cancellation report is handed back.
+            _ = await collaborationCoordinator.suppressHeartbeatLog(
+                rootInvocationID: turnID,
+                retainUntilGenerationTraceRemoved: true
+            )
+            return true
         }
 
         if Task.isCancelled {
@@ -442,7 +515,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
             addGroupParticipantIfNeeded(agent)
         }
 
-        let generation = generationSupport(for: agent, recorder: recorder)
+        let generation = generationSupport(
+            for: agent,
+            recorder: recorder,
+            backend: backend,
+            collaborationDeadline: referenceDate.addingTimeInterval(4 * 60),
+            collaborationRootInvocationID: turnID,
+            captureCollaborationDebug: debugCaptureEnabled
+        )
         let systemInstructions = ModelPrompts.heartbeatSystemInstructions(
             agentName: agent.displayName,
             soul: agent.soul,
@@ -471,17 +551,30 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 captureDebug: debugCaptureEnabled,
                 missingLocalModelMessage: "The selected local model is no longer configured."
             )
-            try Task.checkCancellation()
         } catch {
             let generationError = error as? ModelGenerationError
             let underlying = generationError?.underlying ?? error
             let wasAborted = Task.isCancelled || underlying is CancellationError
+            let partial = generationError?.partial
+            let omitDetailedTrace = await omitDetailedTraceIfPass(partial)
             throw failure(
                 message: wasAborted ? "Aborted by user." : underlying.localizedDescription,
                 wasAborted: wasAborted,
-                partial: generationError?.partial,
+                partial: partial,
                 systemPrompt: systemInstructions,
-                conversationPrompt: conversationPrompt
+                conversationPrompt: conversationPrompt,
+                omitDetailedTrace: omitDetailedTrace
+            )
+        }
+        if Task.isCancelled {
+            let omitDetailedTrace = await omitDetailedTraceIfPass(result)
+            throw failure(
+                message: "Aborted by user.",
+                wasAborted: true,
+                partial: result,
+                systemPrompt: systemInstructions,
+                conversationPrompt: conversationPrompt,
+                omitDetailedTrace: omitDetailedTrace
             )
         }
         onModelResponseAccepted?()
@@ -490,13 +583,26 @@ final class ChatViewModel: ObservableObject, Identifiable {
             result.finalText,
             modelIdentifier: modelIdentifier
         )
+        let visibleText = parsedResponse.output.visibleText
+        let passed = parsedResponse.isPass
+        if passed {
+            guard await collaborationCoordinator.suppressHeartbeatLog(
+                rootInvocationID: turnID
+            ) else {
+                throw failure(
+                    message: "The model passed, but Chat could not durably suppress its collaboration log.",
+                    wasAborted: false,
+                    partial: result,
+                    systemPrompt: systemInstructions,
+                    conversationPrompt: conversationPrompt,
+                    omitDetailedTrace: true
+                )
+            }
+        }
         agentStore.appendAgentMemoryEntries(
             id: agent.id,
             entries: parsedResponse.output.memoryEntries
         )
-
-        let visibleText = parsedResponse.output.visibleText
-        let passed = parsedResponse.isPass
         let posted = shouldPostAssistantReply(visibleText)
         var assistantMessageID: UUID?
         if posted {
@@ -561,7 +667,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let agent = agentStore.agent(for: storedChat.agentID)
         let debugCaptureEnabled = agent?.isDebugLogEnabled == true
         let recorder = ToolCallRecorder()
-        let generation = generationSupport(for: agent, recorder: recorder)
+        let generation = generationSupport(for: agent, recorder: recorder, backend: backend)
         let storedMessages = allStoredMessages()
         let systemInstructions = ModelPrompts.agentSystemInstructions(
             agentName: resolvedAgentName,
@@ -656,7 +762,9 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let existingAgentIDs = Set(groupParticipants.map(\.agentID))
         let newAgents = agentStore.agents.filter { agent in
             !existingAgentIDs.contains(agent.id)
-                && mentionedHandles.contains(AgentMention.handle(for: agent.displayName).lowercased())
+                && mentionedHandles.contains(
+                    AgentMention.lookupKey(for: agent.resolvedMentionHandle)
+                )
         }
 
         guard !newAgents.isEmpty else { return }
@@ -785,11 +893,12 @@ final class ChatViewModel: ObservableObject, Identifiable {
         captureDebug: Bool
     ) async throws -> GroupGeneration {
         let storedMessages = allStoredMessages()
+        let backend = localModelStore.backend(for: participant.agentModelIdentifier)
         let generation = generationSupport(
             for: agentStore.agent(for: participant.agentID),
-            recorder: recorder
+            recorder: recorder,
+            backend: backend
         )
-        let backend = localModelStore.backend(for: participant.agentModelIdentifier)
         let systemInstructions = ModelPrompts.groupSystemPrompt(
             agentName: participant.agentName,
             soul: currentSoul(
@@ -846,13 +955,32 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     private func generationSupport(
         for agent: Agent?,
-        recorder: ToolCallRecorder? = nil
+        recorder: ToolCallRecorder? = nil,
+        backend: ChatBackend,
+        collaborationDeadline: Date? = nil,
+        collaborationRootInvocationID: UUID? = nil,
+        captureCollaborationDebug: Bool = false
     ) -> (tools: AgentToolBox, skillsPrompt: String) {
-        let tools = AgentToolBox.make(agent: agent, catalog: skillCatalog, recorder: recorder)
+        let delegationRuntime = agent.map {
+            collaborationCoordinator.rootRuntime(
+                for: $0,
+                backend: backend,
+                deadline: collaborationDeadline,
+                rootInvocationID: collaborationRootInvocationID,
+                captureDebug: captureCollaborationDebug
+            )
+        }
+        let tools = AgentToolBox.make(
+            agent: agent,
+            catalog: skillCatalog,
+            recorder: recorder,
+            delegationRuntime: delegationRuntime
+        )
         return (
             tools,
             ModelPrompts.toolsPrompt(enabledIDs: tools.enabledToolIDs)
                 + ModelPrompts.skillsPrompt(for: tools.runtime.skills)
+                + tools.collaborationPrompt
         )
     }
 
@@ -1028,7 +1156,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         defer { isCompacting = false }
 
         let messages = allStoredMessages()
-        let generation = generationSupport(for: agentStore.agent(for: storedChat.agentID))
+        let generation = generationSupport(
+            for: agentStore.agent(for: storedChat.agentID),
+            backend: backend
+        )
         let systemInstructions = ModelPrompts.agentSystemInstructions(
             agentName: agentName,
             soul: currentSoul(for: storedChat.agentID, fallback: storedChat.agentSoul),
@@ -1081,6 +1212,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         text: String,
         authorAgentID: UUID? = nil,
         authorName: String? = nil,
+        sourceInvocationID: UUID? = nil,
         save: Bool = true
     ) -> StoredChatMessage {
         let storedMessage = StoredChatMessage(
@@ -1088,7 +1220,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
             role: role,
             text: text,
             authorAgentID: authorAgentID,
-            authorName: authorName
+            authorName: authorName,
+            sourceInvocationID: sourceInvocationID
         )
         modelContext.insert(storedMessage)
         storedChat.updatedAt = .now
@@ -1142,13 +1275,16 @@ final class ChatViewModel: ObservableObject, Identifiable {
         availabilityMessage = availability.message
     }
 
-    private func saveChanges() {
-        guard modelContext.hasChanges else { return }
+    @discardableResult
+    private func saveChanges() -> Bool {
+        guard modelContext.hasChanges else { return true }
 
         do {
             try modelContext.save()
+            return true
         } catch {
-            assertionFailure("Failed to save chat: \(error.localizedDescription)")
+            Self.logger.error("Failed to save chat: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 }

@@ -72,7 +72,7 @@ final class LocalModel: Identifiable {
     }
 }
 
-struct LocalModelConfiguration: Sendable {
+nonisolated struct LocalModelConfiguration: Sendable, Equatable {
     let id: UUID
     let name: String
     let endpoint: String
@@ -147,7 +147,7 @@ struct LocalModelConfiguration: Sendable {
     }
 }
 
-enum ChatBackend {
+nonisolated enum ChatBackend: Sendable, Equatable {
     case appleFoundation
     case chatGPT(ChatGPTProviderConfiguration)
     case openAICompatible(LocalModelConfiguration)
@@ -181,6 +181,20 @@ enum ChatBackend {
             return "missingChatGPTProvider"
         case .missingLocalModel:
             return "missingLocalModel"
+        }
+    }
+}
+
+nonisolated enum ChatModelConfigurationScope: Sendable {
+    case local(UUID)
+    case chatGPT
+
+    func includes(_ modelIdentifier: String) -> Bool {
+        switch self {
+        case .local(let modelID):
+            return modelIdentifier == ChatModelIdentifier.localModelID(modelID)
+        case .chatGPT:
+            return ChatModelIdentifier.isChatGPT(modelIdentifier)
         }
     }
 }
@@ -231,6 +245,7 @@ final class LocalModelStore: ObservableObject {
     @Published private(set) var chatGPTConnectionState: ChatGPTConnectionState = .idle
     @Published private(set) var configuredCodexExecutablePath: String
     @Published private(set) var resolvedCodexExecutableURL: URL?
+    let modelConfigurationWillChange = PassthroughSubject<ChatModelConfigurationScope, Never>()
 
     private let modelContext: ModelContext
     private static let codexExecutablePathDefaultsKey = "chatgptProvider.codexExecutablePath"
@@ -260,6 +275,7 @@ final class LocalModelStore: ObservableObject {
     }
 
     func remove(_ model: LocalModel) {
+        modelConfigurationWillChange.send(.local(model.id))
         LocalModelCredentials.deleteToken(for: model.id)
         let identifier = ChatModelIdentifier.localModelID(model.id)
         let descriptor = FetchDescriptor<ReplyFilterSet>(
@@ -276,18 +292,21 @@ final class LocalModelStore: ObservableObject {
     }
 
     func updateName(for model: LocalModel, to name: String) {
+        modelConfigurationWillChange.send(.local(model.id))
         model.name = name
         saveChanges()
         objectWillChange.send()
     }
 
     func updateEndpoint(for model: LocalModel, to endpoint: String) {
+        modelConfigurationWillChange.send(.local(model.id))
         model.endpoint = endpoint
         saveChanges()
         objectWillChange.send()
     }
 
     func updateModelID(for model: LocalModel, to modelID: String) {
+        modelConfigurationWillChange.send(.local(model.id))
         let previousModelID = model.modelID
         model.modelID = modelID
         if model.name == "Local model" || model.name == previousModelID {
@@ -298,6 +317,7 @@ final class LocalModelStore: ObservableObject {
     }
 
     func updateContextTokenLimit(for model: LocalModel, to limit: Int?) {
+        modelConfigurationWillChange.send(.local(model.id))
         if let limit {
             model.contextTokenLimit = min(
                 max(limit, ConversationCompaction.minimumContextTokens),
@@ -315,6 +335,7 @@ final class LocalModelStore: ObservableObject {
     }
 
     func updateBearerToken(for model: LocalModel, to token: String) {
+        modelConfigurationWillChange.send(.local(model.id))
         LocalModelCredentials.save(token, for: model.id)
     }
 
@@ -354,6 +375,7 @@ final class LocalModelStore: ObservableObject {
     }
 
     func updateCodexExecutablePath(_ path: String) {
+        modelConfigurationWillChange.send(.chatGPT)
         chatGPTOperationID = UUID()
         configuredCodexExecutablePath = path
         let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -370,6 +392,7 @@ final class LocalModelStore: ObservableObject {
 
     func refreshChatGPT() async {
         guard !chatGPTConnectionState.isBusy else { return }
+        modelConfigurationWillChange.send(.chatGPT)
         let operationID = UUID()
         chatGPTOperationID = operationID
         chatGPTConnectionState = .checking
@@ -398,6 +421,7 @@ final class LocalModelStore: ObservableObject {
 
     func connectChatGPT() async {
         guard !chatGPTConnectionState.isBusy else { return }
+        modelConfigurationWillChange.send(.chatGPT)
         let operationID = UUID()
         chatGPTOperationID = operationID
 

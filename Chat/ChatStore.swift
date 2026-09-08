@@ -73,6 +73,7 @@ final class StoredChatMessage: Identifiable {
     var text: String
     @Attribute(originalName: "authorPersonaID") var authorAgentID: UUID?
     var authorName: String?
+    var sourceInvocationID: UUID?
     var createdAt: Date
 
     init(
@@ -82,6 +83,7 @@ final class StoredChatMessage: Identifiable {
         text: String,
         authorAgentID: UUID? = nil,
         authorName: String? = nil,
+        sourceInvocationID: UUID? = nil,
         createdAt: Date = .now
     ) {
         self.id = id
@@ -90,6 +92,7 @@ final class StoredChatMessage: Identifiable {
         self.text = text
         self.authorAgentID = authorAgentID
         self.authorName = authorName
+        self.sourceInvocationID = sourceInvocationID
         self.createdAt = createdAt
     }
 
@@ -115,6 +118,7 @@ final class ChatStore: ObservableObject {
     private let localModelStore: LocalModelStore
     private let skillCatalog: SkillCatalog
     private let replyFilterStore: ReplyFilterStore
+    private let collaborationCoordinator: AgentCollaborationCoordinator
     private var agentsCancellable: AnyCancellable?
     private var agentConfigurationCancellable: AnyCancellable?
     private var chatActivityCancellables: [ChatViewModel.ID: AnyCancellable] = [:]
@@ -136,9 +140,25 @@ final class ChatStore: ObservableObject {
         self.localModelStore = localModelStore
         self.skillCatalog = skillCatalog
         self.replyFilterStore = replyFilterStore
+        collaborationCoordinator = AgentCollaborationCoordinator(
+            agentStore: agentStore,
+            localModelStore: localModelStore,
+            skillCatalog: skillCatalog,
+            replyFilterStore: replyFilterStore,
+            modelContext: modelContext
+        )
         loadChats()
         ensureDefaultChats(for: agentStore.agents)
         selectedChatID = chats.first?.id
+
+        collaborationCoordinator.setDeliveryHandler { [weak self] agentID, agentName, text, invocationID in
+            self?.deliverDelegatedResult(
+                to: agentID,
+                agentName: agentName,
+                text: text,
+                invocationID: invocationID
+            ) ?? false
+        }
 
         agentsCancellable = agentStore.$agents
             .sink { [weak self] agents in
@@ -192,6 +212,7 @@ final class ChatStore: ObservableObject {
             localModelStore: localModelStore,
             skillCatalog: skillCatalog,
             replyFilterStore: replyFilterStore,
+            collaborationCoordinator: collaborationCoordinator,
             modelContext: modelContext
         )
         if isDefault {
@@ -223,6 +244,7 @@ final class ChatStore: ObservableObject {
             localModelStore: localModelStore,
             skillCatalog: skillCatalog,
             replyFilterStore: replyFilterStore,
+            collaborationCoordinator: collaborationCoordinator,
             modelContext: modelContext
         )
         chats.insert(chat, at: 0)
@@ -241,6 +263,26 @@ final class ChatStore: ObservableObject {
     func defaultChat(for agentID: Agent.ID?) -> ChatViewModel? {
         guard let agentID else { return nil }
         return chats.first { !$0.isGroupChat && $0.agentID == agentID && $0.isDefaultChat }
+    }
+
+    private func deliverDelegatedResult(
+        to agentID: Agent.ID,
+        agentName: String,
+        text: String,
+        invocationID: UUID
+    ) -> Bool {
+        guard let agent = agentStore.agent(for: agentID) else { return false }
+        let chat = defaultChat(for: agentID) ?? makeDirectChat(with: agent, isDefault: true)
+        return chat.receiveDelegatedResult(
+            text,
+            agentID: agentID,
+            agentName: agentName,
+            invocationID: invocationID
+        )
+    }
+
+    func cancelDelegatedInvocation(_ invocationID: UUID) {
+        collaborationCoordinator.cancelInvocation(invocationID)
     }
 
     func selectDefaultChat(for agent: Agent) {
@@ -594,6 +636,7 @@ final class ChatStore: ObservableObject {
         error: Error
     ) -> HeartbeatExecutionReport {
         let wasAborted = (error as? HeartbeatModelFailure)?.wasAborted == true
+        let omitDetailedTrace = (error as? HeartbeatModelFailure)?.omitDetailedTrace == true
         let actionSummary: String
         if wasAborted {
             actionSummary = "Run was aborted. No chat message was posted."
@@ -622,8 +665,9 @@ final class ChatStore: ObservableObject {
             memoryEntryCount: 0,
             modelIdentifier: modelIdentifier,
             backendRawValue: backendRawValue,
-            toolInvocations: toolInvocations,
-            debug: debugCaptureEnabled ? debug : nil,
+            toolInvocations: omitDetailedTrace ? [] : toolInvocations,
+            debug: debugCaptureEnabled && !omitDetailedTrace ? debug : nil,
+            omitDetailedTrace: omitDetailedTrace,
             promptTokenCount: storedTokenUsage(from: error)?.promptTokens,
             completionTokenCount: storedTokenUsage(from: error)?.completionTokens
         )
@@ -662,6 +706,7 @@ final class ChatStore: ObservableObject {
                     localModelStore: localModelStore,
                     skillCatalog: skillCatalog,
                     replyFilterStore: replyFilterStore,
+                    collaborationCoordinator: collaborationCoordinator,
                     modelContext: modelContext
                 )
             }
@@ -683,9 +728,20 @@ final class ChatStore: ObservableObject {
         )
 
         do {
-            return try modelContext.fetch(descriptor).filter {
+            let participants = try modelContext.fetch(descriptor).filter {
                 activeAgentIDs.contains($0.agentID)
             }
+            var changed = false
+            for participant in participants
+            where AgentMention.normalizedHandle(participant.agentMentionHandle) == nil {
+                guard let agent = agentStore.agent(for: participant.agentID) else { continue }
+                participant.agentMentionHandle = agent.resolvedMentionHandle
+                changed = true
+            }
+            if changed {
+                try? modelContext.save()
+            }
+            return participants
         } catch {
             return []
         }

@@ -6,8 +6,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ezachrisen/shadswift.git",
       "state" : {
-        "revision" : "a0003b3adb9f475adcb19d356da348d208865f53",
-        "version" : "0.1.0"
+        "revision" : "4364dd6194bd59bbec4b6e25a341490b49117936",
+        "version" : "0.2.0"
       }
     }
   ],

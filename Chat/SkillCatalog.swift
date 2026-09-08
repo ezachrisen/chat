@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-struct DiscoveredSkill: Identifiable, Sendable, Equatable {
+nonisolated struct DiscoveredSkill: Identifiable, Sendable, Equatable {
     var id: String { name }
     let name: String
     let description: String
@@ -9,7 +9,7 @@ struct DiscoveredSkill: Identifiable, Sendable, Equatable {
     let directoryURL: URL
 }
 
-struct SkillRuntime: Sendable {
+nonisolated struct SkillRuntime: Sendable {
     let skills: [DiscoveredSkill]
 
     func skill(named name: String) -> DiscoveredSkill? {
@@ -30,6 +30,8 @@ enum AgentToolID: String, CaseIterable, Identifiable {
     case executeSkillScript = "ExecuteSkillScript"
     case sendNotification = "SendNotification"
     case readCalendarEvents = "ReadCalendarEvents"
+    case askAgents = "AskAgents"
+    case sendToAgents = "SendToAgents"
 
     var id: String { rawValue }
 
@@ -43,6 +45,10 @@ enum AgentToolID: String, CaseIterable, Identifiable {
             return "Send notification"
         case .readCalendarEvents:
             return "Read calendar events"
+        case .askAgents:
+            return "Ask agents"
+        case .sendToAgents:
+            return "Send to agents"
         }
     }
 
@@ -56,6 +62,10 @@ enum AgentToolID: String, CaseIterable, Identifiable {
             return "Show a macOS notification with a title and body."
         case .readCalendarEvents:
             return "Read events from the Mac calendars you allow for this agent."
+        case .askAgents:
+            return "Consult allowed agents in parallel, wait for their results, and use them in this reply."
+        case .sendToAgents:
+            return "Dispatch independent work to allowed agents in parallel without waiting for their results."
         }
     }
 
@@ -69,6 +79,10 @@ enum AgentToolID: String, CaseIterable, Identifiable {
             return "Send a macOS notification. You must call this tool to notify the user; writing the message in your chat reply does not send a notification. body is required. title is optional and defaults to the agent name."
         case .readCalendarEvents:
             return "Read calendar events between start and end. start and end are ISO 8601 dates or date-times (for example 2026-08-01 or 2026-08-01T09:00:00). Optional calendar_ids is a comma-separated list of calendar IDs, not names. Omit calendar_ids to query every calendar this agent is allowed to read. Timed start and end times in the result are already converted to the user's current time zone, which is named in the result; all-day events are calendar dates. When talking to the user, use those local times and name the time zone. Notes longer than 250 characters are truncated."
+        case .askAgents:
+            return "Consult one or more allowed agents in parallel and wait for their results. Pass one focused assignment per agent, using the exact stable agent reference from the collaboration directory. Use the gathered results as input to your own final reply; consulted agents do not post independently."
+        case .sendToAgents:
+            return "Dispatch one or more independent assignments to allowed agents in parallel. Use the exact stable agent references from the collaboration directory. This returns dispatch receipts rather than completed work; dispatched agents publish their own results separately."
         }
     }
 }

@@ -45,6 +45,9 @@ final class GenerationTurn: Identifiable {
     var toolCallCount: Int
     var memoryEntryCount: Int
     var debugCaptureEnabled: Bool
+    /// Durable privacy tombstone used when an agent involved in a recorded
+    /// collaboration is deleted.
+    var debugContentRedacted: Bool?
     var createdAt: Date
 
     init(
@@ -68,6 +71,7 @@ final class GenerationTurn: Identifiable {
         toolCallCount: Int = 0,
         memoryEntryCount: Int = 0,
         debugCaptureEnabled: Bool = false,
+        debugContentRedacted: Bool? = nil,
         createdAt: Date = .now
     ) {
         self.id = id
@@ -90,6 +94,7 @@ final class GenerationTurn: Identifiable {
         self.toolCallCount = toolCallCount
         self.memoryEntryCount = memoryEntryCount
         self.debugCaptureEnabled = debugCaptureEnabled
+        self.debugContentRedacted = debugContentRedacted
         self.createdAt = createdAt
     }
 
@@ -99,6 +104,10 @@ final class GenerationTurn: Identifiable {
 
     var status: GenerationStatus {
         GenerationStatus(rawValue: statusRawValue) ?? .failed
+    }
+
+    var isDebugContentRedacted: Bool {
+        debugContentRedacted == true
     }
 }
 

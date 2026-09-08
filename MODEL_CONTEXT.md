@@ -11,7 +11,8 @@ Primary implementation:
 - `Chat/ModelPrompts.swift`: system and conversation prompt construction
 - `Chat/AgentMemory.swift`: memory protocol sent to models and parsed from replies
 - `Chat/SkillCatalog.swift`: `~/.chat/skills` discovery and global enablement
-- `Chat/SkillTools.swift`: `ReadSkillFileTool`, `ExecuteSkillScript`, `SendNotification`, and `ReadCalendarEvents`
+- `Chat/SkillTools.swift`: skill, notification, calendar, `AskAgents`, and `SendToAgents` tool definitions and execution
+- `Chat/AgentCollaboration.swift`: directed agent delegation, parallel fan-out/gather, execution budgets, cancellation leases, and delivery
 - `Chat/CalendarAccess.swift`: EventKit calendar listing and event reads, scoped by per-agent calendar IDs
 - `Chat/ChatViewModel.swift`: turn orchestration
 - `Chat/LocalModels.swift`: local model CRUD and backend selection
@@ -29,6 +30,8 @@ An agent has:
 - A selected model
 - Optional text-to-speech settings: a configured tool, voice name, and voice model
 - Per-agent enablement of model tools and skills
+- A permanent, unique `@handle` and optional “When to ask me” routing description
+- Directed, default-deny consult and dispatch grants to other agents
 - Zero or more heartbeat schedules
 
 Text-to-speech settings are live agent configuration and are not included in model prompts. While voice mode is active, each visible assistant response is sent to the responding agent's selected command-line tool using its configured voice name and voice model, then the generated WAV file is played.
@@ -67,9 +70,14 @@ Available tools:
 
 Available skills:
 - <skill name>: <skill description>
+
+Collaboration directory:
+- @<stable handle> [consult, dispatch]: <when-to-ask description>
 ```
 
 The tools section is omitted when the agent has no tools enabled. Each enabled tool is listed by its exact call name. The model is told that describing a tool or putting its intended output in a reply does not invoke it, and that it may call multiple tools in sequence.
+
+The collaboration directory is omitted when the agent has no effective outbound grants. It lists only targets that the caller may currently consult or dispatch to. A typed `@handle` resolves the target for the UI and gives the model an exact stable reference, but text alone never starts work: the model must call `AskAgents` or `SendToAgents`.
 
 `ReadCalendarEvents(start, end, calendar_ids)` reads EventKit events in an ISO 8601 date range. `calendar_ids` is an optional comma-separated list of calendar identifiers, not names; omitting it queries every calendar the user allowed for that agent (All, or a stored ID allowlist). The tool returns labeled text: a calendar ID+name directory, then one `event:` record per event. Timed `start`/`end` values are converted in-process to the Mac’s current time zone and formatted as localized date-times with a zone abbreviation (for example PDT); the header names that zone (`America/Los_Angeles (PDT, UTC-7)`). All-day events stay calendar dates in the event’s own zone so they do not shift a day. The payload omits EventKit identifiers, lat/long, alarms, creation/modification timestamps, default `confirmed`/`busy` flags, and per-event original time zones. Attachments are omitted. Notes longer than 250 characters are truncated. The allowlist is live agent configuration and is not included in the system prompt.
 
@@ -157,11 +165,11 @@ No Apple session is reused between turns. All conversational memory comes from t
 
 The ChatGPT subscription backend uses the supported Codex app-server protocol over a local JSONL subprocess. It accepts only an account reported by Codex as `chatgpt` whose configuration requires OpenAI authentication; an API-key session or custom model provider is rejected so this provider cannot silently switch to metered or third-party billing. Threads explicitly request the built-in `openai` provider and verify the provider returned by Codex before a turn starts. Chat does not read, copy, or persist Codex authentication tokens. Codex owns sign-in, credential refresh, and account storage.
 
-Each generation starts an ephemeral Codex thread in a newly created empty temporary directory. The thread uses no approvals, a read-only sandbox with network disabled, no workspace roots or execution environments, and chat-specific base instructions that prohibit built-in Codex shell, file, workspace, browser, web, MCP, collaboration, and patch tools. The temporary directory is removed after the turn. SwiftData remains the sole authority for conversation history.
+Each generation starts an ephemeral Codex thread in a newly created empty temporary directory. The app-server process is launched with its built-in shell, execution, browser, computer-use, image, plugin, skill-search, workspace, and multi-agent feature families disabled. Before the thread starts, Chat reads the effective Codex configuration, disables every inherited MCP server and plugin by name, disables project-document and host-environment instruction discovery, and applies a no-approval/read-only/no-network policy with no workspace roots or execution environments. After thread creation, Chat verifies that every configured MCP entry is runtime-disabled and exposes no tools, resources, resource templates, or initialized server metadata. (`mcpServerStatus/list` includes configured entries even when they are disabled.) During the turn, any command, file-change, MCP, web, image, sleep, review, or other unexpected built-in tool item aborts the generation. The temporary directory is removed after the turn. SwiftData remains the sole authority for conversation history.
 
 The direct-chat digest and tail are flattened into the same conversation prompt used by Apple Foundation Model and passed as one text input. The effective agent system instructions are supplied as developer instructions. Selecting `ChatGPT (recommended model)` omits a model override so Codex chooses the account default; selecting a discovered model sends its Codex model ID.
 
-Enabled agent tools are translated into app-server dynamic function tools. A dynamic call is routed back through `AgentToolBox`, including the existing skill, notification, and calendar policy checks, and the result is returned to the same Codex turn. Command-execution and file-change approval requests are always declined.
+Enabled agent tools are translated into app-server dynamic function tools. A dynamic call is routed back through `AgentToolBox`, including the existing skill, notification, calendar, and collaboration policy checks, and the result is returned to the same Codex turn. Command-execution and file-change approval requests are declined and terminate the generation.
 
 ### OpenAI-compatible model
 
@@ -205,7 +213,7 @@ Compaction is serialized per chat. The digest is chat-local and is not written t
 
 ### Adding and directing participants
 
-The harness extracts case-insensitive tokens matching `@[letters, numbers, or underscore]`. An agent's mention is its display name with non-alphanumeric characters removed; `Product Critic` becomes `@ProductCritic`.
+The harness extracts case-insensitive tokens matching stable agent handles. Handles are generated once, made unique (`@agent`, `@agent2`, and so on when necessary), persisted, and do not change when the display name changes. Existing group participants also persist the handle they joined with.
 
 Newly mentioned agents are snapshotted and added before the user message is persisted. The snapshot supplies the participant's name and model selection. Deleting the agent later removes that participant from the live roster, while the `@mention`, authored messages, and generation history remain stored.
 
@@ -295,6 +303,31 @@ For ChatGPT subscription models, the complete group prompt is passed as one text
 
 For OpenAI-compatible models, the request contains exactly one `system` message and one `user` message. The complete transcript exists inside that single user message rather than native per-turn roles.
 
+## Agent collaboration
+
+Collaboration is available in ordinary user turns and heartbeats through the same two model tools:
+
+- `AskAgents(assignments)` consults up to four allowed targets in parallel, waits for best-effort results, and returns one ordered JSON result envelope to the caller. Consulted agents do not post independently. They receive their own current Soul and selected model, no persistent memory, and a read-only tool subset (`ReadSkillFileTool` and `ReadCalendarEvents` when enabled).
+- `SendToAgents(assignments)` accepts up to four independent assignments, returns receipts immediately, and runs the target agents in parallel. A dispatched agent receives its own current Soul, memory, selected model, enabled tools, and outbound collaboration grants. Its visible result—or a failure notice—is posted idempotently to its default direct chat. Dispatches continue after the calling turn finishes, but only while Chat remains running.
+
+Each assignment names a stable `@handle` and contains one focused task. A handle is seeded from the agent's first committed nonempty name and then remains unchanged across later renames. The coordinator resolves handles against the live agent directory and rechecks authorization immediately before acceptance, execution, every tool call, nested delegation, memory append, and chat delivery. Delegated tasks, tool output, and child-agent output are explicitly marked as untrusted data.
+
+### Permission and execution boundaries
+
+Collaboration grants are directed, mode-specific, default-deny, and non-transitive. A grant from A to B does not grant B access to A or to any agent A can reach. Effective authority is the intersection of the caller-to-target grant, the caller's collaboration tool enablement, and the target's currently enabled tools and skills. Dispatch may use all of the target's enabled tools; consult uses only its read-only subset. Changing an involved agent, grant, model endpoint, selected provider model, Codex executable, context limit, or bearer token cancels affected in-flight branches. The complete backend configuration is also compared again before model start, tool use, and final commit so queued work cannot retain a stale endpoint or credential.
+
+The execution tree is bounded to 12 delegated nodes, depth 2, four assignments per call, three active children per root, four active children and 24 total outstanding invocations across the app, six remote-model calls per root, 24,000 characters per assignment, and 96,000 delegated task characters per root. One execution slot is reserved for nested work to prevent fan-out deadlock. Caller-facing gathered output, child summaries, and tool output are independently bounded for the caller or target model's context window. If the complete task plus the target's Soul, memory, and tool instructions cannot fit safely, the assignment is rejected rather than silently truncated.
+
+Every invocation has a four-minute execution window and a revocable lease. User cancellation cascades through already-created descendants; preparation checks the parent lease before and after every suspension so a not-yet-created child cannot escape. A timed-out or cancelled model request may take longer to stop if its backend ignores cancellation, but it keeps occupying its concurrency slot and all later tool calls, fan-out, memory writes, and chat delivery are fenced off.
+
+### Audit and persistence
+
+`AgentInvocationRecord` stores the execution tree IDs, caller and target snapshots, mode, state, bounded task/result/error previews, model/backend, depth, timing, token counts, and a compact tool trace containing tool names and success/failure. When a heartbeat starts with its agent's Debug log enabled, the heartbeat turn ID is also used as the collaboration tree root and each invocation stores a full debug payload: exact assignment and prepared/sent prompts, raw/visible reply, the exact bounded envelope or receipt returned to the caller, reasoning and intermediate output, provider transcript metadata, errors, and complete tool arguments/results. This debug flag is snapshotted for the whole tree and propagated to nested and asynchronous dispatches; ordinary runs keep the redacted compact audit. A completed dispatch's full user-visible post is held temporarily in a durable outbox until it has been inserted idempotently into the target chat, then cleared. The Collaboration editor shows the latest 20 related rows and lets the user stop an active branch. Compact terminal history is kept for at most 30 days and 500 records; heartbeat debug rows remain with their run. Deleting an agent also redacts correlated root delegation tool rows and removes provider debug payloads that may duplicate the exchange. Its scrubbed root-wide privacy tombstones are retention-exempt so an in-flight parent or later descendant cannot recreate deleted content.
+
+If the root heartbeat returns an exact pass, the entire collaboration tree is suppressed too. A content-free root marker is confirmed durable before the pass is committed and hides the whole tree even if its child rows are temporarily unreadable; inability to save that marker turns the attempt into a compact visible storage-failure row instead of a silent pass, while still omitting the detailed trace because the actual model reply was PASS. For cancellation/error results, the marker carries a durable handoff bit until any already-written timeout generation graph and its compact-run link are removed; launch recovery completes that scrub after a crash. The marker is removed after that handoff and the tree's operational rows are gone. Finished rows are deleted immediately. Already-accepted independent dispatches keep only hidden, scrubbed operational state until their idempotent delivery finishes, then that state is deleted; nested work inherits the suppression. This preserves dispatch behavior without leaving a heartbeat-PASS debug or collaboration trail.
+
+Queued and running records found after relaunch are marked failed and surfaced in the target chat through the same durable outbox. The task payload itself is intentionally in-memory, so accepted dispatches are not resumed after Chat quits.
+
 ## Heartbeats
 
 ### Scheduling
@@ -326,7 +359,7 @@ The Heartbeats window exposes three actions for an upcoming heartbeat:
 
 A claimed heartbeat is removed from Upcoming and shown in the in-memory Running section. Its elapsed running time updates once per second. Right-clicking a running heartbeat and choosing `Abort` requests task cancellation. The harness checks cancellation again after the backend returns and before processing memory or posting, so an aborted run cannot add memory or a chat message. Its normal next-run date remains scheduled.
 
-Every execution has a five-minute timeout. At five minutes the scheduler removes the heartbeat from Running, requests cancellation, creates a completed timeout audit record, and schedules the next attempt one full interval after the timeout. The timeout record preserves the model input if it had already been constructed, has no model output, and reports that no chat message was posted. A backend that ignores cancellation may continue working after the UI timeout, but its eventual response is discarded before memory or message processing.
+Every execution has a five-minute timeout. At five minutes the scheduler removes the heartbeat from Running, requests cancellation, creates a completed timeout audit record, and schedules the next attempt one full interval after the timeout. With Debug log enabled, the timeout payload preserves any model input already constructed and tool calls completed by the timeout; otherwise the compact record omits prompt content. A backend that ignores cancellation may continue working after the UI timeout, but its eventual response is discarded before memory or message processing. If that late response is an exact pass, the detailed timeout graph is removed and only the compact timeout history row remains.
 
 ### Destination selection
 
@@ -386,9 +419,9 @@ The result is processed in this order:
 
 A generation, destination, or abort error is stored on the heartbeat for display in the agent editor. Unlike ordinary group-generation errors, heartbeat errors are not posted into the chat.
 
-Every completed heartbeat attempt also creates a persistent audit record. The record snapshots the agent name, heartbeat instruction, destination label, start and completion times, the complete system and user input, the model's raw output before memory-block removal, the action taken, and any error. These records remain available in the Heartbeats window even if the heartbeat or agent is later edited or deleted.
+Every completed heartbeat attempt creates a persistent compact `HeartbeatRun` history record. Recorded runs snapshot the agent name, heartbeat instruction, destination label, start and completion times, action, token usage, and any error. An exact pass creates only this compact row: it creates no `GenerationTurn`, tool rows, provider/debug payload, or collaboration trace. These records remain available in the Heartbeats window even if the heartbeat or agent is later edited or deleted.
 
-The stored model input is displayed as `SYSTEM` and `USER` sections. Those sections contain the exact prompt text supplied to both backends; they are an audit representation rather than an additional wrapper sent to the model. Aborted and timed-out runs are saved as completed audit records with their corresponding action and error; their input is present if prompt construction had completed before cancellation, and their output is normally empty.
+With Debug log enabled, the linked generation turn stores the exact `SYSTEM` and `USER` prompts, the raw model output, intermediate/provider artifacts, complete root tool arguments/results, and every correlated delegated-agent exchange. Asynchronous dispatch rows continue updating after the root heartbeat finishes, and inspectors observe newly inserted descendants live. Debug-off runs retain only compact tool fields. Aborted and timed-out runs are saved as completed audit records with their corresponding action and error. If a cancellation-resistant provider exits after the five-minute timeout, its final tool snapshot and debug artifacts enrich that same timed-out turn without changing the terminal outcome or scheduling state, unless its late result is an exact pass; PASS removes the detailed graph while retaining the compact timeout row.
 
 ## Pass handling
 
@@ -399,6 +432,8 @@ A response is treated as a pass only when its complete visible content, after tr
 - `PASS`
 
 Memory blocks are removed before this check, so an agent can append memory and pass without posting.
+
+A heartbeat pass remains visible in compact execution history but is omitted from generation, tool, provider/debug, and collaboration logging. It still counts as a completed attempt for scheduling and for the next heartbeat prompt's elapsed-time calculation.
 
 ## Values not sent as conversational context
 
@@ -424,7 +459,7 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 
 3. **The memory protocol is marker-based.** A malformed or incomplete marker becomes visible text. A model can append low-quality, duplicated, or misleading memory, and there is no confirmation, provenance, size limit, or deduplication.
 
-4. **Codex app-server does not expose a stable per-thread allowlist for its built-in tools.** The ChatGPT provider supplies an empty temporary working directory, a read-only/no-network sandbox, no workspace roots or execution environments, declines mutation approvals, and instructs the model to use only host-supplied dynamic tools. Those controls prevent writes and intentionally supplied workspace context, but prompt instructions are not a technical guarantee against a built-in read command targeting another host path. Stronger isolation requires a supported app-server tool allowlist or a separately sandboxed subprocess.
+4. **Codex app-server does not expose a stable dynamic-tools-only allowlist.** Chat disables the current built-in feature families at process and thread scope, disables all inherited MCP/plugin entries discovered in effective configuration, verifies that configured MCP entries are disabled with empty callable inventories, uses an empty temporary directory plus read-only/no-network execution settings, and aborts on unexpected built-in tool events. These are fail-closed checks for the current protocol surface, but they are not equivalent to an upstream model-visible tool-registry allowlist: a future unclassified built-in could theoretically act before its event is rejected. A complete boundary ultimately requires a supported app-server allowlist or a separately OS-sandboxed subprocess.
 
 ### Medium priority
 
@@ -432,9 +467,9 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 
 6. **Single-flight deferral can create schedule drift.** A heartbeat that becomes due while another heartbeat is running is postponed by its complete configured interval. Repeated contention can defer a heartbeat more than once, especially when a long-interval heartbeat happens to become due during frequent runs.
 
-7. **Execution control is in-memory and backend cancellation is cooperative.** If the app terminates after a heartbeat is claimed, the model request stops without a completed or aborted audit record, while the already-advanced next-run date remains persisted. At the five-minute UI timeout the global heartbeat slot is released; a non-cooperative backend may continue consuming resources and overlap a later heartbeat until it returns, although its late output is discarded.
+7. **Execution control is in-memory and backend cancellation is cooperative.** If the app terminates after a heartbeat is claimed, the model request stops without a completed or aborted audit record, while the already-advanced next-run date remains persisted. At the five-minute UI timeout the global heartbeat slot is released; a non-cooperative backend may continue consuming resources and overlap a later heartbeat until it returns. When it does return, Debug mode refreshes the already-terminal timeout trace but never posts the late reply or changes scheduling; an exact late pass removes that detailed trace instead.
 
-8. **Heartbeat history has no retention limit.** Each completed attempt stores the full model input and raw output. Long conversations and frequent schedules can make the SwiftData store grow quickly.
+8. **Recorded heartbeat history has no retention limit.** Compact runs, including exact passes, accumulate indefinitely, while Debug-enabled non-PASS runs additionally retain full prompts, raw/provider output, root tool exchanges, and correlated delegated-agent traces. Root generation fields have per-field caps, but the aggregate delegated-agent debug JSON has no additional storage cap beyond the collaboration/tool runtime bounds. Scrubbed privacy tombstones created by agent deletion are also retained without a cap to prevent late work from restoring deleted content. Frequent schedules and repeated agent deletion can therefore make the SwiftData store grow.
 
 9. **Extra-chat turns and heartbeat turns use different name and model snapshot rules.** Default chats and heartbeats use current agent configuration, with an optional per-heartbeat model override. Extra chats retain snapshotted names and model choices. All paths use current individual instructions and memory, but a heartbeat post can still differ from the agent's next ordinary reply in an extra chat because of its name or model.
 
@@ -442,7 +477,7 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 
 11. **Normal group-generation errors are still agent speech.** The error bubble is attributed to the agent and enters the transcript seen by later participants.
 
-12. **Mention handles can collide.** Removing spaces and punctuation can map multiple agent names to one handle, adding or emphasizing every match.
+12. **Independent dispatch is not a durable job queue.** Work survives the caller's turn but not app termination. Relaunch marks interrupted records failed and posts a failure notice, but the redacted audit record does not contain enough task data to resume it.
 
 ### Lower priority
 
@@ -451,3 +486,5 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 14. **Silent group participants are absent from context.** An agent learns who else is present only after those participants post.
 
 15. **Memory edits can race with generation.** The user can edit memory while a request is running. The request uses the memory captured at prompt construction, while any model additions are appended to whatever text exists when the result returns.
+
+16. **Delegation limits are fixed policy, not user-configurable budgets.** Depth, node count, provider concurrency, deadlines, and retained audit history are currently hard-coded. There is no per-agent cost ceiling or daily remote-model budget.

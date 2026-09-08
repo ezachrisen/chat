@@ -12,7 +12,7 @@
 
 Chat already persists a visible transcript (`StoredChat` / `StoredChatMessage` in `Chat/ChatStore.swift`) and an always-on heartbeat audit (`HeartbeatRun` in `Chat/AgentHeartbeats.swift`). It does **not** persist a generation session: which user message triggered a model call, which tools or skills ran, whether the agent posted or passed, or the prompt that produced the reply. `ModelClient.complete` returns a final `String`; the OpenAI tool loop in `OpenAICompatibleClient.respond` and the Apple `LanguageModelSession` tool transcript are discarded. Heartbeats make the opposite mistake: every `HeartbeatRun` stores the full `SYSTEM`/`USER` prompt and raw model output even when nobody asked for that volume of data (`MODEL_CONTEXT.md` issue 7).
 
-This design adds a SwiftData **generation-turn** log that is queryable independently of the chat bubbles. Every model invocation — direct reply, per-agent group reply, or heartbeat — writes one `GenerationTurn` plus zero or more `ToolInvocation` rows. The visible transcript stays in `StoredChatMessage`. A per-agent **Debug log** toggle (off by default) gates a separate `GenerationDebugPayload` that stores the prompt, Apple transcript / OpenAI tool-loop messages, reasoning entries, and unsanitized model output. `HeartbeatRun` is kept as the compact Heartbeats-window row; bulky prompt/output moves behind debug.
+This design adds a SwiftData **generation-turn** log that is queryable independently of the chat bubbles. Every recorded model invocation — direct reply, per-agent group reply, or non-PASS heartbeat — writes one `GenerationTurn` plus zero or more `ToolInvocation` rows. Exact heartbeat passes write only the compact `HeartbeatRun` history row and intentionally create no generation/debug graph. The visible transcript stays in `StoredChatMessage`. A per-agent **Debug log** toggle (off by default) gates a separate `GenerationDebugPayload` that stores the prompt, Apple transcript / OpenAI tool-loop messages, reasoning entries, and unsanitized model output. `HeartbeatRun` is kept as the compact Heartbeats-window row; bulky prompt/output moves behind debug.
 
 Heartbeat persistence has a **single writer**: `AgentStore.recordHeartbeatCompletion`. `ChatViewModel.executeHeartbeat` never inserts a turn. Timeout and abort are distinguished by an explicit scheduler-slot outcome, not by `Task.isCancelled` alone. The scheduler owns the `ToolCallRecorder` for the in-flight run so a five-minute timeout can snapshot tools that already finished.
 
@@ -116,14 +116,14 @@ That string is the full chat transcript plus memory plus skills list, stored on 
 - Feeding tool results back into later agents’ visible transcripts (today they never appear in `StoredChatMessage`).
 - Chat deletion, turn deletion UI, or exporting sessions.
 - OS background heartbeats, or fixing single-flight deferral (`MODEL_CONTEXT.md` issues 4–6) except where capture must handle abort/timeout.
-- Waiting out a non-cooperative backend after the five-minute heartbeat timeout. The global heartbeat slot still releases at five minutes; late model output is still discarded before memory or posting.
+- Waiting out a non-cooperative backend after the five-minute heartbeat timeout. The global heartbeat slot still releases at five minutes; late model output never reaches memory or chat. Debug mode may copy a non-PASS result into the already-terminal timeout trace when the provider exits; an exact late pass removes that detailed graph and retains only the compact timeout row.
 - Parsing `<think>` / chain-of-thought tags some local models emit inside `content`. Those remain in raw debug output and may already be stripped from the bubble by `ReplyFilterSet`.
 
 ## Key Decisions
 
 1. **Unified `GenerationTurn` for chat and heartbeats; keep `HeartbeatRun`.** One schema for “a model ran.” Heartbeats window and `AgentStore.heartbeatRuns` stay on `HeartbeatRun`. Dual-write of the compact heartbeat row plus a turn is cheaper and safer than migrating `HeartbeatRun` off an unversioned store. **Only `AgentStore.recordHeartbeatCompletion` inserts heartbeat turns.**
 
-2. **`StoredChatMessage` remains the visible transcript.** Turns *point at* message UUIDs (`userMessageID`, `assistantMessageID`). Greeting, fake developer messages, and TTS playback are unchanged. Passes have a turn and no assistant message.
+2. **`StoredChatMessage` remains the visible transcript.** Turns *point at* message UUIDs (`userMessageID`, `assistantMessageID`). Greeting, fake developer messages, and TTS playback are unchanged. Direct/group passes have a turn and no assistant message; heartbeat passes keep a compact `HeartbeatRun` but are intentionally omitted from the generation-turn table.
 
 3. **No SwiftData `@Relationship`; UUID FKs only.** Matches `StoredChatMessage.chatID`, `HeartbeatRun.heartbeatID`, `StoredGroupChatParticipant.agentID`.
 
@@ -137,7 +137,7 @@ That string is the full chat transcript plus memory plus skills list, stored on 
 
 8. **Group chats: one turn per agent generation, all sharing the same `userMessageID`.** Serial order is `startedAt` among participants (the loop is serial and each call takes model latency). Later agents see earlier *posted* replies because those are already `StoredChatMessage` rows; they do not see sibling tool calls.
 
-9. **Heartbeat bulky fields are starved, not deleted.** Compact write and Heartbeats empty-state copy ship in the **same** PR, so new `HeartbeatRun` rows always store `modelInput = ""` and `modelOutput = nil`. Debug data lives only on `GenerationDebugPayload`. Legacy rows keep their prompts and are shown as today. UI: non-empty `modelInput`/`modelOutput` (legacy) **or** payload (new debug-on) **or** muted “Debug log was off.”
+9. **Heartbeat bulky fields are starved, not deleted.** Compact write and Heartbeats empty-state copy ship in the **same** PR, so new `HeartbeatRun` rows always store `modelInput = ""` and `modelOutput = nil`. Debug data lives only on `GenerationDebugPayload`. Legacy rows keep their prompts and are shown as today. UI: non-empty `modelInput`/`modelOutput` (legacy), payload (new debug-on), “Debug log was on, but no model payload was stored” (debug-on pre-model failure), or muted “Debug log was off.”
 
 10. **Do not load debug payloads (or unbounded run lists) into `AgentStore`.** Page `HeartbeatRun` **before** schema/capture work. Heartbeats UI faults debug on expand.
 
@@ -516,7 +516,7 @@ sequenceDiagram
     else five-minute timeout
         Sch->>Sch: outcome = timedOut, cancel task, snapshot recorder
         Sch->>AS: recordHeartbeatCompletion(timedOut, snapshot)
-        Note over Sch: late VM report discarded (token gone)
+        Note over Sch: late debug report refreshes the same terminal turn
     end
 ```
 
@@ -580,9 +580,9 @@ struct HeartbeatExecutionSlot {
 3. Build a timeout `HeartbeatExecutionReport` with preallocated ids, `chatID` from the slot, `debugCaptureEnabled` from the slot, invocations from the snapshot, `generationStatus = .timedOut`.
 4. Debug on: payload draft uses the **already-split** slot fields (`systemPrompt = slot.debugSystemPrompt ?? ""`, `conversationPrompt = slot.debugConversationPrompt ?? ""`). Do **not** concatenate them as today’s `SYSTEM\n…\nUSER\n…` `onModelInput` string, and do not parse that blob back apart. If the callback has not fired, both fields are `""`. Debug off: leave `debug` nil; do not store prompts on the slot.
 5. Nil the slot (release single-flight), remove from `runningHeartbeats`, `recordHeartbeatCompletion`, `rescheduleHeartbeatAfterTimeout`.
-6. When the cancelled task later returns, `executionTasks[id]?.token` does not match → **discard** the report. No second turn, no memory append, no chat post (same as today’s discard-after-timeout).
+6. When the cancelled task later returns, `executionTasks[id]?.token` does not match. In Debug mode, refresh only the exact timed-out turn's tool rows, debug payload, and recovered token counts. If the late result is exact PASS, retain the durable root-suppression marker until the timed-out generation turn, tool rows, payload, and compact run's turn link are removed atomically, while keeping its timeout outcome. Launch recovery honors a marker left by a crash and finishes the same scrub. Never create a second turn, append memory, post to chat, or change the timeout outcome/scheduling.
 
-Tools that complete after the snapshot (in-flight `ExecuteSkillScript` at t=5:00) may be missing from the timeout record. That is the accepted gap. Tools that finished before t=5:00 are persisted. `executeHeartbeat` still must attach the recorder snapshot to `HeartbeatModelFailure` so **abort** (token still valid) and **model errors** flush tools.
+Tools that finished before t=5:00 are present immediately. In Debug mode, tools that complete after the timeout snapshot appear when a cancellation-resistant provider finally exits with a non-PASS result and refreshes the turn. `executeHeartbeat` still attaches the recorder snapshot to `HeartbeatModelFailure` so **abort** (token still valid), **model errors**, and non-PASS late timeout refreshes flush tools. Exact PASS failures mark the report to omit detailed trace.
 
 **Abort.** `abort()` only cancels the task. `executeHeartbeat` throws `HeartbeatModelFailure(wasAborted: true)` with the recorder snapshot, `chatID`, ids, and prompt pieces if constructed. Scheduler sees matching token and `outcome == .running` → writes `.aborted` via `recordHeartbeatCompletion`. If timeout already claimed the slot, the abort report is discarded.
 
@@ -599,7 +599,8 @@ Tools that complete after the snapshot (in-flight `ExecuteSkillScript` at t=5:00
 | `HeartbeatExecutionError.emptyInstruction` | `nil` | No |
 | `HeartbeatExecutionError.targetMissing` | `nil` | No |
 | `HeartbeatExecutionError.chatBusy` (thrown after `targetChat` is chosen) | `targetChat.id` | Yes, `.failed`, 0 tools |
-| Success / pass / empty / model error / abort after destination | `targetChat.id` | Yes |
+| Success / empty / model error / abort after destination | `targetChat.id` | Yes |
+| Exact pass after destination | `targetChat.id` | No. Write compact `HeartbeatRun` history only |
 | Scheduler timeout after `onDestinationChat` | slot `chatID` | Yes, `.timedOut`, recorder snapshot |
 | Scheduler timeout *before* `onDestinationChat` (should not happen; destination resolve is synchronous) | `nil` | No. `HeartbeatRun` only |
 
@@ -869,7 +870,8 @@ Later (not v1 UI): a Sessions window listing `GenerationTurn` like Heartbeats. T
 | Posted assistant preview (≤280 chars) | `GenerationTurn.visibleReplyPreview` | List/Heartbeats snippet without joining |
 | Greeting / fake / slow messages | `StoredChatMessage` only | Not model generations |
 | Error bubble text | `StoredChatMessage` + failed `GenerationTurn` | Today errors are agent speech in-group |
-| Pass / empty | `GenerationTurn` only | Nothing to show in the transcript |
+| Direct/group pass or empty | `GenerationTurn` only | Nothing to show in the transcript |
+| Heartbeat pass | Compact `HeartbeatRun` only | Visible in history; no generation/tool/debug graph |
 | Tool name / args / result | `ToolInvocation` | Never part of the visible transcript |
 | Full prompt, reasoning, raw output | `GenerationDebugPayload` | Volume; debug-gated |
 | Heartbeat instruction, destination label, action sentence | `HeartbeatRun` | Heartbeats window |
@@ -1157,7 +1159,7 @@ Cleaner faulting.
 
 Would persist in-flight tool results after `Process.terminate`.
 
-**Rejected:** pins the single-flight heartbeat slot beyond five minutes when the backend ignores cancel. Snapshot the scheduler-owned recorder instead; omit tools still running at t=5:00.
+**Rejected:** pins the single-flight heartbeat slot beyond five minutes when the backend ignores cancel. Snapshot the scheduler-owned recorder, release the slot immediately, then let Debug mode enrich the already-terminal timeout trace if the old provider eventually exits.
 
 ## Security & Privacy Considerations
 
@@ -1281,7 +1283,7 @@ Incremental, each PR reviewable and mergeable on main. Capture types live in `Sk
 - **Title:** Stop storing heartbeat prompts by default; link HeartbeatRun to GenerationTurn
 - **Files:** `Chat/ChatViewModel.swift`, `Chat/ChatStore.swift`, `Chat/AgentHeartbeats.swift`, `Chat/AgentStore.swift`, `Chat/HeartbeatsView.swift`
 - **Depends on:** PR 2, PR 3 (does **not** depend on PR 4; `recordTurn` already exists). Does **not** include paging (PR 1).
-- **Changes:** Implement the Heartbeat single-writer protocol: preallocated `runID`/`turnID`, scheduler-owned recorder passed into `executeHeartbeat` (checklist: no second `ToolCallRecorder()` in the VM), `onDestinationChat` on `ChatStore` only, slot `outcome` for timeout vs abort, `recordHeartbeatCompletion` inserts run + turn. New `HeartbeatRun.modelInput`/`modelOutput` always empty/nil. Replace `onModelInput` / `runningModelInputs` with `onDebugPrompt(system, conversation)` filling `slot.debugSystemPrompt` / `debugConversationPrompt` when debug is on; timeout payload uses those two fields, not a concatenated blob. Timeout snapshots the recorder (tools finished before t=5:00); late cancelled-task reports are discarded. Heartbeats Completed expand: Tools list; hide empty Model input/output; show payload when present; muted “Debug log was off” otherwise. `RunningHeartbeat` gains `chatID` and `debugCaptureEnabled`.
+- **Changes:** Implement the Heartbeat single-writer protocol: preallocated `runID`/`turnID`, scheduler-owned recorder passed into `executeHeartbeat` (checklist: no second `ToolCallRecorder()` in the VM), `onDestinationChat` on `ChatStore` only, slot `outcome` for timeout vs abort, `recordHeartbeatCompletion` inserts a compact run for every outcome and a generation turn for every non-PASS outcome after destination resolution. An exact pass updates completion state and writes only `HeartbeatRun`; it creates no `GenerationTurn`, tool rows, or debug payload. New `HeartbeatRun.modelInput`/`modelOutput` always empty/nil. Replace `onModelInput` / `runningModelInputs` with `onDebugPrompt(system, conversation)` filling `slot.debugSystemPrompt` / `debugConversationPrompt` when debug is on; timeout payload uses those two fields, not a concatenated blob. Timeout snapshots the recorder at t=5:00; if a cancellation-resistant provider exits later, Debug mode refreshes that exact timed-out turn's tools and payload without changing its outcome. Heartbeats Completed expand: Tools list; hide empty Model input/output; show payload when present; distinguish PASS-without-debug, debug-on/no-payload, and debug-off. `RunningHeartbeat` gains `chatID` and `debugCaptureEnabled`.
 
 ### PR 6 — Chat transcript inspector for tools and debug
 

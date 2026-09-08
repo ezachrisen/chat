@@ -408,10 +408,7 @@ struct OpenAICompatibleClient: Sendable {
             return try await performHTTP(request)
         }
 
-        var (data, httpResponse) = try await performOnce(includingTools: tools != nil)
-        if tools != nil, !(200...299).contains(httpResponse.statusCode) {
-            (data, httpResponse) = try await performOnce(includingTools: false)
-        }
+        let (data, httpResponse) = try await performOnce(includingTools: tools != nil)
 
         guard (200...299).contains(httpResponse.statusCode) else {
             let errorPayload = try? JSONDecoder().decode(OpenAIErrorResponse.self, from: data)

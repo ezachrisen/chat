@@ -19,7 +19,7 @@ nonisolated struct ChatGPTProviderInspection: Sendable {
     let executableVersion: String
 }
 
-nonisolated struct ChatGPTProviderConfiguration: Sendable {
+nonisolated struct ChatGPTProviderConfiguration: Sendable, Equatable {
     let executableURL: URL
     let modelID: String?
     let displayName: String
@@ -60,6 +60,7 @@ nonisolated enum ChatGPTProviderError: LocalizedError {
     case responseTimedOut
     case interrupted
     case noFinalResponse
+    case capabilityBoundaryViolation(String)
 
     var errorDescription: String? {
         switch self {
@@ -94,6 +95,8 @@ nonisolated enum ChatGPTProviderError: LocalizedError {
             return "The ChatGPT response was cancelled."
         case .noFinalResponse:
             return "ChatGPT completed without returning a reply."
+        case .capabilityBoundaryViolation(let details):
+            return "ChatGPT stopped because the provider capability boundary could not be enforced. \(details)"
         }
     }
 }
@@ -310,6 +313,7 @@ enum ChatGPTProviderClient {
                 guard try await readChatGPTAccount(from: session) != nil else {
                     throw ChatGPTProviderError.notAuthenticated
                 }
+                let confinedConfig = try await confinedThreadConfiguration(from: session)
 
                 let temporaryDirectory = try makeIsolatedWorkingDirectory()
                 defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
@@ -325,6 +329,7 @@ enum ChatGPTProviderClient {
                     "personality": "none",
                     "serviceName": "chat",
                     "allowProviderModelFallback": false,
+                    "config": confinedConfig,
                     "baseInstructions": baseInstructions,
                     "developerInstructions": developerInstructions(
                         systemPrompt: systemPrompt,
@@ -349,6 +354,7 @@ enum ChatGPTProviderClient {
                 guard threadResult["modelProvider"] as? String == "openai" else {
                     throw ChatGPTProviderError.subscriptionRoutingUnavailable
                 }
+                try await requireConfinedMCPInventory(session: session, threadID: threadID)
 
                 let turnResult = try await session.request(
                     method: "turn/start",
@@ -386,7 +392,7 @@ enum ChatGPTProviderClient {
     }
 
     private static let baseInstructions = """
-    You are the language model powering a conversational chat application. Respond to the user's chat request directly and naturally. Do not behave like a coding workspace agent. Do not inspect files, run commands, modify a workspace, browse the web, or invoke built-in Codex tools. Only use explicitly supplied dynamic function tools when they are relevant to the user's request. Return the user-facing response as your final answer.
+    You are the language model powering a conversational chat application and its internal agent-work runtime. Follow the supplied developer instructions to determine whether a result is user-facing or is internal evidence for another agent. Do not behave like a coding workspace agent. Do not inspect files, run commands, modify a workspace, browse the web, or invoke built-in Codex tools. Only use explicitly supplied dynamic function tools when they are relevant to the assigned work.
     """
 
     private static func sessionTimeout(
@@ -417,6 +423,193 @@ enum ChatGPTProviderClient {
         """
     }
 
+    private static func confinedThreadConfiguration(
+        from session: CodexAppServerSession
+    ) async throws -> [String: Any] {
+        let result = try await session.request(
+            method: "config/read",
+            params: ["includeLayers": false]
+        )
+        guard let effectiveConfig = result["config"] as? [String: Any] else {
+            throw ChatGPTProviderError.capabilityBoundaryViolation(
+                "Codex did not return its effective configuration."
+            )
+        }
+
+        var confinedFeatures = Dictionary(
+            uniqueKeysWithValues: confinedFeatureNames.map { ($0, false as Any) }
+        )
+        // Current ChatGPT models route host-supplied dynamic functions through
+        // the adjacent Codex code-mode host. Keep that bridge enabled while
+        // disabling code_mode itself and all other model-visible tool families.
+        confinedFeatures["code_mode_host"] = true
+
+        let disabledMCPServers = try disabledNamedEntries(
+            in: effectiveConfig,
+            key: "mcp_servers"
+        )
+        let disabledPlugins = try disabledNamedEntries(
+            in: effectiveConfig,
+            key: "plugins"
+        )
+
+        return [
+            "approval_policy": "never",
+            "sandbox_mode": "read-only",
+            "features": confinedFeatures,
+            "mcp_servers": disabledMCPServers,
+            "plugins": disabledPlugins,
+            "apps": [
+                "_default": [
+                    "enabled": false,
+                    "destructive_enabled": false,
+                    "open_world_enabled": false,
+                    "default_tools_enabled": false
+                ]
+            ],
+            "agents": ["enabled": false],
+            "orchestrator": [
+                "skills": ["enabled": false],
+                "mcp": ["enabled": false]
+            ],
+            "skills": ["include_instructions": false],
+            "tools": [
+                "experimental_request_user_input": ["enabled": false],
+                "request_user_input": ["enabled": false],
+                "update_plan": ["enabled": false]
+            ],
+            "web_search": "disabled",
+            "project_doc_max_bytes": 0,
+            "project_doc_fallback_filenames": [],
+            "include_apps_instructions": false,
+            "include_environment_context": false,
+            "include_collaboration_mode_instructions": false,
+            "include_permissions_instructions": false
+        ]
+    }
+
+    private static let confinedFeatureNames = [
+        "apps",
+        "auth_elicitation",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "code_mode",
+        "computer_use",
+        "default_mode_request_user_input",
+        "enable_mcp_apps",
+        "goals",
+        "hooks",
+        "image_generation",
+        "multi_agent",
+        "multi_agent_v2",
+        "plugins",
+        "recommended_plugins",
+        "remote_plugin",
+        "request_permissions_tool",
+        "shell_tool",
+        "skill_mcp_dependency_install",
+        "skill_search",
+        "standalone_web_search",
+        "tool_call_mcp_elicitation",
+        "tool_suggest",
+        "unified_exec",
+        "view_image",
+        "web_search_cached",
+        "web_search_request",
+        "workspace_dependencies"
+    ]
+
+    private static func disabledNamedEntries(
+        in config: [String: Any],
+        key: String
+    ) throws -> [String: Any] {
+        guard let rawEntries = config[key] else { return [:] }
+        guard let entries = rawEntries as? [String: Any] else {
+            throw ChatGPTProviderError.capabilityBoundaryViolation(
+                "Codex returned an unreadable \(key) configuration."
+            )
+        }
+        return Dictionary(uniqueKeysWithValues: entries.keys.map { name in
+            (name, ["enabled": false] as [String: Any])
+        })
+    }
+
+    private static func requireConfinedMCPInventory(
+        session: CodexAppServerSession,
+        threadID: String
+    ) async throws {
+        var cursor: String?
+        var seenCursors = Set<String>()
+
+        repeat {
+            var params: [String: Any] = [
+                "threadId": threadID,
+                "detail": "toolsAndAuthOnly",
+                "limit": 100
+            ]
+            if let cursor {
+                guard seenCursors.insert(cursor).inserted else {
+                    throw ChatGPTProviderError.capabilityBoundaryViolation(
+                        "Codex repeated an MCP inventory cursor."
+                    )
+                }
+                params["cursor"] = cursor
+            }
+
+            let result = try await session.request(
+                method: "mcpServerStatus/list",
+                params: params
+            )
+            guard let servers = result["data"] as? [[String: Any]] else {
+                throw ChatGPTProviderError.capabilityBoundaryViolation(
+                    "Codex did not return a verifiable MCP inventory."
+                )
+            }
+            guard servers.allSatisfy(isConfinedMCPServer) else {
+                throw ChatGPTProviderError.capabilityBoundaryViolation(
+                    "An inherited MCP server was not fully disabled."
+                )
+            }
+            if let nextCursor = result["nextCursor"] {
+                if nextCursor is NSNull {
+                    cursor = nil
+                } else if let nextCursor = nextCursor as? String {
+                    cursor = nextCursor
+                } else {
+                    throw ChatGPTProviderError.capabilityBoundaryViolation(
+                        "Codex returned an unreadable MCP inventory cursor."
+                    )
+                }
+            } else {
+                cursor = nil
+            }
+        } while cursor != nil
+    }
+
+    /// `mcpServerStatus/list` includes configured servers even when the thread-level
+    /// configuration disables them. A disabled entry is safe only when the runtime
+    /// confirms that it did not initialize and exposes no callable inventory.
+    private static func isConfinedMCPServer(_ server: [String: Any]) -> Bool {
+        guard let name = server["name"] as? String,
+              !name.isEmpty,
+              server["runtimeStatus"] as? String == "disabled",
+              let tools = server["tools"] as? [String: Any],
+              tools.isEmpty,
+              let resources = server["resources"] as? [Any],
+              resources.isEmpty,
+              let resourceTemplates = server["resourceTemplates"] as? [Any],
+              resourceTemplates.isEmpty,
+              isMissingOrNull(server["serverInfo"]) else {
+            return false
+        }
+        return true
+    }
+
+    private static func isMissingOrNull(_ value: Any?) -> Bool {
+        value == nil || value is NSNull
+    }
+
     private static func collectGeneration(
         session: CodexAppServerSession,
         threadID: String,
@@ -433,13 +626,33 @@ enum ChatGPTProviderClient {
         var toolCallCount = 0
         var lastErrorMessage: String?
 
-        while let message = try await session.nextMessage() {
+        func partialResult() -> ModelGenerationResult {
+            let hasObservedOutput = finalText != nil
+                || !reasoningTexts.isEmpty
+                || !intermediateTexts.isEmpty
+                || !unknownPhaseTexts.isEmpty
+                || toolCallCount > 0
+            return ModelGenerationResult(
+                finalText: finalText ?? "",
+                reasoningTexts: reasoningTexts,
+                intermediateAssistantTexts: intermediateTexts + unknownPhaseTexts,
+                openAIRoundCount: hasObservedOutput ? max(1, toolCallCount + 1) : 0,
+                tokenUsage: tokenUsage,
+                debug: captureDebug ? debugCapture(
+                    modelID: modelID,
+                    toolCallCount: toolCallCount
+                ) : nil
+            )
+        }
+
+        do {
+            while let message = try await session.nextMessage() {
             if let requestID = message["id"],
                let method = message["method"] as? String {
                 switch method {
                 case "item/tool/call":
                     toolCallCount += 1
-                    await answerDynamicToolCall(
+                    try await answerDynamicToolCall(
                         requestID: requestID,
                         message: message,
                         expectedThreadID: threadID,
@@ -449,11 +662,17 @@ enum ChatGPTProviderClient {
                     )
                 case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
                     try session.sendResponse(id: requestID, result: ["decision": "decline"])
+                    throw ChatGPTProviderError.capabilityBoundaryViolation(
+                        "Codex requested the built-in \(method) capability."
+                    )
                 default:
                     try session.sendError(
                         id: requestID,
                         code: -32601,
                         message: "This chat provider does not support \(method)."
+                    )
+                    throw ChatGPTProviderError.capabilityBoundaryViolation(
+                        "Codex requested the unsupported \(method) capability."
                     )
                 }
                 continue
@@ -465,6 +684,15 @@ enum ChatGPTProviderClient {
             }
 
             switch method {
+            case "item/started":
+                guard params["threadId"] as? String == threadID,
+                      params["turnId"] as? String == turnID,
+                      let item = params["item"] as? [String: Any],
+                      let type = item["type"] as? String else {
+                    continue
+                }
+                try requirePermittedItemType(type)
+
             case "item/completed":
                 guard params["threadId"] as? String == threadID,
                       params["turnId"] as? String == turnID,
@@ -472,6 +700,7 @@ enum ChatGPTProviderClient {
                       let type = item["type"] as? String else {
                     continue
                 }
+                try requirePermittedItemType(type)
                 if type == "agentMessage", let text = item["text"] as? String {
                     switch item["phase"] as? String {
                     case "final_answer":
@@ -546,11 +775,28 @@ enum ChatGPTProviderClient {
             default:
                 continue
             }
-        }
+            }
 
-        throw ChatGPTProviderError.protocolError(
-            lastErrorMessage ?? "Codex closed the event stream before the turn completed."
-        )
+            throw ChatGPTProviderError.protocolError(
+                lastErrorMessage ?? "Codex closed the event stream before the turn completed."
+            )
+        } catch let error as ModelGenerationError {
+            throw error
+        } catch {
+            throw ModelGenerationError(underlying: error, partial: partialResult())
+        }
+    }
+
+    private static func requirePermittedItemType(_ type: String) throws {
+        switch type {
+        case "userMessage", "agentMessage", "reasoning", "dynamicToolCall",
+             "functionCallOutput", "contextCompaction":
+            return
+        default:
+            throw ChatGPTProviderError.capabilityBoundaryViolation(
+                "Codex attempted the built-in \(type) capability."
+            )
+        }
     }
 
     private static func answerDynamicToolCall(
@@ -560,20 +806,15 @@ enum ChatGPTProviderClient {
         expectedTurnID: String,
         tools: AgentToolBox?,
         session: CodexAppServerSession
-    ) async {
+    ) async throws {
         guard let params = message["params"] as? [String: Any],
               params["threadId"] as? String == expectedThreadID,
               params["turnId"] as? String == expectedTurnID,
               let toolName = params["tool"] as? String,
               let tools else {
-            try? session.sendResponse(
-                id: requestID,
-                result: dynamicToolResponse(
-                    text: "The requested tool is unavailable.",
-                    success: false
-                )
+            throw ChatGPTProviderError.capabilityBoundaryViolation(
+                "Codex requested a dynamic tool outside the active turn."
             )
-            return
         }
 
         do {
@@ -860,7 +1101,25 @@ private nonisolated final class CodexAppServerSession: @unchecked Sendable {
         iterator = lineFramer.stream.makeAsyncIterator()
 
         process.executableURL = executableURL
-        process.arguments = ["app-server", "--listen", "stdio://"]
+        process.arguments = [
+            "app-server",
+            "--enable", "code_mode_host",
+            "--disable", "apps",
+            "--disable", "browser_use",
+            "--disable", "computer_use",
+            "--disable", "image_generation",
+            "--disable", "multi_agent",
+            "--disable", "plugins",
+            "--disable", "remote_plugin",
+            "--disable", "shell_tool",
+            "--disable", "skill_mcp_dependency_install",
+            "--disable", "skill_search",
+            "--disable", "tool_suggest",
+            "--disable", "unified_exec",
+            "--disable", "view_image",
+            "--disable", "workspace_dependencies",
+            "--listen", "stdio://"
+        ]
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe

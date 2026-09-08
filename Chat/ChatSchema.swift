@@ -43,6 +43,9 @@ enum ChatModelContainer {
     static func make(configuration: ModelConfiguration) throws -> ModelContainer {
         try ModelContainer(
             for: Agent.self,
+            AgentCollaborationGrant.self,
+            SuppressedAgentInvocationRoot.self,
+            AgentInvocationRecord.self,
             AgentHeartbeat.self,
             HeartbeatRun.self,
             LocalModel.self,

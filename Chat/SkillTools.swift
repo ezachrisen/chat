@@ -36,6 +36,36 @@ nonisolated enum SkillAccessError: LocalizedError {
     }
 }
 
+private nonisolated final class SkillProcessCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var resolvedValue: Bool?
+
+    func install(_ continuation: CheckedContinuation<Bool, Never>) {
+        lock.lock()
+        if let resolvedValue {
+            lock.unlock()
+            continuation.resume(returning: resolvedValue)
+        } else {
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func resolve(_ value: Bool) {
+        lock.lock()
+        guard resolvedValue == nil else {
+            lock.unlock()
+            return
+        }
+        resolvedValue = value
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: value)
+    }
+}
+
 nonisolated enum SkillFileAccess {
     static let maxFileBytes = 256_000
     static let scriptTimeout: TimeInterval = 30
@@ -104,32 +134,33 @@ nonisolated enum SkillFileAccess {
             throw SkillAccessError.startFailed(error.localizedDescription)
         }
 
-        let finished: Bool = await withCheckedContinuation { continuation in
-            let lock = NSLock()
-            var didResume = false
-            func resume(_ value: Bool) {
-                lock.lock()
-                defer { lock.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume(returning: value)
-            }
+        let completion = SkillProcessCompletion()
+        let finished: Bool = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                completion.install(continuation)
 
-            let timeout = DispatchWorkItem {
-                if process.isRunning {
-                    process.terminate()
+                let timeout = DispatchWorkItem {
+                    if process.isRunning {
+                        process.terminate()
+                    }
+                    completion.resolve(false)
                 }
-                resume(false)
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                    deadline: .now() + scriptTimeout,
+                    execute: timeout
+                )
+                process.terminationHandler = { _ in
+                    timeout.cancel()
+                    completion.resolve(true)
+                }
             }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(
-                deadline: .now() + scriptTimeout,
-                execute: timeout
-            )
-            process.terminationHandler = { _ in
-                timeout.cancel()
-                resume(true)
+        } onCancel: {
+            if process.isRunning {
+                process.terminate()
             }
+            completion.resolve(false)
         }
+        try Task.checkCancellation()
 
         if process.isRunning {
             process.terminate()
@@ -214,7 +245,7 @@ nonisolated enum SkillFileAccess {
     }
 }
 
-nonisolated struct CapturedToolInvocation: Sendable {
+nonisolated struct CapturedToolInvocation: Codable, Sendable {
     var sequence: Int
     var roundIndex: Int
     var toolName: String
@@ -320,6 +351,7 @@ nonisolated enum ToolArgumentsJSON {
 struct ReadSkillFileTool: Tool {
     let runtime: SkillRuntime
     let recorder: ToolCallRecorder?
+    let authorization: AgentToolAuthorization?
 
     var name: String { AgentToolID.readSkillFile.rawValue }
     var description: String { AgentToolID.readSkillFile.toolDescription }
@@ -334,6 +366,8 @@ struct ReadSkillFileTool: Tool {
     }
 
     func call(arguments: Arguments) async throws -> String {
+        try Task.checkCancellation()
+        try await authorization?.check(toolName: name)
         let startedAt = Date()
         let argumentsJSON = ToolArgumentsJSON.encode([
             "skill_name": arguments.skill_name,
@@ -358,8 +392,9 @@ struct ReadSkillFileTool: Tool {
                 fileName: arguments.file_name,
                 runtime: runtime
             )
-            capturedResult = .success(output)
-            return output
+            let validatedOutput = try await authorization?.validatedOutput(output, toolName: name) ?? output
+            capturedResult = .success(validatedOutput)
+            return validatedOutput
         } catch {
             capturedResult = .failure(error)
             throw error
@@ -370,6 +405,7 @@ struct ReadSkillFileTool: Tool {
 struct SendNotificationTool: Tool {
     let agentName: String
     let recorder: ToolCallRecorder?
+    let authorization: AgentToolAuthorization?
 
     var name: String { AgentToolID.sendNotification.rawValue }
     var description: String { AgentToolID.sendNotification.toolDescription }
@@ -384,6 +420,8 @@ struct SendNotificationTool: Tool {
     }
 
     func call(arguments: Arguments) async throws -> String {
+        try Task.checkCancellation()
+        try await authorization?.check(toolName: name)
         let startedAt = Date()
         let argumentsJSON = ToolArgumentsJSON.encode([
             "title": arguments.title,
@@ -410,8 +448,9 @@ struct SendNotificationTool: Tool {
                 ),
                 body: arguments.body
             )
-            capturedResult = .success(output)
-            return output
+            let validatedOutput = try await authorization?.validatedOutput(output, toolName: name) ?? output
+            capturedResult = .success(validatedOutput)
+            return validatedOutput
         } catch {
             capturedResult = .failure(error)
             throw error
@@ -422,6 +461,7 @@ struct SendNotificationTool: Tool {
 struct ReadCalendarEventsTool: Tool {
     let policy: CalendarAccessPolicy
     let recorder: ToolCallRecorder?
+    let authorization: AgentToolAuthorization?
 
     var name: String { AgentToolID.readCalendarEvents.rawValue }
     var description: String { AgentToolID.readCalendarEvents.toolDescription }
@@ -439,6 +479,8 @@ struct ReadCalendarEventsTool: Tool {
     }
 
     func call(arguments: Arguments) async throws -> String {
+        try Task.checkCancellation()
+        try await authorization?.check(toolName: name)
         let startedAt = Date()
         let argumentsJSON = ToolArgumentsJSON.encode([
             "start": arguments.start,
@@ -465,8 +507,9 @@ struct ReadCalendarEventsTool: Tool {
                 calendarIDsRaw: arguments.calendar_ids,
                 policy: policy
             )
-            capturedResult = .success(output)
-            return output
+            let validatedOutput = try await authorization?.validatedOutput(output, toolName: name) ?? output
+            capturedResult = .success(validatedOutput)
+            return validatedOutput
         } catch {
             capturedResult = .failure(error)
             throw error
@@ -477,6 +520,7 @@ struct ReadCalendarEventsTool: Tool {
 struct ExecuteSkillScriptTool: Tool {
     let runtime: SkillRuntime
     let recorder: ToolCallRecorder?
+    let authorization: AgentToolAuthorization?
 
     var name: String { AgentToolID.executeSkillScript.rawValue }
     var description: String { AgentToolID.executeSkillScript.toolDescription }
@@ -494,6 +538,8 @@ struct ExecuteSkillScriptTool: Tool {
     }
 
     func call(arguments: Arguments) async throws -> String {
+        try Task.checkCancellation()
+        try await authorization?.check(toolName: name)
         let startedAt = Date()
         let argumentsJSON = ToolArgumentsJSON.encode([
             "skill_name": arguments.skill_name,
@@ -520,10 +566,239 @@ struct ExecuteSkillScriptTool: Tool {
                 arguments: arguments.arguments,
                 runtime: runtime
             )
-            capturedResult = .success(output)
-            return output
+            let validatedOutput = try await authorization?.validatedOutput(output, toolName: name) ?? output
+            capturedResult = .success(validatedOutput)
+            return validatedOutput
         } catch {
             capturedResult = .failure(error)
+            throw error
+        }
+    }
+}
+
+private nonisolated enum DelegationToolTrace {
+    private static let maximumRecordedAgents = 8
+    private static let maximumAgentLength = 64
+    private static let maximumErrorLength = 320
+
+    static let undecodedArguments = "{\"assignment_count\":\"unknown\",\"agents\":[]}"
+
+    static func arguments(
+        _ assignments: [AgentDelegationAssignment],
+        includeTasks: Bool
+    ) -> String {
+        if includeTasks,
+           let data = try? JSONEncoder().encode(assignments),
+           let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+
+        struct Summary: Encodable {
+            var assignment_count: Int
+            var agents: [String]
+        }
+
+        let agents = assignments.prefix(maximumRecordedAgents).map { assignment in
+            sanitizeAgent(assignment.agent)
+        }
+        let summary = Summary(
+            assignment_count: assignments.count,
+            agents: Array(agents)
+        )
+        guard let data = try? JSONEncoder().encode(summary),
+              let string = String(data: data, encoding: .utf8) else {
+            return undecodedArguments
+        }
+        return string
+    }
+
+    static func result(
+        _ output: String,
+        assignmentCount: Int,
+        includeOutput: Bool
+    ) -> String {
+        if includeOutput {
+            return output
+        }
+        return "Completed \(assignmentCount) delegation assignment\(assignmentCount == 1 ? "" : "s"); result omitted (\(output.count) characters)."
+    }
+
+    static func error(_ error: Error, includeDetails: Bool) -> Error {
+        if includeDetails {
+            return error
+        }
+        let normalized = error.localizedDescription
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        let bounded = String(normalized.prefix(maximumErrorLength))
+        return DelegationTraceError(message: bounded.isEmpty ? "Delegation failed." : bounded)
+    }
+
+    private static func sanitizeAgent(_ agent: String) -> String {
+        let normalized = agent
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        return String(normalized.prefix(maximumAgentLength))
+    }
+}
+
+private nonisolated struct DelegationTraceError: LocalizedError {
+    let message: String
+
+    var errorDescription: String? { message }
+}
+
+struct AskAgentsTool: Tool {
+    let runtime: AgentDelegationRuntime
+    let recorder: ToolCallRecorder?
+    let authorization: AgentToolAuthorization?
+
+    var name: String { AgentToolID.askAgents.rawValue }
+    var description: String { AgentToolID.askAgents.toolDescription }
+
+    @Generable
+    struct Assignment {
+        @Guide(description: "The exact stable agent reference from the collaboration directory.")
+        var agent: String
+
+        @Guide(description: "A focused, self-contained task for this agent. Do not include work intended for another agent.")
+        var task: String
+    }
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Assignments to consult on in parallel. Include each target agent at most once.")
+        var assignments: [Assignment]
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        try Task.checkCancellation()
+        try await authorization?.check(toolName: name)
+        let assignments = arguments.assignments.map {
+            AgentDelegationAssignment(agent: $0.agent, task: $0.task)
+        }
+        return try await invoke(assignments)
+    }
+
+    private func invoke(_ assignments: [AgentDelegationAssignment]) async throws -> String {
+        let startedAt = Date()
+        let argumentsJSON = DelegationToolTrace.arguments(
+            assignments,
+            includeTasks: runtime.capturesFullTrace
+        )
+        var capturedResult: Result<String, Error> = .failure(
+            DelegationTraceError(message: "Delegation did not return a result.")
+        )
+        defer {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: nil,
+                result: capturedResult
+            )
+        }
+
+        do {
+            let response = try await runtime.ask(assignments)
+            try Task.checkCancellation()
+            try await authorization?.check(toolName: name)
+            await runtime.recordCallerExchange(response)
+            capturedResult = .success(
+                DelegationToolTrace.result(
+                    response.output,
+                    assignmentCount: assignments.count,
+                    includeOutput: runtime.capturesFullTrace
+                )
+            )
+            return response.output
+        } catch {
+            capturedResult = .failure(
+                DelegationToolTrace.error(
+                    error,
+                    includeDetails: runtime.capturesFullTrace
+                )
+            )
+            throw error
+        }
+    }
+}
+
+struct SendToAgentsTool: Tool {
+    let runtime: AgentDelegationRuntime
+    let recorder: ToolCallRecorder?
+    let authorization: AgentToolAuthorization?
+
+    var name: String { AgentToolID.sendToAgents.rawValue }
+    var description: String { AgentToolID.sendToAgents.toolDescription }
+
+    @Generable
+    struct Assignment {
+        @Guide(description: "The exact stable agent reference from the collaboration directory.")
+        var agent: String
+
+        @Guide(description: "A focused, self-contained task for this agent. Do not include work intended for another agent.")
+        var task: String
+    }
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Independent assignments to dispatch in parallel. Include each target agent at most once.")
+        var assignments: [Assignment]
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        try Task.checkCancellation()
+        try await authorization?.check(toolName: name)
+        let assignments = arguments.assignments.map {
+            AgentDelegationAssignment(agent: $0.agent, task: $0.task)
+        }
+        return try await invoke(assignments)
+    }
+
+    private func invoke(_ assignments: [AgentDelegationAssignment]) async throws -> String {
+        let startedAt = Date()
+        let argumentsJSON = DelegationToolTrace.arguments(
+            assignments,
+            includeTasks: runtime.capturesFullTrace
+        )
+        var capturedResult: Result<String, Error> = .failure(
+            DelegationTraceError(message: "Delegation did not return a result.")
+        )
+        defer {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: nil,
+                result: capturedResult
+            )
+        }
+
+        do {
+            let response = try await runtime.send(assignments)
+            try Task.checkCancellation()
+            try await authorization?.check(toolName: name)
+            await runtime.recordCallerExchange(response)
+            capturedResult = .success(
+                DelegationToolTrace.result(
+                    response.output,
+                    assignmentCount: assignments.count,
+                    includeOutput: runtime.capturesFullTrace
+                )
+            )
+            return response.output
+        } catch {
+            capturedResult = .failure(
+                DelegationToolTrace.error(
+                    error,
+                    includeDetails: runtime.capturesFullTrace
+                )
+            )
             throw error
         }
     }
@@ -537,6 +812,15 @@ struct AgentToolBox: Sendable {
     let recorder: ToolCallRecorder?
     let agentName: String
     let calendarPolicy: CalendarAccessPolicy
+    let delegationRuntime: AgentDelegationRuntime?
+    let authorization: AgentToolAuthorization?
+
+    var collaborationPrompt: String {
+        ModelPrompts.collaborationPrompt(
+            directoryPrompt: delegationRuntime?.directoryPrompt ?? "",
+            enabledToolIDs: enabledToolIDs
+        )
+    }
 
     var isEmpty: Bool {
         appleTools.isEmpty
@@ -545,16 +829,26 @@ struct AgentToolBox: Sendable {
     var appleTools: [any Tool] {
         var tools: [any Tool] = []
         if enabledToolIDs.contains(AgentToolID.readSkillFile.rawValue) {
-            tools.append(ReadSkillFileTool(runtime: runtime, recorder: recorder))
+            tools.append(ReadSkillFileTool(runtime: runtime, recorder: recorder, authorization: authorization))
         }
         if enabledToolIDs.contains(AgentToolID.executeSkillScript.rawValue) {
-            tools.append(ExecuteSkillScriptTool(runtime: runtime, recorder: recorder))
+            tools.append(ExecuteSkillScriptTool(runtime: runtime, recorder: recorder, authorization: authorization))
         }
         if enabledToolIDs.contains(AgentToolID.sendNotification.rawValue) {
-            tools.append(SendNotificationTool(agentName: agentName, recorder: recorder))
+            tools.append(SendNotificationTool(agentName: agentName, recorder: recorder, authorization: authorization))
         }
         if enabledToolIDs.contains(AgentToolID.readCalendarEvents.rawValue) {
-            tools.append(ReadCalendarEventsTool(policy: calendarPolicy, recorder: recorder))
+            tools.append(ReadCalendarEventsTool(policy: calendarPolicy, recorder: recorder, authorization: authorization))
+        }
+        if enabledToolIDs.contains(AgentToolID.askAgents.rawValue),
+           let delegationRuntime,
+           delegationRuntime.canConsult {
+            tools.append(AskAgentsTool(runtime: delegationRuntime, recorder: recorder, authorization: authorization))
+        }
+        if enabledToolIDs.contains(AgentToolID.sendToAgents.rawValue),
+           let delegationRuntime,
+           delegationRuntime.canDispatch {
+            tools.append(SendToAgentsTool(runtime: delegationRuntime, recorder: recorder, authorization: authorization))
         }
         return tools
     }
@@ -604,6 +898,31 @@ struct AgentToolBox: Sendable {
                     ],
                     required: ["start", "end"]
                 )
+            case AgentToolID.askAgents.rawValue, AgentToolID.sendToAgents.rawValue:
+                return OpenAITool.function(
+                    name: tool.name,
+                    description: tool.description,
+                    properties: [
+                        "assignments": OpenAIJSONProperty(
+                            type: "array",
+                            description: "Assignments for allowed agents. Include each target agent at most once.",
+                            items: OpenAIJSONSchema(
+                                properties: [
+                                    "agent": OpenAIJSONProperty(
+                                        type: "string",
+                                        description: "The exact stable agent reference from the collaboration directory."
+                                    ),
+                                    "task": OpenAIJSONProperty(
+                                        type: "string",
+                                        description: "A focused, self-contained task for this agent."
+                                    )
+                                ],
+                                required: ["agent", "task"]
+                            )
+                        )
+                    ],
+                    required: ["assignments"]
+                )
             default:
                 return OpenAITool.function(
                     name: tool.name,
@@ -616,7 +935,16 @@ struct AgentToolBox: Sendable {
     }
 
     func execute(name: String, argumentsJSON: String) async throws -> String {
+        try Task.checkCancellation()
+        try authorization?.check(toolName: name)
         let startedAt = Date()
+        let isDelegationTool = name == AgentToolID.askAgents.rawValue
+            || name == AgentToolID.sendToAgents.rawValue
+        let capturesFullDelegationTrace = isDelegationTool
+            && delegationRuntime?.capturesFullTrace == true
+        var recordedArgumentsJSON = isDelegationTool && !capturesFullDelegationTrace
+            ? DelegationToolTrace.undecodedArguments
+            : argumentsJSON
         var capturedResult: Result<String, Error> = .failure(
             SkillAccessError.startFailed("Tool did not return a result.")
         )
@@ -624,15 +952,22 @@ struct AgentToolBox: Sendable {
             recorder?.record(
                 startedAt: startedAt,
                 toolName: name,
-                argumentsJSON: argumentsJSON,
-                skillName: ToolArgumentsJSON.skillName(from: argumentsJSON),
+                argumentsJSON: recordedArgumentsJSON,
+                skillName: isDelegationTool ? nil : ToolArgumentsJSON.skillName(from: argumentsJSON),
                 result: capturedResult
             )
         }
 
         do {
+            guard enabledToolIDs.contains(name) else {
+                throw SkillAccessError.startFailed(
+                    "Tool “\(name)” is not enabled for this agent invocation."
+                )
+            }
             let data = Data(argumentsJSON.utf8)
             let output: String
+            var recordedOutput: String?
+            var delegationResponse: AgentDelegationToolResult?
             switch name {
             case AgentToolID.readSkillFile.rawValue:
                 let arguments = try JSONDecoder().decode(ReadSkillFileCall.self, from: data)
@@ -666,13 +1001,69 @@ struct AgentToolBox: Sendable {
                     calendarIDsRaw: arguments.calendar_ids,
                     policy: calendarPolicy
                 )
+            case AgentToolID.askAgents.rawValue:
+                let arguments = try JSONDecoder().decode(AgentDelegationCall.self, from: data)
+                recordedArgumentsJSON = DelegationToolTrace.arguments(
+                    arguments.assignments,
+                    includeTasks: capturesFullDelegationTrace
+                )
+                guard enabledToolIDs.contains(AgentToolID.askAgents.rawValue),
+                      let delegationRuntime,
+                      delegationRuntime.canConsult else {
+                    throw SkillAccessError.startFailed("Agent consultation is unavailable for this invocation.")
+                }
+                let response = try await delegationRuntime.ask(arguments.assignments)
+                output = response.output
+                delegationResponse = response
+                recordedOutput = DelegationToolTrace.result(
+                    output,
+                    assignmentCount: arguments.assignments.count,
+                    includeOutput: capturesFullDelegationTrace
+                )
+            case AgentToolID.sendToAgents.rawValue:
+                let arguments = try JSONDecoder().decode(AgentDelegationCall.self, from: data)
+                recordedArgumentsJSON = DelegationToolTrace.arguments(
+                    arguments.assignments,
+                    includeTasks: capturesFullDelegationTrace
+                )
+                guard enabledToolIDs.contains(AgentToolID.sendToAgents.rawValue),
+                      let delegationRuntime,
+                      delegationRuntime.canDispatch else {
+                    throw SkillAccessError.startFailed("Agent dispatch is unavailable for this invocation.")
+                }
+                let response = try await delegationRuntime.send(arguments.assignments)
+                output = response.output
+                delegationResponse = response
+                recordedOutput = DelegationToolTrace.result(
+                    output,
+                    assignmentCount: arguments.assignments.count,
+                    includeOutput: capturesFullDelegationTrace
+                )
             default:
                 throw SkillAccessError.startFailed("Unknown tool “\(name)”.")
             }
-            capturedResult = .success(output)
-            return output
+            let validatedOutput: String
+            if isDelegationTool {
+                try Task.checkCancellation()
+                try authorization?.check(toolName: name)
+                validatedOutput = output
+            } else {
+                validatedOutput = try authorization?.validatedOutput(output, toolName: name) ?? output
+            }
+            if let delegationResponse {
+                delegationRuntime?.recordCallerExchange(delegationResponse)
+            }
+            capturedResult = .success(recordedOutput ?? validatedOutput)
+            return validatedOutput
         } catch {
-            capturedResult = .failure(error)
+            capturedResult = .failure(
+                isDelegationTool
+                    ? DelegationToolTrace.error(
+                        error,
+                        includeDetails: capturesFullDelegationTrace
+                    )
+                    : error
+            )
             throw error
         }
     }
@@ -681,14 +1072,30 @@ struct AgentToolBox: Sendable {
     static func make(
         agent: Agent?,
         catalog: SkillCatalog,
-        recorder: ToolCallRecorder? = nil
+        recorder: ToolCallRecorder? = nil,
+        delegationRuntime: AgentDelegationRuntime? = nil,
+        allowedToolIDs: Set<String>? = nil,
+        authorization: AgentToolAuthorization? = nil
     ) -> AgentToolBox {
-        AgentToolBox(
+        var enabledToolIDs = catalog.enabledToolIDs(for: agent)
+        if let allowedToolIDs {
+            enabledToolIDs.formIntersection(allowedToolIDs)
+        }
+        if delegationRuntime?.canConsult != true {
+            enabledToolIDs.remove(AgentToolID.askAgents.rawValue)
+        }
+        if delegationRuntime?.canDispatch != true {
+            enabledToolIDs.remove(AgentToolID.sendToAgents.rawValue)
+        }
+
+        return AgentToolBox(
             runtime: catalog.runtime(for: agent),
-            enabledToolIDs: catalog.enabledToolIDs(for: agent),
+            enabledToolIDs: enabledToolIDs,
             recorder: recorder,
             agentName: agent?.displayName ?? "Chat",
-            calendarPolicy: agent?.calendarAccessPolicy ?? .none
+            calendarPolicy: agent?.calendarAccessPolicy ?? .none,
+            delegationRuntime: delegationRuntime,
+            authorization: authorization
         )
     }
 }
@@ -713,6 +1120,10 @@ private struct ReadCalendarEventsCall: Decodable {
     var start: String
     var end: String
     var calendar_ids: String?
+}
+
+private struct AgentDelegationCall: Decodable {
+    var assignments: [AgentDelegationAssignment]
 }
 
 struct OpenAITool: Encodable, Sendable {
@@ -750,4 +1161,15 @@ struct OpenAIJSONSchema: Encodable, Sendable {
 struct OpenAIJSONProperty: Encodable, Sendable {
     var type: String
     var description: String
+    var items: OpenAIJSONSchema?
+
+    init(
+        type: String,
+        description: String,
+        items: OpenAIJSONSchema? = nil
+    ) {
+        self.type = type
+        self.description = description
+        self.items = items
+    }
 }

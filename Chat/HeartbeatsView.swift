@@ -304,10 +304,7 @@ private struct RunningHeartbeatRow: View {
 private struct CompletedHeartbeatRow: View {
     @Environment(\.shadTheme) private var theme
     let run: HeartbeatRun
-    @Environment(\.modelContext) private var modelContext
     @State private var isExpanded = false
-    @State private var invocations: [ToolInvocationDisplay] = []
-    @State private var payload: GenerationDebugPayload?
 
     var body: some View {
         VStack(alignment: .leading, spacing: theme.spacing.sm) {
@@ -339,8 +336,14 @@ private struct CompletedHeartbeatRow: View {
                         if let errorMessage = run.errorMessage {
                             HeartbeatDetailField(title: "Error", text: errorMessage, isError: true)
                         }
-                        if !invocations.isEmpty {
-                            GenerationToolCallList(invocations: invocations)
+                        if let turnID = run.generationTurnID {
+                            GenerationToolCallSection(
+                                turnID: turnID,
+                                showsFullDetails: run.debugCaptureEnabled == true
+                            )
+                        }
+                        if let turnID = run.generationTurnID {
+                            AgentCollaborationDebugSection(rootInvocationID: turnID)
                         }
                         debugContent
                     }
@@ -348,11 +351,6 @@ private struct CompletedHeartbeatRow: View {
                 }
                 .padding(.leading, theme.spacing.xxl)
                 .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .onChange(of: isExpanded) { _, expanded in
-            if expanded {
-                loadDetails()
             }
         }
     }
@@ -419,8 +417,19 @@ private struct CompletedHeartbeatRow: View {
                 title: "Model output",
                 text: run.modelOutput ?? "No model output was received."
             )
-        } else if let payload {
-            GenerationDebugSections(payload: payload)
+        } else if let turnID = run.generationTurnID {
+            GenerationDebugLogSection(
+                turnID: turnID,
+                debugCaptureEnabled: run.debugCaptureEnabled == true
+            )
+        } else if run.passedWithoutDebugLog {
+            Text("The model returned PASS. Compact history was kept, but no debug log was stored.")
+                .font(theme.font(theme.typography.xs))
+                .foregroundStyle(theme.colors.mutedForeground)
+        } else if run.debugCaptureEnabled == true {
+            Text("Debug log was on, but no model payload was stored.")
+                .font(theme.font(theme.typography.xs))
+                .foregroundStyle(theme.colors.mutedForeground)
         } else {
             Text("Debug log was off for this run.")
                 .font(theme.font(theme.typography.xs))
@@ -428,15 +437,6 @@ private struct CompletedHeartbeatRow: View {
         }
     }
 
-    private func loadDetails() {
-        guard let turnID = run.generationTurnID else {
-            invocations = []
-            payload = nil
-            return
-        }
-        invocations = GenerationQuery.fetchToolCalls(forTurn: turnID, in: modelContext).map(ToolInvocationDisplay.init)
-        payload = GenerationQuery.fetchDebugPayload(forTurn: turnID, in: modelContext)
-    }
 }
 
 private struct HeartbeatDetailField: View {

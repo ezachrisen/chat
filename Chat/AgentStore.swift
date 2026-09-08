@@ -8,11 +8,13 @@ final class AgentStore: ObservableObject {
     private static let logger = Logger(subsystem: "Chat", category: "Agents")
 
     @Published private(set) var agents: [Agent] = []
+    @Published private(set) var collaborationGrants: [AgentCollaborationGrant] = []
     @Published private(set) var heartbeats: [AgentHeartbeat] = []
     @Published private(set) var heartbeatRuns: [HeartbeatRun] = []
     @Published private(set) var hasOlderHeartbeatRuns = false
     @Published var selectedAgentID: Agent.ID?
     let agentConfigurationDidChange = PassthroughSubject<Agent.ID, Never>()
+    let heartbeatTraceSuppressionDidComplete = PassthroughSubject<UUID, Never>()
 
     private static let heartbeatRunBatchSize = 200
 
@@ -31,12 +33,20 @@ final class AgentStore: ObservableObject {
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
         loadAgents()
+        loadCollaborationGrants()
         loadHeartbeats()
         loadHeartbeatRuns()
     }
 
+    var grants: [AgentCollaborationGrant] {
+        collaborationGrants
+    }
+
     func addAgent() {
-        let agent = Agent(name: "", soul: "")
+        let agent = Agent(
+            name: "",
+            soul: ""
+        )
         modelContext.insert(agent)
         saveChanges()
         loadAgents(selecting: agent.id)
@@ -59,6 +69,63 @@ final class AgentStore: ObservableObject {
               index > agents.startIndex else {
             return false
         }
+        let queued = AgentInvocationState.queued.rawValue
+        let running = AgentInvocationState.running.rawValue
+        let activeAgentID = agentID
+        var activeInvocationDescriptor = FetchDescriptor<AgentInvocationRecord>(
+            predicate: #Predicate { invocation in
+                (invocation.callerAgentID == activeAgentID
+                    || invocation.targetAgentID == activeAgentID)
+                    && (invocation.stateRawValue == queued
+                        || invocation.stateRawValue == running)
+            }
+        )
+        activeInvocationDescriptor.fetchLimit = 1
+        do {
+            guard try modelContext.fetch(activeInvocationDescriptor).first == nil else {
+                return false
+            }
+        } catch {
+            Self.logger.error(
+                "Failed to verify active delegations: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+        let deletedAgentID = agentID
+        let invocationDescriptor = FetchDescriptor<AgentInvocationRecord>(
+            predicate: #Predicate { invocation in
+                invocation.callerAgentID == deletedAgentID
+                    || invocation.targetAgentID == deletedAgentID
+            }
+        )
+        let invocationRecords: [AgentInvocationRecord]
+        do {
+            invocationRecords = try modelContext.fetch(invocationDescriptor)
+        } catch {
+            Self.logger.error(
+                "Failed to load delegation history for redaction: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+        let affectedRootIDs = Set(invocationRecords.map(\.rootInvocationID))
+        var rootInvocationRecordsByID = Dictionary(
+            uniqueKeysWithValues: invocationRecords.map { ($0.id, $0) }
+        )
+        do {
+            for rootID in affectedRootIDs {
+                let rootDescriptor = FetchDescriptor<AgentInvocationRecord>(
+                    predicate: #Predicate { $0.rootInvocationID == rootID }
+                )
+                for record in try modelContext.fetch(rootDescriptor) {
+                    rootInvocationRecordsByID[record.id] = record
+                }
+            }
+        } catch {
+            Self.logger.error(
+                "Failed to load complete collaboration roots for redaction: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
 
         let previousSelection = selectedAgentID
         let nextSelection: Agent.ID?
@@ -74,11 +141,46 @@ final class AgentStore: ObservableObject {
             modelContext.delete(heartbeat)
         }
         heartbeats.removeAll { $0.agentID == agentID }
+
+        let grantsToDelete = collaborationGrants.filter {
+            $0.callerAgentID == agentID || $0.targetAgentID == agentID
+        }
+        for grant in grantsToDelete {
+            modelContext.delete(grant)
+        }
+        collaborationGrants.removeAll {
+            $0.callerAgentID == agentID || $0.targetAgentID == agentID
+        }
+        for invocation in rootInvocationRecordsByID.values {
+            invocation.contentRedacted = true
+            invocation.taskPreview = "(redacted when agent was deleted)"
+            invocation.resultPreview = nil
+            invocation.errorMessage = nil
+            invocation.toolTraceSummary = nil
+            invocation.debugLogJSON = nil
+            if invocation.callerAgentID == agentID || invocation.targetAgentID == agentID {
+                invocation.pendingDeliveryText = nil
+                invocation.deliveryCompletedAt = nil
+            }
+        }
+        do {
+            try redactGenerationLogs(forCollaborationRoots: affectedRootIDs)
+        } catch {
+            Self.logger.error(
+                "Failed to redact correlated generation logs: \(error.localizedDescription, privacy: .public)"
+            )
+            modelContext.rollback()
+            loadAgents(selecting: previousSelection)
+            loadCollaborationGrants()
+            loadHeartbeats()
+            return false
+        }
         modelContext.delete(agents[index])
         beforeSaving()
         guard saveChanges() else {
             modelContext.rollback()
             loadAgents(selecting: previousSelection)
+            loadCollaborationGrants()
             loadHeartbeats()
             return false
         }
@@ -86,10 +188,63 @@ final class AgentStore: ObservableObject {
         return true
     }
 
+    private func redactGenerationLogs(forCollaborationRoots rootIDs: Set<UUID>) throws {
+        let collaborationToolNames: Set<String> = [
+            AgentToolID.askAgents.rawValue,
+            AgentToolID.sendToAgents.rawValue,
+        ]
+        for rootID in rootIDs {
+            var turnDescriptor = FetchDescriptor<GenerationTurn>(
+                predicate: #Predicate { $0.id == rootID }
+            )
+            turnDescriptor.fetchLimit = 1
+            if let turn = try modelContext.fetch(turnDescriptor).first {
+                turn.debugContentRedacted = true
+            }
+            let toolRows = try modelContext.fetch(
+                GenerationQuery.toolCalls(forTurn: rootID)
+            )
+            for row in toolRows where collaborationToolNames.contains(row.toolName) {
+                row.argumentsJSON = "(redacted when an involved agent was deleted)"
+                row.resultText = "(redacted when an involved agent was deleted)"
+                row.resultTruncated = false
+                row.errorMessage = nil
+            }
+            var payloadDescriptor = GenerationQuery.debugPayload(forTurn: rootID)
+            payloadDescriptor.fetchLimit = 1
+            if let payload = try modelContext.fetch(payloadDescriptor).first {
+                modelContext.delete(payload)
+            }
+        }
+    }
+
     func updateAgentName(id: Agent.ID, name: String) {
         guard let agent = agents.first(where: { $0.id == id }) else { return }
 
-        agent.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        agent.name = normalizedName
+        saveChanges()
+        objectWillChange.send()
+        agentConfigurationDidChange.send(id)
+    }
+
+    func finalizeAgentMentionHandle(id: Agent.ID) {
+        guard let agent = agent(for: id),
+              AgentMention.normalizedHandle(agent.mentionHandle) == nil else {
+            return
+        }
+        let normalizedName = agent.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedName.isEmpty else { return }
+        agent.mentionHandle = uniqueMentionHandle(for: normalizedName, excluding: id)
+        guard saveChanges() else { return }
+        objectWillChange.send()
+        agentConfigurationDidChange.send(id)
+    }
+
+    func updateAgentRoutingDescription(id: Agent.ID, routingDescription: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
+
+        agent.routingDescription = routingDescription.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
         saveChanges()
         objectWillChange.send()
         agentConfigurationDidChange.send(id)
@@ -127,6 +282,7 @@ final class AgentStore: ObservableObject {
         agent.memory = memory
         saveChanges()
         objectWillChange.send()
+        agentConfigurationDidChange.send(id)
     }
 
     func updateAgentVoiceTriggerPhrases(id: Agent.ID, phrasesText: String) {
@@ -192,6 +348,7 @@ final class AgentStore: ObservableObject {
         agent.setTool(toolID, enabled: enabled)
         saveChanges()
         objectWillChange.send()
+        agentConfigurationDidChange.send(agentID)
     }
 
     func setCalendarAccessAll(_ all: Bool, selecting ids: [String] = [], for agentID: Agent.ID) {
@@ -199,6 +356,7 @@ final class AgentStore: ObservableObject {
         agent.setCalendarAccessAll(all, selecting: ids)
         saveChanges()
         objectWillChange.send()
+        agentConfigurationDidChange.send(agentID)
     }
 
     func setAllowedCalendarID(_ id: String, enabled: Bool, for agentID: Agent.ID) {
@@ -206,6 +364,7 @@ final class AgentStore: ObservableObject {
         agent.setAllowedCalendarID(id, enabled: enabled)
         saveChanges()
         objectWillChange.send()
+        agentConfigurationDidChange.send(agentID)
     }
 
     func setSkill(_ skillID: String, enabled: Bool, for agentID: Agent.ID) {
@@ -213,6 +372,7 @@ final class AgentStore: ObservableObject {
         agent.setSkill(skillID, enabled: enabled)
         saveChanges()
         objectWillChange.send()
+        agentConfigurationDidChange.send(agentID)
     }
 
     func updateAgentDebugLog(id: Agent.ID, enabled: Bool) {
@@ -250,6 +410,103 @@ final class AgentStore: ObservableObject {
 
     func agent(for id: Agent.ID) -> Agent? {
         agents.first { $0.id == id }
+    }
+
+    func agent(matchingMention mention: String) -> Agent? {
+        guard let lookupHandle = AgentMention.lookupHandle(from: mention) else { return nil }
+        return agents.first {
+            guard let handle = AgentMention.normalizedHandle($0.mentionHandle) else { return false }
+            return AgentMention.lookupKey(for: handle) == lookupHandle
+        }
+    }
+
+    func grant(
+        from callerAgentID: Agent.ID,
+        to targetAgentID: Agent.ID
+    ) -> AgentCollaborationGrant? {
+        collaborationGrants.first {
+            $0.callerAgentID == callerAgentID && $0.targetAgentID == targetAgentID
+        }
+    }
+
+    func canDelegate(
+        _ mode: AgentDelegationMode,
+        from callerAgentID: Agent.ID,
+        to targetAgentID: Agent.ID
+    ) -> Bool {
+        grant(from: callerAgentID, to: targetAgentID)?.allows(mode) == true
+    }
+
+    func canDelegate(
+        from callerAgentID: Agent.ID,
+        to targetAgentID: Agent.ID,
+        mode: AgentDelegationMode
+    ) -> Bool {
+        canDelegate(mode, from: callerAgentID, to: targetAgentID)
+    }
+
+    @discardableResult
+    func setCollaborationPermission(
+        _ mode: AgentDelegationMode,
+        enabled: Bool,
+        from callerAgentID: Agent.ID,
+        to targetAgentID: Agent.ID
+    ) -> AgentCollaborationGrant? {
+        guard callerAgentID != targetAgentID,
+              let callerAgent = agent(for: callerAgentID),
+              agent(for: targetAgentID) != nil else {
+            return nil
+        }
+        finalizeAgentMentionHandle(id: callerAgentID)
+        finalizeAgentMentionHandle(id: targetAgentID)
+        guard AgentMention.normalizedHandle(callerAgent.mentionHandle) != nil,
+              let targetAgent = agent(for: targetAgentID),
+              AgentMention.normalizedHandle(targetAgent.mentionHandle) != nil else {
+            return nil
+        }
+
+        if enabled {
+            let toolID: AgentToolID = mode == .consult ? .askAgents : .sendToAgents
+            callerAgent.setTool(toolID, enabled: true)
+        }
+
+        let changedGrant: AgentCollaborationGrant
+        if let existingGrant = grant(from: callerAgentID, to: targetAgentID) {
+            existingGrant.setAllowed(enabled, for: mode)
+            existingGrant.updatedAt = .now
+            changedGrant = existingGrant
+        } else {
+            guard enabled else { return nil }
+            let canConsult: Bool
+            let canDispatch: Bool
+            switch mode {
+            case .consult:
+                canConsult = true
+                canDispatch = false
+            case .dispatch:
+                canConsult = false
+                canDispatch = true
+            }
+            let newGrant = AgentCollaborationGrant(
+                callerAgentID: callerAgentID,
+                targetAgentID: targetAgentID,
+                canConsult: canConsult,
+                canDispatch: canDispatch
+            )
+            modelContext.insert(newGrant)
+            collaborationGrants.append(newGrant)
+            changedGrant = newGrant
+        }
+
+        guard saveChanges() else {
+            modelContext.rollback()
+            loadCollaborationGrants()
+            objectWillChange.send()
+            return grant(from: callerAgentID, to: targetAgentID)
+        }
+        objectWillChange.send()
+        agentConfigurationDidChange.send(callerAgentID)
+        return changedGrant
     }
 
     func heartbeats(for agentID: Agent.ID) -> [AgentHeartbeat] {
@@ -455,7 +712,21 @@ final class AgentStore: ObservableObject {
             }
         }
 
-        let shouldInsertTurn = report.chatID != nil
+        // PASS still belongs in compact heartbeat history, but deliberately
+        // has no generation turn, tool rows, debug payload, or collaboration
+        // trace.
+        let isPass = report.generationStatus == .passed
+        let omitsDetailedTrace = isPass || report.omitDetailedTrace
+        let shouldInsertTurn = report.chatID != nil && !omitsDetailedTrace
+        let redactsDebugContent = shouldInsertTurn
+            ? heartbeatRootHasRedactedContent(report.turnID)
+            : false
+        let persistedInvocations = redactsDebugContent
+            ? Self.redactingCollaborationContent(in: report.toolInvocations)
+            : report.toolInvocations
+        if omitsDetailedTrace {
+            stageHeartbeatTraceSuppressionCompletion(report.turnID)
+        }
         let run = HeartbeatRun(
             id: report.runID,
             heartbeatID: heartbeatID,
@@ -470,14 +741,15 @@ final class AgentStore: ObservableObject {
             actionSummary: report.actionSummary,
             errorMessage: report.errorMessage,
             generationTurnID: shouldInsertTurn ? report.turnID : nil,
+            debugCaptureEnabled: report.debugCaptureEnabled,
             promptTokenCount: report.promptTokenCount,
             completionTokenCount: report.completionTokenCount
         )
         modelContext.insert(run)
         heartbeatRuns.insert(run, at: 0)
 
-        if let chatID = report.chatID {
-            GenerationStore.recordTurn(
+        if shouldInsertTurn, let chatID = report.chatID {
+            let turn = GenerationStore.recordTurn(
                 draft: GenerationTurnDraft(
                     id: report.turnID,
                     kind: .heartbeat,
@@ -499,14 +771,141 @@ final class AgentStore: ObservableObject {
                     memoryEntryCount: report.memoryEntryCount,
                     debugCaptureEnabled: report.debugCaptureEnabled
                 ),
-                invocations: report.toolInvocations,
-                debug: report.debugCaptureEnabled ? report.debug : nil,
+                invocations: persistedInvocations,
+                debug: report.debugCaptureEnabled && !redactsDebugContent ? report.debug : nil,
                 in: modelContext
             )
+            if redactsDebugContent {
+                turn.debugContentRedacted = true
+            }
         }
 
-        saveChanges()
+        let saved = saveChanges()
+        if saved, omitsDetailedTrace {
+            heartbeatTraceSuppressionDidComplete.send(report.turnID)
+        }
         objectWillChange.send()
+    }
+
+    private func heartbeatRootHasRedactedContent(_ rootInvocationID: UUID) -> Bool {
+        let descriptor = FetchDescriptor<AgentInvocationRecord>(
+            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
+        )
+        do {
+            return try modelContext.fetch(descriptor).contains(where: \.isContentRedacted)
+        } catch {
+            // Privacy is fail-closed: omit the debug payload if its durable
+            // redaction state cannot be read.
+            Self.logger.error(
+                "Failed to inspect heartbeat redaction state for \(rootInvocationID.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return true
+        }
+    }
+
+    private static func redactingCollaborationContent(
+        in invocations: [CapturedToolInvocation]
+    ) -> [CapturedToolInvocation] {
+        let collaborationToolNames: Set<String> = [
+            AgentToolID.askAgents.rawValue,
+            AgentToolID.sendToAgents.rawValue,
+        ]
+        return invocations.map { invocation in
+            guard collaborationToolNames.contains(invocation.toolName) else {
+                return invocation
+            }
+            var redacted = invocation
+            redacted.argumentsJSON = "(redacted when an involved agent was deleted)"
+            redacted.resultText = "(redacted when an involved agent was deleted)"
+            redacted.errorMessage = nil
+            return redacted
+        }
+    }
+
+    /// A provider may ignore cancellation and exit after the scheduler has
+    /// already committed the terminal timeout. Enrich that exact debug turn
+    /// without changing its outcome, timestamps, scheduling, or chat state.
+    /// If the late result is PASS, remove the detailed graph instead and keep
+    /// only the already-terminal compact history row.
+    func refreshTimedOutHeartbeatTrace(report: HeartbeatExecutionReport) {
+        let runID = report.runID
+        var descriptor = FetchDescriptor<HeartbeatRun>(
+            predicate: #Predicate { $0.id == runID }
+        )
+        descriptor.fetchLimit = 1
+        guard let run = try? modelContext.fetch(descriptor).first,
+              run.generationTurnID == report.turnID else {
+            return
+        }
+
+        if report.generationStatus == .passed || report.omitDetailedTrace {
+            guard GenerationStore.removeTimedOutHeartbeatTrace(
+                turnID: report.turnID,
+                in: modelContext
+            ) else {
+                return
+            }
+            stageHeartbeatTraceSuppressionCompletion(report.turnID)
+            run.generationTurnID = nil
+            run.promptTokenCount = report.promptTokenCount
+            run.completionTokenCount = report.completionTokenCount
+            guard saveChanges() else {
+                modelContext.rollback()
+                return
+            }
+            heartbeatTraceSuppressionDidComplete.send(report.turnID)
+            objectWillChange.send()
+            return
+        }
+
+        guard report.debugCaptureEnabled,
+              GenerationStore.refreshTimedOutHeartbeatTrace(
+                turnID: report.turnID,
+                invocations: report.toolInvocations,
+                debug: report.debug,
+                in: modelContext
+              ) else {
+            return
+        }
+        run.promptTokenCount = report.promptTokenCount
+        run.completionTokenCount = report.completionTokenCount
+        guard saveChanges() else {
+            modelContext.rollback()
+            return
+        }
+        objectWillChange.send()
+    }
+
+    /// Clears the durable handoff bit in the same save that confirms a PASS
+    /// has no generation graph. If no collaboration work remains, the marker
+    /// can be removed too; otherwise the coordinator removes it after the
+    /// hidden operational rows finish.
+    private func stageHeartbeatTraceSuppressionCompletion(_ rootInvocationID: UUID) {
+        let markerDescriptor = FetchDescriptor<SuppressedAgentInvocationRoot>(
+            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
+        )
+        let markers: [SuppressedAgentInvocationRoot]
+        do {
+            markers = try modelContext.fetch(markerDescriptor)
+        } catch {
+            Self.logger.error(
+                "Failed to load heartbeat suppression marker for completion: \(error.localizedDescription, privacy: .public)"
+            )
+            return
+        }
+        guard !markers.isEmpty else { return }
+
+        for marker in markers {
+            marker.generationTraceSuppressionPending = false
+        }
+        let invocationDescriptor = FetchDescriptor<AgentInvocationRecord>(
+            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
+        )
+        if let records = try? modelContext.fetch(invocationDescriptor), records.isEmpty {
+            for marker in markers {
+                modelContext.delete(marker)
+            }
+        }
     }
 
     private func deferHeartbeatByInterval(_ heartbeat: AgentHeartbeat, from date: Date) {
@@ -529,15 +928,80 @@ final class AgentStore: ObservableObject {
         if agents.isEmpty {
             let agent = Agent(name: "Default", soul: "You are a concise, very quirky and goofy assistant inside a simple chat app.")
             modelContext.insert(agent)
-            saveChanges()
             agents = [agent]
         }
+
+        backfillAgentMentionHandles()
+        saveChanges()
 
         selectedAgentID = selection.flatMap { selectedID in
             agents.contains { $0.id == selectedID } ? selectedID : nil
         } ?? selectedAgentID.flatMap { selectedID in
             agents.contains { $0.id == selectedID } ? selectedID : nil
         } ?? agents.first?.id
+    }
+
+    private func loadCollaborationGrants() {
+        let descriptor = FetchDescriptor<AgentCollaborationGrant>(
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+
+        do {
+            collaborationGrants = try modelContext.fetch(descriptor)
+        } catch {
+            collaborationGrants = []
+        }
+    }
+
+    private func backfillAgentMentionHandles() {
+        var usedHandles = Set<String>()
+
+        for agent in agents {
+            guard let existing = AgentMention.normalizedHandle(agent.mentionHandle) else { continue }
+            let unique = uniqueMentionHandle(base: existing, usedHandles: usedHandles)
+            if agent.mentionHandle != unique {
+                agent.mentionHandle = unique
+            }
+            usedHandles.insert(AgentMention.lookupKey(for: unique))
+        }
+
+        for agent in agents where AgentMention.normalizedHandle(agent.mentionHandle) == nil {
+            let normalizedName = agent.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedName.isEmpty else { continue }
+            let base = AgentMention.handle(for: normalizedName)
+            let unique = uniqueMentionHandle(base: base, usedHandles: usedHandles)
+            agent.mentionHandle = unique
+            usedHandles.insert(AgentMention.lookupKey(for: unique))
+        }
+    }
+
+    private func uniqueMentionHandle(for agentName: String, excluding agentID: Agent.ID) -> String {
+        let usedHandles = Set(
+            agents.compactMap { agent -> String? in
+                guard agent.id != agentID,
+                      let handle = AgentMention.normalizedHandle(agent.mentionHandle) else {
+                    return nil
+                }
+                return AgentMention.lookupKey(for: handle)
+            }
+        )
+        return uniqueMentionHandle(
+            base: AgentMention.handle(for: agentName),
+            usedHandles: usedHandles
+        )
+    }
+
+    private func uniqueMentionHandle(base: String, usedHandles: Set<String>) -> String {
+        let normalizedBase = AgentMention.normalizedHandle(base) ?? "agent"
+        guard usedHandles.contains(AgentMention.lookupKey(for: normalizedBase)) else {
+            return normalizedBase
+        }
+
+        var suffix = 2
+        while usedHandles.contains(AgentMention.lookupKey(for: "\(normalizedBase)\(suffix)")) {
+            suffix += 1
+        }
+        return "\(normalizedBase)\(suffix)"
     }
 
     private func loadHeartbeats() {
@@ -631,6 +1095,11 @@ final class AgentStore: ObservableObject {
 
         for run in heartbeatRuns where synchronizedHeartbeatIDs.insert(run.heartbeatID).inserted {
             guard let heartbeat = heartbeatsByID[run.heartbeatID] else { continue }
+            // A newer completion may come from an older build that omitted
+            // PASS history rows. Do not roll its scheduling state back.
+            if heartbeat.lastCompletedAt.map({ $0 > run.completedAt }) == true {
+                continue
+            }
             heartbeat.lastCompletedAt = run.completedAt
             heartbeat.lastError = run.errorMessage
         }
@@ -666,10 +1135,208 @@ final class AgentStore: ObservableObject {
 }
 
 @Model
+final class AgentCollaborationGrant: Identifiable {
+    #Unique<AgentCollaborationGrant>([\.callerAgentID, \.targetAgentID])
+    #Index<AgentCollaborationGrant>(
+        [\.callerAgentID, \.targetAgentID],
+        [\.targetAgentID]
+    )
+
+    @Attribute(.unique) var id: UUID
+    var callerAgentID: UUID
+    var targetAgentID: UUID
+    var canConsult: Bool
+    var canDispatch: Bool
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        callerAgentID: UUID,
+        targetAgentID: UUID,
+        canConsult: Bool = false,
+        canDispatch: Bool = false,
+        createdAt: Date = .now,
+        updatedAt: Date = .now
+    ) {
+        self.id = id
+        self.callerAgentID = callerAgentID
+        self.targetAgentID = targetAgentID
+        self.canConsult = canConsult
+        self.canDispatch = canDispatch
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    func allows(_ mode: AgentDelegationMode) -> Bool {
+        switch mode {
+        case .consult:
+            return canConsult
+        case .dispatch:
+            return canDispatch
+        }
+    }
+
+    func setAllowed(_ allowed: Bool, for mode: AgentDelegationMode) {
+        switch mode {
+        case .consult:
+            canConsult = allowed
+        case .dispatch:
+            canDispatch = allowed
+        }
+    }
+}
+
+@Model
+final class SuppressedAgentInvocationRoot {
+    @Attribute(.unique) var rootInvocationID: UUID
+    var createdAt: Date
+    /// A durable handoff between PASS detection and removal of a timeout's
+    /// already-persisted generation graph. Optional for lightweight migration.
+    var generationTraceSuppressionPending: Bool?
+
+    init(
+        rootInvocationID: UUID,
+        createdAt: Date = .now,
+        generationTraceSuppressionPending: Bool = false
+    ) {
+        self.rootInvocationID = rootInvocationID
+        self.createdAt = createdAt
+        self.generationTraceSuppressionPending = generationTraceSuppressionPending
+    }
+}
+
+@Model
+final class AgentInvocationRecord: Identifiable {
+    #Index<AgentInvocationRecord>(
+        [\.rootInvocationID, \.startedAt],
+        [\.parentInvocationID],
+        [\.callerAgentID, \.startedAt],
+        [\.targetAgentID, \.startedAt]
+    )
+
+    @Attribute(.unique) var id: UUID
+    var rootInvocationID: UUID
+    var parentInvocationID: UUID?
+    var callerAgentID: UUID
+    var targetAgentID: UUID
+    var callerName: String
+    var targetName: String
+    var modeRawValue: String
+    var stateRawValue: String
+    var taskPreview: String
+    var resultPreview: String?
+    var errorMessage: String?
+    var toolTraceSummary: String?
+    var debugLogJSON: String?
+    /// PASS heartbeats retain only transient operational state needed by an
+    /// already-accepted dispatch. Suppressed rows never appear as audit log
+    /// entries and are deleted once delivery bookkeeping is complete.
+    var logSuppressed: Bool?
+    /// Set when an involved agent is deleted. This is a durable tombstone so
+    /// cancellation-resistant providers cannot repopulate redacted content.
+    var contentRedacted: Bool?
+    var modelIdentifier: String
+    var backendRawValue: String
+    var depth: Int
+    var startedAt: Date
+    var modelStartedAt: Date?
+    var completedAt: Date?
+    var promptTokenCount: Int?
+    var completionTokenCount: Int?
+    var pendingDeliveryText: String?
+    var deliveryCompletedAt: Date?
+
+    init(
+        id: UUID = UUID(),
+        rootInvocationID: UUID,
+        parentInvocationID: UUID? = nil,
+        callerAgentID: UUID,
+        targetAgentID: UUID,
+        callerName: String,
+        targetName: String,
+        mode: AgentDelegationMode,
+        state: AgentInvocationState,
+        taskPreview: String,
+        resultPreview: String? = nil,
+        errorMessage: String? = nil,
+        toolTraceSummary: String? = nil,
+        debugLogJSON: String? = nil,
+        logSuppressed: Bool? = nil,
+        contentRedacted: Bool? = nil,
+        modelIdentifier: String,
+        backendRawValue: String,
+        depth: Int,
+        startedAt: Date = .now,
+        modelStartedAt: Date? = nil,
+        completedAt: Date? = nil,
+        promptTokenCount: Int? = nil,
+        completionTokenCount: Int? = nil,
+        pendingDeliveryText: String? = nil,
+        deliveryCompletedAt: Date? = nil
+    ) {
+        self.id = id
+        self.rootInvocationID = rootInvocationID
+        self.parentInvocationID = parentInvocationID
+        self.callerAgentID = callerAgentID
+        self.targetAgentID = targetAgentID
+        self.callerName = callerName
+        self.targetName = targetName
+        modeRawValue = mode.rawValue
+        stateRawValue = state.rawValue
+        self.taskPreview = taskPreview
+        self.resultPreview = resultPreview
+        self.errorMessage = errorMessage
+        self.toolTraceSummary = toolTraceSummary
+        self.debugLogJSON = debugLogJSON
+        self.logSuppressed = logSuppressed
+        self.contentRedacted = contentRedacted
+        self.modelIdentifier = modelIdentifier
+        self.backendRawValue = backendRawValue
+        self.depth = depth
+        self.startedAt = startedAt
+        self.modelStartedAt = modelStartedAt
+        self.completedAt = completedAt
+        self.promptTokenCount = promptTokenCount
+        self.completionTokenCount = completionTokenCount
+        self.pendingDeliveryText = pendingDeliveryText
+        self.deliveryCompletedAt = deliveryCompletedAt
+    }
+
+    var mode: AgentDelegationMode {
+        AgentDelegationMode(rawValue: modeRawValue) ?? .consult
+    }
+
+    var state: AgentInvocationState {
+        get { AgentInvocationState(rawValue: stateRawValue) ?? .failed }
+        set { stateRawValue = newValue.rawValue }
+    }
+
+    var totalTokenCount: Int? {
+        guard promptTokenCount != nil || completionTokenCount != nil else { return nil }
+        return (promptTokenCount ?? 0) + (completionTokenCount ?? 0)
+    }
+
+    var debugLog: AgentInvocationDebugLog? {
+        AgentInvocationDebugLog.decode(debugLogJSON)
+    }
+
+    var isLogSuppressed: Bool {
+        logSuppressed == true
+    }
+
+    var isContentRedacted: Bool {
+        contentRedacted == true
+    }
+}
+
+@Model
 final class Agent: Identifiable {
     @Attribute(.unique) var id: UUID
     var name: String
     var soul: String
+    var mentionHandle: String?
+    var routingDescription: String?
     var memory: String?
     var modelIdentifier: String?
     var voiceTriggerPhrase: String?
@@ -691,6 +1358,8 @@ final class Agent: Identifiable {
         id: UUID = UUID(),
         name: String,
         soul: String,
+        mentionHandle: String? = nil,
+        routingDescription: String? = nil,
         memory: String? = nil,
         modelIdentifier: String? = nil,
         voiceTriggerPhrase: String? = nil,
@@ -711,6 +1380,8 @@ final class Agent: Identifiable {
         self.id = id
         self.name = name
         self.soul = soul
+        self.mentionHandle = mentionHandle
+        self.routingDescription = routingDescription
         self.memory = memory
         self.modelIdentifier = modelIdentifier
         self.voiceTriggerPhrase = voiceTriggerPhrase
@@ -731,6 +1402,10 @@ final class Agent: Identifiable {
 
     var displayName: String {
         name.isEmpty ? "Untitled Agent" : name
+    }
+
+    var routingDescriptionText: String {
+        routingDescription?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     var selectedModelIdentifier: String {
@@ -830,5 +1505,12 @@ final class Agent: Identifiable {
             return nil
         }
         return string
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

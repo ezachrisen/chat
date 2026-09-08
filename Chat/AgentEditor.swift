@@ -1,4 +1,6 @@
 import ShadSwift
+import AppKit
+import Foundation
 import SwiftUI
 import SwiftData
 
@@ -198,6 +200,7 @@ private enum AgentEditorTab: String, CaseIterable, Hashable {
     case voice = "Voice"
     case tools = "Tools"
     case skills = "Skills"
+    case collaboration = "Collaboration"
     case heartbeats = "Heartbeats"
     case advanced = "Advanced"
 }
@@ -210,6 +213,9 @@ struct AgentEditor: View {
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
     @Binding var avatarEditorState: ShadAvatarEditorState
+    @Query(sort: \AgentInvocationRecord.startedAt, order: .reverse)
+    private var collaborationInvocations: [AgentInvocationRecord]
+    @Query private var suppressedCollaborationRoots: [SuppressedAgentInvocationRoot]
     var onEditHeartbeat: (AgentHeartbeat.ID) -> Void = { _ in }
     var onAgentDeleted: () -> Void = {}
     @ObservedObject private var calendarDirectory = CalendarDirectory.shared
@@ -231,6 +237,18 @@ struct AgentEditor: View {
         } set: { newValue in
             guard let agentID = selectedAgent?.id else { return }
             store.updateAgentName(id: agentID, name: newValue)
+        }
+    }
+
+    private var routingDescription: Binding<String> {
+        Binding {
+            selectedAgent?.routingDescriptionText ?? ""
+        } set: { newValue in
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentRoutingDescription(
+                id: agentID,
+                routingDescription: newValue
+            )
         }
     }
 
@@ -416,9 +434,14 @@ struct AgentEditor: View {
                             title: "Name",
                             description: "Used in chat labels and @mentions."
                         ) {
-                            ShadInput("Agent name", text: agentName)
+                            ShadInput(
+                                "Agent name",
+                                text: agentName,
+                                onSubmit: finalizeSelectedAgentHandle
+                            )
                                 .frame(width: 320)
                                 .accessibilityLabel("Agent name")
+                                .onDisappear(perform: finalizeSelectedAgentHandle)
                         }
 
                         ShadSeparator()
@@ -616,6 +639,137 @@ struct AgentEditor: View {
                 }
             }
 
+            ShadTabsContent(value: AgentEditorTab.collaboration) {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ShadSettingsSectionHeader(
+                            title: "Routing",
+                            description: "Give other agents a stable way to identify this agent and understand when its perspective is useful."
+                        )
+
+                        VStack(spacing: 0) {
+                            ShadSettingsRow(
+                                title: "Handle",
+                                description: "This routing handle is permanent and does not change when you rename the agent."
+                            ) {
+                                Text(agent.mention)
+                                    .font(theme.font(theme.typography.sm, theme.typography.medium))
+                                    .foregroundStyle(theme.colors.accent)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(theme.colors.accent.opacity(0.1), in: Capsule())
+                                    .overlay {
+                                        Capsule()
+                                            .stroke(theme.colors.accent.opacity(0.24), lineWidth: 1)
+                                    }
+                                    .textSelection(.enabled)
+                                    .accessibilityLabel("Agent handle \(agent.mention)")
+                            }
+
+                            ShadSeparator()
+
+                            ShadField {
+                                ShadFieldLabel("When to ask me")
+                                ShadFieldDescription(
+                                    "Describe the topics, decisions, or situations where another agent should consult or dispatch to this agent."
+                                )
+                                ShadTextarea(
+                                    "For example: Ask me about planning, deadlines, and prioritization.",
+                                    text: routingDescription,
+                                    minHeight: 112,
+                                    maxHeight: 180
+                                )
+                                .accessibilityLabel("When to ask \(agent.displayName)")
+                            }
+                            .padding(16)
+                        }
+                        .shadSettingsCard()
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        ShadSettingsSectionHeader(
+                            title: "Outbound permissions",
+                            description: "Consult gathers advice; Dispatch starts independent work. Grants are one-way and non-transitive, and each target’s Soul and enabled tools still govern what it can do."
+                        )
+
+                        let collaborationTargets = store.agents.filter { $0.id != agent.id }
+                        if collaborationTargets.isEmpty {
+                            VStack(spacing: 8) {
+                                Text("No other agents")
+                                    .font(theme.font(theme.typography.sm, theme.typography.medium))
+
+                                Text("Add another agent to configure directed collaboration permissions.")
+                                    .font(theme.font(theme.typography.sm))
+                                    .foregroundStyle(theme.colors.mutedForeground)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 28)
+                            .shadSettingsCard()
+                        } else {
+                            VStack(spacing: 0) {
+                                ForEach(Array(collaborationTargets.enumerated()), id: \.element.id) { index, target in
+                                    ShadSettingsRow(
+                                        title: target.displayName,
+                                        description: collaborationTargetDescription(target)
+                                    ) {
+                                        HStack(spacing: 18) {
+                                            collaborationPermissionControl(
+                                                title: "Consult",
+                                                mode: .consult,
+                                                callerID: agent.id,
+                                                target: target
+                                            )
+                                            collaborationPermissionControl(
+                                                title: "Dispatch",
+                                                mode: .dispatch,
+                                                callerID: agent.id,
+                                                target: target
+                                            )
+                                        }
+                                    }
+
+                                    if index < collaborationTargets.count - 1 {
+                                        ShadSeparator()
+                                    }
+                                }
+                            }
+                            .shadSettingsCard()
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        ShadSettingsSectionHeader(
+                            title: "Recent delegated work",
+                            description: "A live execution tree for work this agent requested or received. Stop fences late results so they cannot post afterward."
+                        )
+
+                        if recentCollaborationInvocations(for: agent).isEmpty {
+                            Text("No delegated work yet.")
+                                .font(theme.font(theme.typography.sm))
+                                .foregroundStyle(theme.colors.mutedForeground)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 28)
+                                .shadSettingsCard()
+                        } else {
+                            VStack(spacing: 0) {
+                                ForEach(
+                                    Array(recentCollaborationInvocations(for: agent).enumerated()),
+                                    id: \.element.id
+                                ) { index, invocation in
+                                    collaborationInvocationRow(invocation)
+                                        .padding(.leading, CGFloat(max(0, invocation.depth - 1)) * 16)
+
+                                    if index < recentCollaborationInvocations(for: agent).count - 1 {
+                                        ShadSeparator()
+                                    }
+                                }
+                            }
+                            .shadSettingsCard()
+                        }
+                    }
+                }
+            }
+
             ShadTabsContent(value: AgentEditorTab.advanced) {
                 VStack(alignment: .leading, spacing: 10) {
                     ShadSettingsSectionHeader(
@@ -626,7 +780,7 @@ struct AgentEditor: View {
                     VStack(spacing: 0) {
                         ShadSettingsRow(
                             title: "Debug log",
-                            description: "Store the full model prompt and intermediate output for this agent’s chats and heartbeats. Off by default — this is a lot of data."
+                            description: "Store full prompts and intermediate output for chats and heartbeats, plus complete tool and delegated-agent exchanges for heartbeats. Off by default — this is a lot of data."
                         ) {
                             ShadSwitch(isOn: debugLogEnabled)
                                 .accessibilityLabel("Debug log")
@@ -722,6 +876,11 @@ struct AgentEditor: View {
         }
     }
 
+    private func finalizeSelectedAgentHandle() {
+        guard let agentID = selectedAgent?.id else { return }
+        store.finalizeAgentMentionHandle(id: agentID)
+    }
+
     private func loadSelectedAgent() {
         guard let selectedAgent else {
             draftSoul = ""
@@ -765,7 +924,14 @@ struct AgentEditor: View {
             (chat.isResponding || chat.isCompacting)
                 && chat.groupParticipants.contains { $0.agentID == agent.id }
         }
-        return hasRunningHeartbeat || hasActiveDirectChat || hasActiveGroupChat
+        let hasActiveDelegatedWork = collaborationInvocations.contains {
+            ($0.callerAgentID == agent.id || $0.targetAgentID == agent.id)
+                && ($0.state == .queued || $0.state == .running)
+        }
+        return hasRunningHeartbeat
+            || hasActiveDirectChat
+            || hasActiveGroupChat
+            || hasActiveDelegatedWork
     }
 
     private func deletionDescription(for agent: Agent) -> String {
@@ -773,7 +939,7 @@ struct AgentEditor: View {
             return "The default agent anchors Chat and cannot be deleted."
         }
         if hasActiveWork(for: agent) {
-            return "Wait for this agent's active chat or heartbeat work to finish before deleting it."
+            return "Wait for this agent's active chat, heartbeat, or delegated work to finish before deleting it."
         }
         return "Delete this agent and its heartbeat schedules. Existing messages and generation history are preserved."
     }
@@ -817,6 +983,147 @@ struct AgentEditor: View {
                 Task { await calendarDirectory.prepare() }
             }
         }
+    }
+
+    private func collaborationPermission(
+        _ mode: AgentDelegationMode,
+        from callerID: Agent.ID,
+        to targetID: Agent.ID
+    ) -> Binding<Bool> {
+        Binding {
+            store.grant(from: callerID, to: targetID)?.allows(mode) == true
+        } set: { enabled in
+            store.setCollaborationPermission(
+                mode,
+                enabled: enabled,
+                from: callerID,
+                to: targetID
+            )
+        }
+    }
+
+    private func recentCollaborationInvocations(for agent: Agent) -> [AgentInvocationRecord] {
+        var suppressedRootIDs = Set(
+            suppressedCollaborationRoots.map(\.rootInvocationID)
+        )
+        suppressedRootIDs.formUnion(
+            collaborationInvocations.lazy
+                .filter(\.isLogSuppressed)
+                .map(\.rootInvocationID)
+        )
+        return Array(
+            collaborationInvocations
+                .lazy
+                .filter {
+                    !suppressedRootIDs.contains($0.rootInvocationID)
+                        && ($0.callerAgentID == agent.id || $0.targetAgentID == agent.id)
+                }
+                .prefix(20)
+        )
+    }
+
+    private func collaborationInvocationRow(_ invocation: AgentInvocationRecord) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("\(invocation.callerName) → \(invocation.targetName)")
+                    .font(theme.font(theme.typography.sm, theme.typography.medium))
+                    .lineLimit(1)
+
+                Text(invocation.mode.displayName)
+                    .font(theme.font(theme.typography.xs, theme.typography.medium))
+                    .foregroundStyle(theme.colors.mutedForeground)
+
+                Spacer(minLength: 8)
+
+                Text(collaborationStateLabel(invocation.state))
+                    .font(theme.font(theme.typography.xs, theme.typography.medium))
+                    .foregroundStyle(collaborationStateColor(invocation.state))
+
+                if invocation.state == .queued || invocation.state == .running {
+                    ShadButton("Stop", variant: .outline, size: .sm) {
+                        chatStore.cancelDelegatedInvocation(invocation.id)
+                    }
+                    .accessibilityLabel("Stop delegated work for \(invocation.targetName)")
+                }
+            }
+
+            Text(invocation.taskPreview)
+                .font(theme.font(theme.typography.xs))
+                .foregroundStyle(theme.colors.mutedForeground)
+                .lineLimit(2)
+
+            if let result = invocation.resultPreview, !result.isEmpty {
+                Text(result)
+                    .font(theme.font(theme.typography.xs))
+                    .lineLimit(2)
+            } else if let error = invocation.errorMessage, !error.isEmpty {
+                Text(error)
+                    .font(theme.font(theme.typography.xs))
+                    .foregroundStyle(theme.colors.destructive)
+                    .lineLimit(2)
+            }
+
+            if let toolTrace = invocation.toolTraceSummary, !toolTrace.isEmpty {
+                Text("Tools\n\(toolTrace)")
+                    .font(theme.font(theme.typography.xs))
+                    .foregroundStyle(theme.colors.mutedForeground)
+                    .lineLimit(4)
+            }
+        }
+        .padding(14)
+    }
+
+    private func collaborationStateLabel(_ state: AgentInvocationState) -> String {
+        switch state {
+        case .queued: return "Queued"
+        case .running: return "Running"
+        case .succeeded: return "Completed"
+        case .failed: return "Failed"
+        case .timedOut: return "Timed out"
+        case .cancelled: return "Cancelled"
+        case .rejected: return "Rejected"
+        }
+    }
+
+    private func collaborationStateColor(_ state: AgentInvocationState) -> Color {
+        switch state {
+        case .queued, .running:
+            return theme.colors.accent
+        case .succeeded:
+            return theme.colors.foreground
+        case .failed, .timedOut, .rejected:
+            return theme.colors.destructive
+        case .cancelled:
+            return theme.colors.mutedForeground
+        }
+    }
+
+    private func collaborationTargetDescription(_ target: Agent) -> String {
+        let routingDescription = target.routingDescriptionText
+            .split(whereSeparator: { $0.isNewline })
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !routingDescription.isEmpty else { return target.mention }
+        return "\(target.mention) · \(routingDescription)"
+    }
+
+    private func collaborationPermissionControl(
+        title: String,
+        mode: AgentDelegationMode,
+        callerID: Agent.ID,
+        target: Agent
+    ) -> some View {
+        let permission = collaborationPermission(mode, from: callerID, to: target.id)
+        return VStack(spacing: 5) {
+            Text(title)
+                .font(theme.font(theme.typography.xs, theme.typography.medium))
+                .foregroundStyle(theme.colors.mutedForeground)
+
+            ShadSwitch(isOn: permission, size: .sm)
+                .accessibilityLabel("Allow \(title.lowercased()) with \(target.displayName)")
+                .accessibilityValue(permission.wrappedValue ? "Allowed" : "Not allowed")
+        }
+        .frame(minWidth: 64)
     }
 
     private var calendarAccessAll: Binding<Bool> {
@@ -1468,17 +1775,30 @@ struct AgentHeartbeatEditor: View {
         ShadField {
             ShadFieldLabel("Prompt")
             ShadFieldDescription("Tell the agent what to consider when this heartbeat runs.")
-            ShadTextarea(
-                "Tell the agent what to consider",
+            MentionHighlightingTextArea(
+                placeholder: "Tell the agent what to consider",
                 text: instruction,
-                minHeight: 220,
-                maxHeight: 220
+                recognizedHandles: recognizedMentionHandles
             )
+            .frame(height: 168)
             .accessibilityLabel("Heartbeat prompt")
+
+            Text("Known agent handles are highlighted as links. Plain @text does not trigger delegation on its own; the heartbeat agent decides whether to use its collaboration tools.")
+                .font(theme.font(theme.typography.xs))
+                .foregroundStyle(theme.colors.mutedForeground)
         }
         .padding(16)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .shadSettingsCard()
+    }
+
+    private var recognizedMentionHandles: Set<String> {
+        Set(store.agents.compactMap { agent in
+            guard let handle = AgentMention.normalizedHandle(agent.mentionHandle) else {
+                return nil
+            }
+            return AgentMention.lookupKey(for: handle)
+        })
     }
 
     private var historyTab: some View {
@@ -1493,7 +1813,7 @@ struct AgentHeartbeatEditor: View {
             Text("Executions")
                 .font(theme.font(theme.typography.sm, theme.typography.medium))
 
-            Text("Each run is recorded even if the agent posts nothing. Open a run to view tools and the debug log.")
+            Text("PASS results remain in compact history without tools or a debug log. Open another run to inspect its full trace.")
                 .font(theme.font(theme.typography.sm))
                 .foregroundStyle(theme.colors.mutedForeground)
 
@@ -1515,7 +1835,7 @@ struct AgentHeartbeatEditor: View {
                 }
                 .padding(.top, 4)
             } else {
-                Text("No executions yet. The agent may post a reply, append memory, or pass.")
+                Text("No recorded executions yet.")
                     .font(theme.font(theme.typography.sm))
                     .foregroundStyle(theme.colors.mutedForeground)
                     .padding(.top, 4)
@@ -1790,12 +2110,12 @@ private struct HeartbeatExecutionRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if let turn {
+            if run.generationTurnID != nil, let turn {
                 GenerationInspectorButton(turn: turn)
             }
         }
         .padding(.vertical, 10)
-        .task(id: run.id) {
+        .task(id: run.generationTurnID) {
             loadTurn()
         }
     }
@@ -1874,6 +2194,202 @@ struct ResizeGrip: View {
         .frame(width: 14, height: 14)
         .contentShape(Rectangle())
         .help(helpText)
+    }
+}
+
+private struct MentionHighlightingTextArea: View {
+    @Environment(\.shadTheme) private var theme
+    @Binding var text: String
+    let placeholder: String
+    let recognizedHandles: Set<String>
+    @State private var isFocused = false
+
+    init(
+        placeholder: String,
+        text: Binding<String>,
+        recognizedHandles: Set<String>
+    ) {
+        self.placeholder = placeholder
+        _text = text
+        self.recognizedHandles = recognizedHandles
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if text.isEmpty {
+                Text(placeholder)
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.mutedForeground)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .allowsHitTesting(false)
+            }
+
+            MentionHighlightingTextView(
+                text: $text,
+                recognizedHandles: recognizedHandles,
+                foregroundColor: NSColor(theme.colors.foreground),
+                accentColor: NSColor(theme.colors.accent),
+                onFocusChanged: { isFocused = $0 }
+            )
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+        }
+        .background(
+            RoundedRectangle(cornerRadius: theme.radius.lg)
+                .fill(theme.colorScheme == .dark ? theme.colors.input.opacity(0.3) : .clear)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: theme.radius.lg)
+                .strokeBorder(
+                    isFocused ? theme.colors.ring : theme.colors.input,
+                    lineWidth: theme.borderWidth
+                )
+        }
+        .overlay {
+            if isFocused {
+                RoundedRectangle(cornerRadius: theme.radius.lg + 2)
+                    .strokeBorder(theme.colors.ring.opacity(0.18), lineWidth: 3)
+                    .padding(-2)
+            }
+        }
+        .animation(theme.interactionAnimation, value: isFocused)
+    }
+}
+
+private struct MentionHighlightingTextView: NSViewRepresentable {
+    @Binding var text: String
+    let recognizedHandles: Set<String>
+    let foregroundColor: NSColor
+    let accentColor: NSColor
+    let onFocusChanged: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+
+        let textView = NSTextView()
+        textView.delegate = context.coordinator
+        textView.string = text
+        textView.drawsBackground = false
+        textView.isRichText = true
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainerInset = NSSize(width: 4, height: 2)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: 0,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        scrollView.documentView = textView
+        context.coordinator.applyHighlighting(to: textView)
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        context.coordinator.parent = self
+        if textView.string != text {
+            let selection = textView.selectedRange()
+            textView.string = text
+            textView.setSelectedRange(
+                NSRange(
+                    location: min(selection.location, text.utf16.count),
+                    length: 0
+                )
+            )
+        }
+        context.coordinator.applyHighlighting(to: textView)
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        private static let mentionExpression = try? NSRegularExpression(
+            pattern: "@[\\p{L}\\p{N}_-]+"
+        )
+        var parent: MentionHighlightingTextView
+        private var isApplyingHighlighting = false
+
+        init(parent: MentionHighlightingTextView) {
+            self.parent = parent
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            parent.onFocusChanged(true)
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            parent.onFocusChanged(false)
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard !isApplyingHighlighting,
+                  let textView = notification.object as? NSTextView else {
+                return
+            }
+            parent.text = textView.string
+            applyHighlighting(to: textView)
+        }
+
+        func applyHighlighting(to textView: NSTextView) {
+            guard !isApplyingHighlighting,
+                  let storage = textView.textStorage else {
+                return
+            }
+            isApplyingHighlighting = true
+            defer { isApplyingHighlighting = false }
+
+            let selection = textView.selectedRange()
+            let fullRange = NSRange(location: 0, length: storage.length)
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.lineSpacing = 2
+            storage.beginEditing()
+            storage.setAttributes(
+                [
+                    .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+                    .foregroundColor: parent.foregroundColor,
+                    .paragraphStyle: paragraphStyle,
+                    .underlineStyle: 0
+                ],
+                range: fullRange
+            )
+
+            let source = textView.string
+            let sourceRange = NSRange(location: 0, length: (source as NSString).length)
+            for match in Self.mentionExpression?.matches(in: source, range: sourceRange) ?? [] {
+                let mention = (source as NSString).substring(with: match.range)
+                guard let lookupKey = AgentMention.lookupHandle(from: mention),
+                      parent.recognizedHandles.contains(lookupKey) else {
+                    continue
+                }
+                storage.addAttributes(
+                    [
+                        .font: NSFont.systemFont(
+                            ofSize: NSFont.systemFontSize,
+                            weight: .medium
+                        ),
+                        .foregroundColor: parent.accentColor,
+                        .underlineColor: parent.accentColor,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue
+                    ],
+                    range: match.range
+                )
+            }
+            storage.endEditing()
+            if selection.location <= storage.length {
+                textView.setSelectedRange(selection)
+            }
+        }
     }
 }
 

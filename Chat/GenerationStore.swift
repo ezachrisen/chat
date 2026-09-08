@@ -117,6 +117,160 @@ enum GenerationStore {
         return String(trimmed.prefix(visiblePreviewLimit))
     }
 
+    @discardableResult
+    static func refreshTimedOutHeartbeatTrace(
+        turnID: UUID,
+        invocations: [CapturedToolInvocation],
+        debug: GenerationDebugPayloadDraft?,
+        in modelContext: ModelContext
+    ) -> Bool {
+        let turn: GenerationTurn
+        let existingToolRows: [ToolInvocation]
+        let storedPayload: GenerationDebugPayload?
+        do {
+            var turnDescriptor = FetchDescriptor<GenerationTurn>(
+                predicate: #Predicate { $0.id == turnID }
+            )
+            turnDescriptor.fetchLimit = 1
+            guard let fetchedTurn = try modelContext.fetch(turnDescriptor).first else {
+                return false
+            }
+            turn = fetchedTurn
+            existingToolRows = try modelContext.fetch(
+                GenerationQuery.toolCalls(forTurn: turnID)
+            )
+            var payloadDescriptor = GenerationQuery.debugPayload(forTurn: turnID)
+            payloadDescriptor.fetchLimit = 1
+            storedPayload = try modelContext.fetch(payloadDescriptor).first
+        } catch {
+            logger.error(
+                "Failed to load timed-out heartbeat trace for refresh: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+
+        guard
+              turn.kind == .heartbeat,
+              turn.status == .timedOut,
+              turn.debugCaptureEnabled,
+              !turn.isDebugContentRedacted else {
+            return false
+        }
+
+        for row in existingToolRows {
+            modelContext.delete(row)
+        }
+        for invocation in invocations {
+            let arguments = limit(invocation.argumentsJSON, max: debugFieldLimit, addEllipsis: true)
+            let result = limit(invocation.resultText, max: debugFieldLimit, addEllipsis: true)
+            modelContext.insert(
+                ToolInvocation(
+                    turnID: turnID,
+                    sequence: invocation.sequence,
+                    roundIndex: invocation.roundIndex,
+                    toolName: invocation.toolName,
+                    skillName: invocation.skillName,
+                    argumentsJSON: arguments.value,
+                    resultText: result.value,
+                    resultTruncated: arguments.truncated || result.truncated,
+                    succeeded: invocation.succeeded,
+                    errorMessage: invocation.errorMessage,
+                    startedAt: invocation.startedAt,
+                    completedAt: invocation.completedAt
+                )
+            )
+        }
+        turn.toolCallCount = invocations.count
+
+        if let debug {
+            let systemPrompt = limit(debug.systemPrompt, max: debugFieldLimit, addEllipsis: true).value
+            let conversationPrompt = limit(debug.conversationPrompt, max: debugFieldLimit, addEllipsis: true).value
+            let rawModelOutput = limit(debug.rawModelOutput, max: debugFieldLimit, addEllipsis: true).value
+            let reasoningText = debug.reasoningText.map {
+                limit($0, max: debugFieldLimit, addEllipsis: true).value
+            }
+            let intermediateAssistantJSON = debug.intermediateAssistantJSON.map {
+                limit($0, max: debugFieldLimit, addEllipsis: true).value
+            }
+            let appleTranscriptSummary = debug.appleTranscriptSummary.map {
+                limit($0, max: debugFieldLimit, addEllipsis: true).value
+            }
+            let openAIMessagesJSON = debug.openAIMessagesJSON.map {
+                limit($0, max: debugFieldLimit, addEllipsis: true).value
+            }
+            if let storedPayload {
+                storedPayload.systemPrompt = systemPrompt
+                storedPayload.conversationPrompt = conversationPrompt
+                storedPayload.rawModelOutput = rawModelOutput
+                storedPayload.reasoningText = reasoningText
+                storedPayload.intermediateAssistantJSON = intermediateAssistantJSON
+                storedPayload.appleTranscriptSummary = appleTranscriptSummary
+                storedPayload.openAIMessagesJSON = openAIMessagesJSON
+            } else {
+                modelContext.insert(
+                    GenerationDebugPayload(
+                        turnID: turnID,
+                        systemPrompt: systemPrompt,
+                        conversationPrompt: conversationPrompt,
+                        rawModelOutput: rawModelOutput,
+                        reasoningText: reasoningText,
+                        intermediateAssistantJSON: intermediateAssistantJSON,
+                        appleTranscriptSummary: appleTranscriptSummary,
+                        openAIMessagesJSON: openAIMessagesJSON
+                    )
+                )
+            }
+        }
+        return true
+    }
+
+    /// Removes the generation graph that was provisionally written when a
+    /// cancellation-resistant heartbeat timed out, then eventually returned
+    /// PASS. The compact HeartbeatRun is intentionally managed by AgentStore.
+    @discardableResult
+    static func removeTimedOutHeartbeatTrace(
+        turnID: UUID,
+        in modelContext: ModelContext
+    ) -> Bool {
+        let turn: GenerationTurn?
+        let toolRows: [ToolInvocation]
+        let payload: GenerationDebugPayload?
+        do {
+            var turnDescriptor = FetchDescriptor<GenerationTurn>(
+                predicate: #Predicate { $0.id == turnID }
+            )
+            turnDescriptor.fetchLimit = 1
+            turn = try modelContext.fetch(turnDescriptor).first
+            toolRows = try modelContext.fetch(
+                GenerationQuery.toolCalls(forTurn: turnID)
+            )
+            var payloadDescriptor = GenerationQuery.debugPayload(forTurn: turnID)
+            payloadDescriptor.fetchLimit = 1
+            payload = try modelContext.fetch(payloadDescriptor).first
+        } catch {
+            logger.error(
+                "Failed to load timed-out heartbeat trace for removal: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+
+        if let turn {
+            guard turn.kind == .heartbeat, turn.status == .timedOut else {
+                return false
+            }
+        }
+        for row in toolRows {
+            modelContext.delete(row)
+        }
+        if let payload {
+            modelContext.delete(payload)
+        }
+        if let turn {
+            modelContext.delete(turn)
+        }
+        return true
+    }
+
     private struct TruncatedText {
         var value: String
         var truncated: Bool
@@ -192,6 +346,13 @@ enum GenerationQuery {
         return descriptor
     }
 
+    static func collaborationInvocations(forTurn turnID: UUID) -> FetchDescriptor<AgentInvocationRecord> {
+        FetchDescriptor<AgentInvocationRecord>(
+            predicate: #Predicate { $0.rootInvocationID == turnID },
+            sortBy: [SortDescriptor(\.startedAt)]
+        )
+    }
+
     static func heartbeatRunsForAgent(_ agentID: UUID) -> FetchDescriptor<HeartbeatRun> {
         FetchDescriptor<HeartbeatRun>(
             predicate: #Predicate { $0.agentID == agentID },
@@ -217,5 +378,13 @@ enum GenerationQuery {
 
     static func fetchDebugPayload(forTurn turnID: UUID, in context: ModelContext) -> GenerationDebugPayload? {
         try? context.fetch(debugPayload(forTurn: turnID)).first
+    }
+
+    static func fetchCollaborationInvocations(
+        forTurn turnID: UUID,
+        in context: ModelContext
+    ) -> [AgentInvocationRecord] {
+        ((try? context.fetch(collaborationInvocations(forTurn: turnID))) ?? [])
+            .filter { !$0.isLogSuppressed }
     }
 }
