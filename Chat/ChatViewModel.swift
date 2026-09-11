@@ -763,16 +763,42 @@ final class ChatViewModel: ObservableObject, Identifiable {
         userMessageID: UUID,
         directlyMentionedAgentIDs: Set<UUID>
     ) async {
-        let orderedParticipants = groupParticipants.sorted { left, right in
-            let leftWasMentioned = directlyMentionedAgentIDs.contains(left.agentID)
-            let rightWasMentioned = directlyMentionedAgentIDs.contains(right.agentID)
-            if leftWasMentioned != rightWasMentioned {
-                return leftWasMentioned
-            }
-            return left.createdAt < right.createdAt
+        defer {
+            respondingAgentName = nil
+            isResponding = false
+            updateAvailability()
         }
 
-        for participant in orderedParticipants {
+        let firstPassPostedReply = await runGroupResponsePass(
+            participants: groupParticipants.shuffled(),
+            userMessageID: userMessageID,
+            directlyMentionedAgentIDs: directlyMentionedAgentIDs,
+            isFollowUp: false,
+            transcriptSnapshot: nil
+        )
+
+        guard firstPassPostedReply, groupParticipants.count > 1, !Task.isCancelled else { return }
+
+        let firstPassTranscript = allStoredMessages()
+        _ = await runGroupResponsePass(
+            participants: groupParticipants.shuffled(),
+            userMessageID: userMessageID,
+            directlyMentionedAgentIDs: directlyMentionedAgentIDs,
+            isFollowUp: true,
+            transcriptSnapshot: firstPassTranscript
+        )
+    }
+
+    private func runGroupResponsePass(
+        participants: [StoredGroupChatParticipant],
+        userMessageID: UUID,
+        directlyMentionedAgentIDs: Set<UUID>,
+        isFollowUp: Bool,
+        transcriptSnapshot: [StoredChatMessage]?
+    ) async -> Bool {
+        var postedReply = false
+
+        for participant in participants {
             guard !Task.isCancelled else { break }
             respondingAgentName = participant.agentName
             let startedAt = Date()
@@ -785,6 +811,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 let generated = try await groupResponse(
                     from: participant,
                     wasDirectlyMentioned: directlyMentionedAgentIDs.contains(participant.agentID),
+                    isFollowUp: isFollowUp,
+                    transcriptSnapshot: transcriptSnapshot,
                     recorder: recorder,
                     captureDebug: debugCaptureEnabled
                 )
@@ -796,6 +824,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     id: participant.agentID,
                     entries: parsedResponse.output.memoryEntries
                 )
+                postedReply = postedReply || shouldPostAssistantReply(parsedResponse.output.visibleText)
                 persistChatTurn(
                     kind: .group,
                     userMessageID: userMessageID,
@@ -829,9 +858,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             }
         }
 
-        respondingAgentName = nil
-        isResponding = false
-        updateAvailability()
+        return postedReply
     }
 
     private struct GroupGeneration {
@@ -854,10 +881,12 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private func groupResponse(
         from participant: StoredGroupChatParticipant,
         wasDirectlyMentioned: Bool,
+        isFollowUp: Bool,
+        transcriptSnapshot: [StoredChatMessage]?,
         recorder: ToolCallRecorder,
         captureDebug: Bool
     ) async throws -> GroupGeneration {
-        let storedMessages = allStoredMessages()
+        let storedMessages = transcriptSnapshot ?? allStoredMessages()
         let backend = localModelStore.backend(for: participant.agentModelIdentifier)
         let generation = generationSupport(
             for: agentStore.agent(for: participant.agentID),
@@ -891,7 +920,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     fallbackAgentName: storedChat.agentName
                 )
             ),
-            wasDirectlyMentioned: wasDirectlyMentioned
+            wasDirectlyMentioned: wasDirectlyMentioned,
+            isFollowUp: isFollowUp
         )
 
         do {

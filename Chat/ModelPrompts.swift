@@ -158,18 +158,23 @@ enum ModelPrompts {
     static func groupConversationPrompt(
         agentName: String,
         transcript: String,
-        wasDirectlyMentioned: Bool
+        wasDirectlyMentioned: Bool,
+        isFollowUp: Bool = false
     ) -> String {
         let emphasis = wasDirectlyMentioned
             ? "The latest user message directly mentions you. Treat it with extra emphasis and usually respond."
             : "The latest user message does not directly mention you. You may still respond if it feels natural and useful."
+
+        let opportunity = isFollowUp
+            ? "Every agent has now had an initial chance to answer. This is your one follow-up opportunity. Respond only if you have a useful reaction to another agent's answer; otherwise return [[PASS]]."
+            : emphasis
 
         return """
         Here is the group conversation so far:
 
         \(transcript)
 
-        \(emphasis)
+        \(opportunity)
         Continue the discussion as \(agentName), or return [[PASS]] if you would only repeat what has already been said.
         """
     }
