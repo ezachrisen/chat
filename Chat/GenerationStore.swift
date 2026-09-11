@@ -224,53 +224,6 @@ enum GenerationStore {
         return true
     }
 
-    /// Removes the generation graph that was provisionally written when a
-    /// cancellation-resistant heartbeat timed out, then eventually returned
-    /// PASS. The compact HeartbeatRun is intentionally managed by AgentStore.
-    @discardableResult
-    static func removeTimedOutHeartbeatTrace(
-        turnID: UUID,
-        in modelContext: ModelContext
-    ) -> Bool {
-        let turn: GenerationTurn?
-        let toolRows: [ToolInvocation]
-        let payload: GenerationDebugPayload?
-        do {
-            var turnDescriptor = FetchDescriptor<GenerationTurn>(
-                predicate: #Predicate { $0.id == turnID }
-            )
-            turnDescriptor.fetchLimit = 1
-            turn = try modelContext.fetch(turnDescriptor).first
-            toolRows = try modelContext.fetch(
-                GenerationQuery.toolCalls(forTurn: turnID)
-            )
-            var payloadDescriptor = GenerationQuery.debugPayload(forTurn: turnID)
-            payloadDescriptor.fetchLimit = 1
-            payload = try modelContext.fetch(payloadDescriptor).first
-        } catch {
-            logger.error(
-                "Failed to load timed-out heartbeat trace for removal: \(error.localizedDescription, privacy: .public)"
-            )
-            return false
-        }
-
-        if let turn {
-            guard turn.kind == .heartbeat, turn.status == .timedOut else {
-                return false
-            }
-        }
-        for row in toolRows {
-            modelContext.delete(row)
-        }
-        if let payload {
-            modelContext.delete(payload)
-        }
-        if let turn {
-            modelContext.delete(turn)
-        }
-        return true
-    }
-
     private struct TruncatedText {
         var value: String
         var truncated: Bool
@@ -384,7 +337,6 @@ enum GenerationQuery {
         forTurn turnID: UUID,
         in context: ModelContext
     ) -> [AgentInvocationRecord] {
-        ((try? context.fetch(collaborationInvocations(forTurn: turnID))) ?? [])
-            .filter { !$0.isLogSuppressed }
+        (try? context.fetch(collaborationInvocations(forTurn: turnID))) ?? []
     }
 }

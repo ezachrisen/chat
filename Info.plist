@@ -23,10 +23,16 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Chat works with Notes, Mail, and Messages using the access you grant each agent.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>Chat reads your calendars so an agent can look up events you allow it to see.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Chat looks up and updates contacts you allow your agents to access.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Chat uses the microphone to transcribe your voice into a message.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>Chat accesses the reminder lists and actions you allow your agents to use.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Chat uses Apple speech recognition to turn your voice into message text.</string>
 	<key>NSUserNotificationAlertStyle</key>

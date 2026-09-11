@@ -14,7 +14,6 @@ final class AgentStore: ObservableObject {
     @Published private(set) var hasOlderHeartbeatRuns = false
     @Published var selectedAgentID: Agent.ID?
     let agentConfigurationDidChange = PassthroughSubject<Agent.ID, Never>()
-    let heartbeatTraceSuppressionDidComplete = PassthroughSubject<UUID, Never>()
 
     private static let heartbeatRunBatchSize = 200
 
@@ -127,6 +126,19 @@ final class AgentStore: ObservableObject {
             return false
         }
 
+        let stashDescriptor = FetchDescriptor<AgentStashEntry>(
+            predicate: #Predicate { $0.agentID == deletedAgentID }
+        )
+        let stashEntries: [AgentStashEntry]
+        do {
+            stashEntries = try modelContext.fetch(stashDescriptor)
+        } catch {
+            Self.logger.error(
+                "Failed to load agent stash for deletion: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+
         let previousSelection = selectedAgentID
         let nextSelection: Agent.ID?
         if agents.count <= 1 {
@@ -147,6 +159,9 @@ final class AgentStore: ObservableObject {
         }
         for grant in grantsToDelete {
             modelContext.delete(grant)
+        }
+        for entry in stashEntries {
+            modelContext.delete(entry)
         }
         collaborationGrants.removeAll {
             $0.callerAgentID == agentID || $0.targetAgentID == agentID
@@ -175,6 +190,7 @@ final class AgentStore: ObservableObject {
             loadHeartbeats()
             return false
         }
+        AppleServiceRuntime.shared.revoke(agentID: agents[index].id)
         modelContext.delete(agents[index])
         beforeSaving()
         guard saveChanges() else {
@@ -345,6 +361,7 @@ final class AgentStore: ObservableObject {
 
     func setTool(_ toolID: AgentToolID, enabled: Bool, for agentID: Agent.ID) {
         guard let agent = agents.first(where: { $0.id == agentID }) else { return }
+        AppleServiceRuntime.shared.revoke(agentID: agentID)
         agent.setTool(toolID, enabled: enabled)
         saveChanges()
         objectWillChange.send()
@@ -712,21 +729,13 @@ final class AgentStore: ObservableObject {
             }
         }
 
-        // PASS still belongs in compact heartbeat history, but deliberately
-        // has no generation turn, tool rows, debug payload, or collaboration
-        // trace.
-        let isPass = report.generationStatus == .passed
-        let omitsDetailedTrace = isPass || report.omitDetailedTrace
-        let shouldInsertTurn = report.chatID != nil && !omitsDetailedTrace
+        let shouldInsertTurn = report.chatID != nil
         let redactsDebugContent = shouldInsertTurn
             ? heartbeatRootHasRedactedContent(report.turnID)
             : false
         let persistedInvocations = redactsDebugContent
             ? Self.redactingCollaborationContent(in: report.toolInvocations)
             : report.toolInvocations
-        if omitsDetailedTrace {
-            stageHeartbeatTraceSuppressionCompletion(report.turnID)
-        }
         let run = HeartbeatRun(
             id: report.runID,
             heartbeatID: heartbeatID,
@@ -780,10 +789,7 @@ final class AgentStore: ObservableObject {
             }
         }
 
-        let saved = saveChanges()
-        if saved, omitsDetailedTrace {
-            heartbeatTraceSuppressionDidComplete.send(report.turnID)
-        }
+        saveChanges()
         objectWillChange.send()
     }
 
@@ -825,8 +831,6 @@ final class AgentStore: ObservableObject {
     /// A provider may ignore cancellation and exit after the scheduler has
     /// already committed the terminal timeout. Enrich that exact debug turn
     /// without changing its outcome, timestamps, scheduling, or chat state.
-    /// If the late result is PASS, remove the detailed graph instead and keep
-    /// only the already-terminal compact history row.
     func refreshTimedOutHeartbeatTrace(report: HeartbeatExecutionReport) {
         let runID = report.runID
         var descriptor = FetchDescriptor<HeartbeatRun>(
@@ -835,26 +839,6 @@ final class AgentStore: ObservableObject {
         descriptor.fetchLimit = 1
         guard let run = try? modelContext.fetch(descriptor).first,
               run.generationTurnID == report.turnID else {
-            return
-        }
-
-        if report.generationStatus == .passed || report.omitDetailedTrace {
-            guard GenerationStore.removeTimedOutHeartbeatTrace(
-                turnID: report.turnID,
-                in: modelContext
-            ) else {
-                return
-            }
-            stageHeartbeatTraceSuppressionCompletion(report.turnID)
-            run.generationTurnID = nil
-            run.promptTokenCount = report.promptTokenCount
-            run.completionTokenCount = report.completionTokenCount
-            guard saveChanges() else {
-                modelContext.rollback()
-                return
-            }
-            heartbeatTraceSuppressionDidComplete.send(report.turnID)
-            objectWillChange.send()
             return
         }
 
@@ -874,38 +858,6 @@ final class AgentStore: ObservableObject {
             return
         }
         objectWillChange.send()
-    }
-
-    /// Clears the durable handoff bit in the same save that confirms a PASS
-    /// has no generation graph. If no collaboration work remains, the marker
-    /// can be removed too; otherwise the coordinator removes it after the
-    /// hidden operational rows finish.
-    private func stageHeartbeatTraceSuppressionCompletion(_ rootInvocationID: UUID) {
-        let markerDescriptor = FetchDescriptor<SuppressedAgentInvocationRoot>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        let markers: [SuppressedAgentInvocationRoot]
-        do {
-            markers = try modelContext.fetch(markerDescriptor)
-        } catch {
-            Self.logger.error(
-                "Failed to load heartbeat suppression marker for completion: \(error.localizedDescription, privacy: .public)"
-            )
-            return
-        }
-        guard !markers.isEmpty else { return }
-
-        for marker in markers {
-            marker.generationTraceSuppressionPending = false
-        }
-        let invocationDescriptor = FetchDescriptor<AgentInvocationRecord>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        if let records = try? modelContext.fetch(invocationDescriptor), records.isEmpty {
-            for marker in markers {
-                modelContext.delete(marker)
-            }
-        }
     }
 
     private func deferHeartbeatByInterval(_ heartbeat: AgentHeartbeat, from date: Date) {
@@ -1191,8 +1143,8 @@ final class AgentCollaborationGrant: Identifiable {
 final class SuppressedAgentInvocationRoot {
     @Attribute(.unique) var rootInvocationID: UUID
     var createdAt: Date
-    /// A durable handoff between PASS detection and removal of a timeout's
-    /// already-persisted generation graph. Optional for lightweight migration.
+    /// Retained only for compatibility with stores written by builds that
+    /// suppressed heartbeat PASS traces. New runs never set this flag.
     var generationTraceSuppressionPending: Bool?
 
     init(
@@ -1229,9 +1181,8 @@ final class AgentInvocationRecord: Identifiable {
     var errorMessage: String?
     var toolTraceSummary: String?
     var debugLogJSON: String?
-    /// PASS heartbeats retain only transient operational state needed by an
-    /// already-accepted dispatch. Suppressed rows never appear as audit log
-    /// entries and are deleted once delivery bookkeeping is complete.
+    /// Compatibility bit written by older builds that hid heartbeat PASS
+    /// traces. New runs leave it false and startup migration clears old flags.
     var logSuppressed: Bool?
     /// Set when an involved agent is deleted. This is a durable tombstone so
     /// cancellation-resistant providers cannot repopulate redacted content.
@@ -1348,6 +1299,7 @@ final class Agent: Identifiable {
     var debugLogEnabled: Bool?
     var calendarAccessAll: Bool?
     var allowedCalendarIDsJSON: String?
+    var appleServiceGrantsJSON: String?
     @Attribute(.externalStorage) var avatarImageData: Data?
     var avatarCropZoom: Double?
     var avatarCropOffsetX: Double?
@@ -1398,6 +1350,23 @@ final class Agent: Identifiable {
         self.avatarCropOffsetX = avatarCropOffsetX
         self.avatarCropOffsetY = avatarCropOffsetY
         self.createdAt = createdAt
+    }
+
+    var appleServiceGrants: [String: AppleServiceGrant] {
+        guard let data = appleServiceGrantsJSON?.data(using: .utf8) else { return [:] }
+        return (try? JSONDecoder().decode([String: AppleServiceGrant].self, from: data)) ?? [:]
+    }
+
+    @MainActor
+    func setAppleServiceGrant(_ service: AppleServiceID, grant: AppleServiceGrant) {
+        AppleServiceRuntime.shared.revoke(agentID: id)
+        var grants = appleServiceGrants
+        grants[service.rawValue] = grant
+        if let data = try? JSONEncoder().encode(grants) { appleServiceGrantsJSON = String(decoding: data, as: UTF8.self) }
+        if grant.enabled {
+            UserDefaults.standard.set(true, forKey: "appleServicesManagedMode")
+            UserDefaults.standard.set(true, forKey: "appleServicesContentUsed")
+        }
     }
 
     var displayName: String {

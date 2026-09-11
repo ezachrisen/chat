@@ -128,17 +128,34 @@ enum ModelClient {
         tools: AgentToolBox?,
         captureDebug: Bool
     ) async throws -> ModelGenerationResult {
+        try await completeApple(systemPrompt: systemPrompt, prompt: prompt,
+                                foundationTools: tools?.foundationModelTools ?? [], captureDebug: captureDebug)
+    }
+
+    // Also used by fixture probes, so tests exercise the production session and error handling.
+    static func completeApple(
+        systemPrompt: String,
+        prompt: String,
+        foundationTools: [any Tool],
+        captureDebug: Bool
+    ) async throws -> ModelGenerationResult {
+        let loop = ToolExecutionLoop()
         let session = LanguageModelSession(
-            tools: tools?.appleTools ?? [],
-            instructions: systemPrompt
+            tools: FoundationToolRecovery.wrap(foundationTools, loop: loop),
+            instructions: systemPrompt + (foundationTools.isEmpty ? "" : "\n\n" + ToolExecutionLoop.instructions)
         )
         do {
             let content = try await session.respond(to: prompt).content
-            return appleResult(from: session, content: content, captureDebug: captureDebug)
+            return appleResult(from: session, content: content, loopTrace: loop.trace.json(), captureDebug: captureDebug)
+        } catch let error as LanguageModelSession.ToolCallError {
+            throw ModelGenerationError(
+                underlying: error.underlyingError,
+                partial: appleResult(from: session, content: "", loopTrace: loop.trace.json(), captureDebug: captureDebug)
+            )
         } catch {
             throw ModelGenerationError(
                 underlying: error,
-                partial: appleResult(from: session, content: "", captureDebug: captureDebug)
+                partial: appleResult(from: session, content: "", loopTrace: loop.trace.json(), captureDebug: captureDebug)
             )
         }
     }
@@ -146,6 +163,7 @@ enum ModelClient {
     private static func appleResult(
         from session: LanguageModelSession,
         content: String,
+        loopTrace: String,
         captureDebug: Bool
     ) -> ModelGenerationResult {
         let usage = TokenUsage(
@@ -171,7 +189,7 @@ enum ModelClient {
             openAIRoundCount: 0,
             tokenUsage: usage,
             debug: ModelDebugCapture(
-                appleTranscriptSummary: captured.summary,
+                appleTranscriptSummary: "--- AGENT LOOP TRACE ---\n\(loopTrace)\n\n--- FOUNDATION TRANSCRIPT ---\n\(captured.summary)",
                 openAIMessagesJSON: nil
             )
         )
@@ -297,7 +315,9 @@ struct OpenAICompatibleClient: Sendable {
         tools: AgentToolBox?,
         captureDebug: Bool
     ) async throws -> ModelGenerationResult {
-        var messages = [OpenAIChatMessage(role: "system", content: systemPrompt)] + apiMessages
+        let loop = ToolExecutionLoop()
+        let instructions = systemPrompt + (tools?.isEmpty == false ? "\n\n" + ToolExecutionLoop.instructions : "")
+        var messages = [OpenAIChatMessage(role: "system", content: instructions)] + apiMessages
         let openAITools = tools?.isEmpty == false ? tools?.openAITools : nil
         var remainingRounds = 8
         var roundIndex = 0
@@ -345,14 +365,17 @@ struct OpenAICompatibleClient: Sendable {
                         )
                     )
                     for call in toolCalls {
+                        let key = try await loop.begin(toolName: call.function.name, argumentsJSON: call.function.arguments)
                         let output: String
                         do {
                             output = try await tools.execute(
                                 name: call.function.name,
                                 argumentsJSON: call.function.arguments
                             )
+                            await loop.succeeded(toolName: call.function.name, requestKey: key, output: output)
                         } catch {
-                            output = error.localizedDescription
+                            output = try await loop.feedback(for: error, requestKey: key,
+                                                             recoverable: ToolRecoveryPolicy.canRecover(error, toolName: call.function.name, argumentsJSON: call.function.arguments))
                         }
                         messages.append(
                             OpenAIChatMessage(
@@ -575,22 +598,24 @@ private enum AppleTranscriptCapture {
         var responseTexts: [String] = []
         var lines: [String] = []
 
-        for entry in transcript {
+        for (index, entry) in transcript.enumerated() {
+            let prefix = "[\(index)]"
             switch entry {
-            case .instructions:
-                lines.append("instructions")
-            case .prompt:
-                lines.append("prompt")
+            case .instructions(let instructions):
+                lines.append("\(prefix) instructions\n\(text(from: instructions.segments))")
+            case .prompt(let prompt):
+                lines.append("\(prefix) prompt\n\(text(from: prompt.segments))")
             case .toolCalls(let calls):
                 let names = calls.map(\.toolName).joined(separator: " ")
-                lines.append(names.isEmpty ? "toolCalls" : "toolCalls \(names)")
+                lines.append(names.isEmpty ? "\(prefix) toolCalls" : "\(prefix) toolCalls \(names)")
+                for call in calls { lines.append("\(call.toolName) arguments: \(call.arguments.jsonString)") }
             case .toolOutput(let output):
-                let chars = text(from: output.segments).count
-                lines.append("toolOutput \(output.toolName) (chars=\(chars))")
+                let content = text(from: output.segments)
+                lines.append("\(prefix) toolOutput \(output.toolName) (chars=\(content.count))\n\(content)")
             case .response(let response):
                 let content = text(from: response.segments)
                 responseTexts.append(content)
-                lines.append("response (chars=\(content.count))")
+                lines.append("\(prefix) response (chars=\(content.count))\n\(content)")
             default:
                 appendReasoningIfAvailable(entry, reasoningTexts: &reasoningTexts, lines: &lines)
             }

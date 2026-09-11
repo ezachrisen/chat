@@ -197,6 +197,7 @@ private enum AgentEditorTab: String, CaseIterable, Hashable {
     case identity = "Identity"
     case soul = "Soul"
     case memory = "Memory"
+    case stash = "Stash"
     case voice = "Voice"
     case tools = "Tools"
     case skills = "Skills"
@@ -215,7 +216,6 @@ struct AgentEditor: View {
     @Binding var avatarEditorState: ShadAvatarEditorState
     @Query(sort: \AgentInvocationRecord.startedAt, order: .reverse)
     private var collaborationInvocations: [AgentInvocationRecord]
-    @Query private var suppressedCollaborationRoots: [SuppressedAgentInvocationRoot]
     var onEditHeartbeat: (AgentHeartbeat.ID) -> Void = { _ in }
     var onAgentDeleted: () -> Void = {}
     @ObservedObject private var calendarDirectory = CalendarDirectory.shared
@@ -580,6 +580,10 @@ struct AgentEditor: View {
                                     .disabled(selectedAgent == nil)
                                 }
 
+                                if toolID == .appleServices, let agent = selectedAgent, agent.isToolEnabled(.appleServices) {
+                                    AgentAppleServicesView(agent: agent)
+                                }
+
                                 if toolID == .readCalendarEvents,
                                    selectedAgent?.isToolEnabled(.readCalendarEvents) == true {
                                     ShadSeparator()
@@ -780,7 +784,7 @@ struct AgentEditor: View {
                     VStack(spacing: 0) {
                         ShadSettingsRow(
                             title: "Debug log",
-                            description: "Store full prompts and intermediate output for chats and heartbeats, plus complete tool and delegated-agent exchanges for heartbeats. Off by default — this is a lot of data."
+                            description: "Store full prompts and intermediate output for chats and heartbeats, plus complete tool and delegated-agent exchanges for heartbeats. PASS runs are included, and Debug remains available with Apple Services enabled. Off by default — this is a lot of data."
                         ) {
                             ShadSwitch(isOn: debugLogEnabled)
                                 .accessibilityLabel("Debug log")
@@ -825,6 +829,11 @@ struct AgentEditor: View {
                     }
                     .shadSettingsCard()
                 }
+            }
+
+            ShadTabsContent(value: AgentEditorTab.stash) {
+                AgentStashEditor(agent: agent)
+                    .id(agent.id)
             }
 
             ShadTabsContent(value: AgentEditorTab.heartbeats) {
@@ -1003,20 +1012,11 @@ struct AgentEditor: View {
     }
 
     private func recentCollaborationInvocations(for agent: Agent) -> [AgentInvocationRecord] {
-        var suppressedRootIDs = Set(
-            suppressedCollaborationRoots.map(\.rootInvocationID)
-        )
-        suppressedRootIDs.formUnion(
-            collaborationInvocations.lazy
-                .filter(\.isLogSuppressed)
-                .map(\.rootInvocationID)
-        )
         return Array(
             collaborationInvocations
                 .lazy
                 .filter {
-                    !suppressedRootIDs.contains($0.rootInvocationID)
-                        && ($0.callerAgentID == agent.id || $0.targetAgentID == agent.id)
+                    $0.callerAgentID == agent.id || $0.targetAgentID == agent.id
                 }
                 .prefix(20)
         )
@@ -1813,7 +1813,7 @@ struct AgentHeartbeatEditor: View {
             Text("Executions")
                 .font(theme.font(theme.typography.sm, theme.typography.medium))
 
-            Text("PASS results remain in compact history without tools or a debug log. Open another run to inspect its full trace.")
+            Text("Every run keeps compact history. Once a destination is resolved, PASS included, it also keeps the generation and tool trace. Debug-enabled runs keep prompts, raw output, provider artifacts, and collaboration details.")
                 .font(theme.font(theme.typography.sm))
                 .foregroundStyle(theme.colors.mutedForeground)
 

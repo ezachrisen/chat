@@ -5,8 +5,7 @@ import SwiftUI
 struct GenerationInspectorButton: View {
     let turn: GenerationTurn
 
-    @Environment(\.modelContext) private var modelContext
-    @State private var isPresented = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ShadButton(
@@ -16,23 +15,31 @@ struct GenerationInspectorButton: View {
             shape: .pill,
             accessibilityLabel: "Inspect tools and debug log"
         ) {
-            isPresented.toggle()
+            openWindow(id: "generation-debug", value: turn.id)
         }
         .help("Inspect tools and debug log")
-        .shadPopover(
-            isPresented: $isPresented,
-            configuration: ShadPopoverConfiguration(
-                alignment: .trailingBottom,
-                maxHeight: 460,
-                becomesKey: true
-            )
-        ) {
-            ShadPopoverSurface(padding: 16) {
+    }
+}
+
+struct GenerationDebugWindow: View {
+    @Query private var turns: [GenerationTurn]
+
+    init(turnID: UUID) {
+        _turns = Query(filter: #Predicate<GenerationTurn> { $0.id == turnID })
+    }
+
+    var body: some View {
+        Group {
+            if let turn = turns.first {
                 GenerationTurnInspector(turn: turn)
-                    .frame(minWidth: 420, idealWidth: 460, minHeight: 280, idealHeight: 420)
-                    .environment(\.modelContext, modelContext)
+                    .padding(20)
+                    .navigationTitle("Debug — \(turn.agentName)")
+            } else {
+                ContentUnavailableView("Debug history unavailable", systemImage: "doc.text.magnifyingglass", description: Text("This generation may have been deleted."))
             }
         }
+        .frame(minWidth: 560, minHeight: 400)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -44,6 +51,8 @@ nonisolated struct ToolInvocationDisplay: Identifiable, Sendable {
     let resultText: String
     let resultTruncated: Bool
     let succeeded: Bool
+    let sequence: Int
+    let roundIndex: Int
 
     init(_ invocation: ToolInvocation) {
         id = invocation.id
@@ -53,6 +62,8 @@ nonisolated struct ToolInvocationDisplay: Identifiable, Sendable {
         resultText = invocation.resultText
         resultTruncated = invocation.resultTruncated
         succeeded = invocation.succeeded
+        sequence = invocation.sequence
+        roundIndex = invocation.roundIndex
     }
 }
 
@@ -60,51 +71,34 @@ struct GenerationTurnInspector: View {
     let turn: GenerationTurn
 
     @Environment(\.shadTheme) private var theme
-    @Query private var suppressionMarkers: [SuppressedAgentInvocationRoot]
-
-    init(turn: GenerationTurn) {
-        self.turn = turn
-        let turnID = turn.id
-        _suppressionMarkers = Query(
-            filter: #Predicate<SuppressedAgentInvocationRoot> {
-                $0.rootInvocationID == turnID
-            }
-        )
-    }
 
     var body: some View {
-        if !suppressionMarkers.isEmpty {
-            ShadItem(variant: .muted, size: .sm) {
-                ShadItemDescription("The model returned PASS. No detailed log was stored.")
-            }
-        } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: theme.spacing.lg) {
-                    ShadItem(variant: .muted, size: .sm) {
-                        ShadItemContent {
-                            ShadItemTitle(turn.agentName)
-                            ShadItemDescription(turn.actionSummary)
-                            Text("\(turn.kind.rawValue) · \(turn.status.rawValue) · \(turn.toolCallCount) tool\(turn.toolCallCount == 1 ? "" : "s")")
-                                .font(theme.font(theme.typography.xs))
-                                .foregroundStyle(theme.colors.mutedForeground)
-                        }
+        ScrollView {
+            VStack(alignment: .leading, spacing: theme.spacing.lg) {
+                ShadItem(variant: .muted, size: .sm) {
+                    ShadItemContent {
+                        ShadItemTitle(turn.agentName)
+                        ShadItemDescription(turn.actionSummary)
+                        Text("\(turn.kind.rawValue) · \(turn.status.rawValue) · \(turn.toolCallCount) tool\(turn.toolCallCount == 1 ? "" : "s")")
+                            .font(theme.font(theme.typography.xs))
+                            .foregroundStyle(theme.colors.mutedForeground)
                     }
-
-                    GenerationToolCallSection(
-                        turnID: turn.id,
-                        showsFullDetails: turn.debugCaptureEnabled,
-                        showsEmptyState: true
-                    )
-
-                    AgentCollaborationDebugSection(rootInvocationID: turn.id)
-
-                    GenerationDebugLogSection(
-                        turnID: turn.id,
-                        debugCaptureEnabled: turn.debugCaptureEnabled
-                    )
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+                GenerationToolCallSection(
+                    turnID: turn.id,
+                    showsFullDetails: turn.debugCaptureEnabled,
+                    showsEmptyState: true
+                )
+
+                AgentCollaborationDebugSection(rootInvocationID: turn.id)
+
+                GenerationDebugLogSection(
+                    turnID: turn.id,
+                    debugCaptureEnabled: turn.debugCaptureEnabled
+                )
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -112,7 +106,6 @@ struct GenerationTurnInspector: View {
 struct GenerationDebugLogSection: View {
     @Query private var turns: [GenerationTurn]
     @Query private var payloads: [GenerationDebugPayload]
-    @Query private var suppressionMarkers: [SuppressedAgentInvocationRoot]
     let debugCaptureEnabled: Bool
 
     init(turnID: UUID, debugCaptureEnabled: Bool) {
@@ -123,20 +116,11 @@ struct GenerationDebugLogSection: View {
         _payloads = Query(
             filter: #Predicate<GenerationDebugPayload> { $0.turnID == storedTurnID }
         )
-        _suppressionMarkers = Query(
-            filter: #Predicate<SuppressedAgentInvocationRoot> {
-                $0.rootInvocationID == storedTurnID
-            }
-        )
         self.debugCaptureEnabled = debugCaptureEnabled
     }
 
     var body: some View {
-        if !suppressionMarkers.isEmpty {
-            ShadItem(variant: .muted, size: .xs) {
-                ShadItemDescription("The model returned PASS. No detailed log was stored.")
-            }
-        } else if turns.first?.isDebugContentRedacted == true {
+        if turns.first?.isDebugContentRedacted == true {
             ShadItem(variant: .muted, size: .xs) {
                 ShadItemDescription("Debug content was redacted because an involved agent was deleted.")
             }
@@ -156,7 +140,6 @@ struct GenerationDebugLogSection: View {
 
 struct GenerationToolCallSection: View {
     @Query private var storedInvocations: [ToolInvocation]
-    @Query private var suppressionMarkers: [SuppressedAgentInvocationRoot]
     let showsFullDetails: Bool
     let showsEmptyState: Bool
 
@@ -166,24 +149,13 @@ struct GenerationToolCallSection: View {
             filter: #Predicate<ToolInvocation> { $0.turnID == storedTurnID },
             sort: [SortDescriptor(\.sequence)]
         )
-        _suppressionMarkers = Query(
-            filter: #Predicate<SuppressedAgentInvocationRoot> {
-                $0.rootInvocationID == storedTurnID
-            }
-        )
         self.showsFullDetails = showsFullDetails
         self.showsEmptyState = showsEmptyState
     }
 
     var body: some View {
         let invocations = storedInvocations.map(ToolInvocationDisplay.init)
-        if !suppressionMarkers.isEmpty {
-            if showsEmptyState {
-                ShadItem(variant: .muted, size: .xs) {
-                    ShadItemDescription("The model returned PASS. No detailed log was stored.")
-                }
-            }
-        } else if invocations.isEmpty {
+        if invocations.isEmpty {
             if showsEmptyState {
                 ShadItem(variant: .muted, size: .xs) {
                     ShadItemDescription("No tools were called.")
@@ -200,7 +172,6 @@ struct GenerationToolCallSection: View {
 
 struct AgentCollaborationDebugSection: View {
     @Query private var storedInvocations: [AgentInvocationRecord]
-    @Query private var suppressionMarkers: [SuppressedAgentInvocationRoot]
 
     init(rootInvocationID: UUID) {
         let rootID = rootInvocationID
@@ -208,17 +179,11 @@ struct AgentCollaborationDebugSection: View {
             filter: #Predicate<AgentInvocationRecord> { $0.rootInvocationID == rootID },
             sort: [SortDescriptor(\.startedAt)]
         )
-        _suppressionMarkers = Query(
-            filter: #Predicate<SuppressedAgentInvocationRoot> { $0.rootInvocationID == rootID }
-        )
     }
 
     var body: some View {
-        let rootIsSuppressed = !suppressionMarkers.isEmpty
-            || storedInvocations.contains(where: \.isLogSuppressed)
-        let visibleInvocations = rootIsSuppressed ? [] : storedInvocations
-        if !visibleInvocations.isEmpty {
-            AgentCollaborationDebugList(invocations: visibleInvocations)
+        if !storedInvocations.isEmpty {
+            AgentCollaborationDebugList(invocations: storedInvocations)
         }
     }
 }
@@ -248,6 +213,7 @@ struct GenerationToolCallList: View {
             VStack(alignment: .leading, spacing: theme.spacing.sm) {
                 HStack {
                     ShadItemTitle(invocation.toolName)
+                    ShadBadge("#\(invocation.sequence + 1) · round \(invocation.roundIndex + 1)", variant: .outline)
                     Spacer()
                     ShadBadge(
                         invocation.succeeded ? "Succeeded" : "Failed",
@@ -341,7 +307,11 @@ struct AgentCollaborationDebugList: View {
                                 GenerationTextBlock(title: "Intermediate output", text: intermediate)
                             }
                             if let transcript = debugLog.appleTranscriptSummary {
-                                GenerationTextBlock(title: "Apple transcript", text: transcript)
+                                let parts = AppleDebugTraceParts(transcript)
+                                if let loop = parts.loopTrace {
+                                    GenerationTextBlock(title: "Agent loop", text: loop)
+                                }
+                                GenerationTextBlock(title: "Apple transcript", text: parts.transcript)
                             }
                             if let messages = debugLog.openAIMessagesJSON {
                                 GenerationTextBlock(title: "OpenAI messages", text: messages)
@@ -386,12 +356,33 @@ struct GenerationDebugSections: View {
             }
             GenerationTextBlock(title: "Raw model output", text: payload.rawModelOutput)
             if let summary = payload.appleTranscriptSummary, !summary.isEmpty {
-                GenerationTextBlock(title: "Apple transcript", text: summary)
+                let parts = AppleDebugTraceParts(summary)
+                if let loop = parts.loopTrace {
+                    GenerationTextBlock(title: "Agent loop", text: loop)
+                }
+                GenerationTextBlock(title: "Apple transcript", text: parts.transcript)
             }
             if let messages = payload.openAIMessagesJSON, !messages.isEmpty {
                 GenerationTextBlock(title: "OpenAI messages", text: messages)
             }
         }
+    }
+}
+
+nonisolated struct AppleDebugTraceParts {
+    let loopTrace: String?
+    let transcript: String
+
+    init(_ text: String) {
+        let loopMarker = "--- AGENT LOOP TRACE ---\n"
+        let transcriptMarker = "\n\n--- FOUNDATION TRANSCRIPT ---\n"
+        guard text.hasPrefix(loopMarker), let range = text.range(of: transcriptMarker) else {
+            loopTrace = nil
+            transcript = text
+            return
+        }
+        loopTrace = String(text[text.index(text.startIndex, offsetBy: loopMarker.count)..<range.lowerBound])
+        transcript = String(text[range.upperBound...])
     }
 }
 
@@ -407,13 +398,11 @@ struct GenerationTextBlock: View {
                 .foregroundStyle(theme.colors.mutedForeground)
 
             ShadItem(variant: .muted, size: .sm) {
-                ScrollView {
-                    Text(text.isEmpty ? "(empty)" : text)
-                        .font(theme.monoFont(theme.typography.xs))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 220)
+                Text(text.isEmpty ? "(empty)" : text)
+                    .font(theme.monoFont(theme.typography.xs))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -19,7 +19,9 @@ struct ChatApp: App {
 
     init() {
         do {
-            let container = try ChatModelContainer.make()
+            let container = try AppleServicesProbe.isRequested || SessionStorageProbe.usesInMemoryStore
+                ? ChatModelContainer.make(configuration: ModelConfiguration(isStoredInMemoryOnly: true))
+                : ChatModelContainer.make()
             let agentStore = AgentStore(modelContext: container.mainContext)
             let localModelStore = LocalModelStore(modelContext: container.mainContext)
             let textToSpeechToolStore = TextToSpeechToolStore(modelContext: container.mainContext)
@@ -43,7 +45,9 @@ struct ChatApp: App {
             _chatStore = StateObject(wrappedValue: chatStore)
             _heartbeatScheduler = StateObject(wrappedValue: heartbeatScheduler)
             _preferencesNavigation = StateObject(wrappedValue: preferencesNavigation)
-            if SessionStorageProbe.isRequested {
+            if AppleServicesProbe.isRequested {
+                AppleServicesProbe.run(container: container)
+            } else if SessionStorageProbe.isRequested {
                 Task { @MainActor in
                     await SessionStorageProbe.maybeRun(
                         container: container,
@@ -89,6 +93,16 @@ struct ChatApp: App {
             HeartbeatCommands()
             DeveloperCommands(chatStore: chatStore)
         }
+
+        WindowGroup("Debug", id: "generation-debug", for: UUID.self) { $turnID in
+            if let turnID {
+                GenerationDebugWindow(turnID: turnID)
+                    .modelContainer(modelContainer)
+                    .shadTheme(ChatShadTheme.theme)
+            }
+        }
+        .defaultSize(width: 900, height: 750)
+        .windowResizability(.contentMinSize)
 
         Window("Heartbeats", id: "heartbeats") {
             HeartbeatsView(
@@ -763,7 +777,12 @@ struct ChatDetailView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            composer
+            VStack(spacing: 8) {
+                AppleServiceActionBanner(agents: chat.isGroupChat
+                    ? agentStore.agents.filter { candidate in chat.groupParticipants.contains { $0.agentID == candidate.id } }
+                    : agentStore.agents.filter { $0.id == chat.agentID })
+                composer
+            }
                 .padding(theme.spacing.xl)
                 .background(theme.colors.background)
         }

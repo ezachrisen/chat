@@ -12,6 +12,7 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
     case models
     case skills
     case textToSpeech
+    case appleServices
 
     var id: Self { self }
 
@@ -23,6 +24,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return "Models"
         case .skills:
             return "Skills"
+        case .appleServices:
+            return "Apple Services"
         case .textToSpeech:
             return "Text to Speech"
         }
@@ -36,6 +39,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return .custom("cpu")
         case .skills:
             return .custom("book")
+        case .appleServices:
+            return .custom("app.connected.to.app.below.fill")
         case .textToSpeech:
             return .custom("waveform")
         }
@@ -77,6 +82,8 @@ struct PreferencesView: View {
                     ModelPreferencesView(store: localModelStore, replyFilterStore: replyFilterStore)
                 case .skills:
                     SkillPreferencesView(catalog: skillCatalog)
+                case .appleServices:
+                    AppleServicesPreferencesView()
                 case .textToSpeech:
                     TextToSpeechPreferencesView(store: textToSpeechToolStore)
                 }

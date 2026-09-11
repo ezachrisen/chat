@@ -455,8 +455,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             wasAborted: Bool,
             partial: ModelGenerationResult? = nil,
             systemPrompt: String = "",
-            conversationPrompt: String = "",
-            omitDetailedTrace: Bool = false
+            conversationPrompt: String = ""
         ) -> HeartbeatModelFailure {
             HeartbeatModelFailure(
                 modelInput: "",
@@ -482,29 +481,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     )
                     : nil,
                 backendRawValue: backend.persistenceName,
-                omitDetailedTrace: omitDetailedTrace,
                 tokenUsage: partial?.tokenUsage ?? .zero
             )
-        }
-
-        func omitDetailedTraceIfPass(_ partial: ModelGenerationResult?) async -> Bool {
-            guard let partial,
-                  sanitizedReply(
-                    partial.finalText,
-                    modelIdentifier: modelIdentifier
-                  ).isPass else {
-                return false
-            }
-
-            // Cancellation is cooperative. A provider can return an exact
-            // PASS after an abort or the scheduler's five-minute timeout, so
-            // establish the same collaboration suppression fence before the
-            // terminal cancellation report is handed back.
-            _ = await collaborationCoordinator.suppressHeartbeatLog(
-                rootInvocationID: turnID,
-                retainUntilGenerationTraceRemoved: true
-            )
-            return true
         }
 
         if Task.isCancelled {
@@ -556,25 +534,21 @@ final class ChatViewModel: ObservableObject, Identifiable {
             let underlying = generationError?.underlying ?? error
             let wasAborted = Task.isCancelled || underlying is CancellationError
             let partial = generationError?.partial
-            let omitDetailedTrace = await omitDetailedTraceIfPass(partial)
             throw failure(
                 message: wasAborted ? "Aborted by user." : underlying.localizedDescription,
                 wasAborted: wasAborted,
                 partial: partial,
                 systemPrompt: systemInstructions,
-                conversationPrompt: conversationPrompt,
-                omitDetailedTrace: omitDetailedTrace
+                conversationPrompt: conversationPrompt
             )
         }
         if Task.isCancelled {
-            let omitDetailedTrace = await omitDetailedTraceIfPass(result)
             throw failure(
                 message: "Aborted by user.",
                 wasAborted: true,
                 partial: result,
                 systemPrompt: systemInstructions,
-                conversationPrompt: conversationPrompt,
-                omitDetailedTrace: omitDetailedTrace
+                conversationPrompt: conversationPrompt
             )
         }
         onModelResponseAccepted?()
@@ -585,20 +559,6 @@ final class ChatViewModel: ObservableObject, Identifiable {
         )
         let visibleText = parsedResponse.output.visibleText
         let passed = parsedResponse.isPass
-        if passed {
-            guard await collaborationCoordinator.suppressHeartbeatLog(
-                rootInvocationID: turnID
-            ) else {
-                throw failure(
-                    message: "The model passed, but Chat could not durably suppress its collaboration log.",
-                    wasAborted: false,
-                    partial: result,
-                    systemPrompt: systemInstructions,
-                    conversationPrompt: conversationPrompt,
-                    omitDetailedTrace: true
-                )
-            }
-        }
         agentStore.appendAgentMemoryEntries(
             id: agent.id,
             entries: parsedResponse.output.memoryEntries
@@ -666,8 +626,13 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let backend = localModelStore.backend(for: modelIdentifier)
         let agent = agentStore.agent(for: storedChat.agentID)
         let debugCaptureEnabled = agent?.isDebugLogEnabled == true
-        let recorder = ToolCallRecorder()
-        let generation = generationSupport(for: agent, recorder: recorder, backend: backend)
+        let recorder = ToolCallRecorder(capturesFullContent: debugCaptureEnabled)
+        let generation = generationSupport(
+            for: agent,
+            recorder: recorder,
+            backend: backend,
+            captureCollaborationDebug: debugCaptureEnabled
+        )
         let storedMessages = allStoredMessages()
         let systemInstructions = ModelPrompts.agentSystemInstructions(
             agentName: resolvedAgentName,
@@ -813,7 +778,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             let startedAt = Date()
             let agent = agentStore.agent(for: participant.agentID)
             let debugCaptureEnabled = agent?.isDebugLogEnabled == true
-            let recorder = ToolCallRecorder()
+            let recorder = ToolCallRecorder(capturesFullContent: debugCaptureEnabled)
             let backend = localModelStore.backend(for: participant.agentModelIdentifier)
 
             do {
@@ -897,7 +862,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let generation = generationSupport(
             for: agentStore.agent(for: participant.agentID),
             recorder: recorder,
-            backend: backend
+            backend: backend,
+            captureCollaborationDebug: captureDebug
         )
         let systemInstructions = ModelPrompts.groupSystemPrompt(
             agentName: participant.agentName,
@@ -967,14 +933,16 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 backend: backend,
                 deadline: collaborationDeadline,
                 rootInvocationID: collaborationRootInvocationID,
-                captureDebug: captureCollaborationDebug
+                captureDebug: captureCollaborationDebug,
+                isBackground: collaborationDeadline != nil
             )
         }
         let tools = AgentToolBox.make(
             agent: agent,
             catalog: skillCatalog,
             recorder: recorder,
-            delegationRuntime: delegationRuntime
+            delegationRuntime: delegationRuntime,
+            serviceOrigin: collaborationDeadline == nil ? .interactive : .heartbeat
         )
         return (
             tools,

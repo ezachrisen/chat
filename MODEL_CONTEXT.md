@@ -2,7 +2,7 @@
 
 This document describes the context the chat harness sends to a model for normal replies and scheduled heartbeats. Keep it updated whenever persistence, prompt construction, memory handling, message loading, or orchestration changes.
 
-Implementation snapshot: September 1, 2026.
+Implementation snapshot: September 11, 2026.
 
 Primary implementation:
 
@@ -10,14 +10,43 @@ Primary implementation:
 - `Chat/ChatGPTProvider.swift`: Codex app-server authentication, model discovery, generation, and dynamic-tool bridging
 - `Chat/ModelPrompts.swift`: system and conversation prompt construction
 - `Chat/AgentMemory.swift`: memory protocol sent to models and parsed from replies
+- `Chat/AgentStash.swift`: per-agent working key/value storage and focused model tools
+- `Chat/AgentStashEditor.swift`: user-visible multiline stash editor
 - `Chat/SkillCatalog.swift`: `~/.chat/skills` discovery and global enablement
 - `Chat/SkillTools.swift`: skill, notification, calendar, `AskAgents`, and `SendToAgents` tool definitions and execution
 - `Chat/AgentCollaboration.swift`: directed agent delegation, parallel fan-out/gather, execution budgets, cancellation leases, and delivery
 - `Chat/CalendarAccess.swift`: EventKit calendar listing and event reads, scoped by per-agent calendar IDs
+- `Chat/AppleServices/`: native service tools, live grants, prepared communication actions, receipts, imported attachments, and permission/review UI
 - `Chat/ChatViewModel.swift`: turn orchestration
 - `Chat/LocalModels.swift`: local model CRUD and backend selection
 - `Chat/GroupChats.swift`: group participants and `@mention` parsing
 - `Chat/AgentHeartbeats.swift`: heartbeat persistence and scheduling
+
+## Bounded tool-error recovery
+
+Foundation Models tools are wrapped at session creation by `Chat/AgentLoop/RecoveringFoundationTool.swift`, preserving their schemas. Actionable validation errors from known read-only operations return small `isError` tool outputs instead of aborting the session. The model reads the feedback and may issue corrected arguments; the app never automatically replays a request. The OpenAI-compatible loop uses the same recovery policy and budget (and retains its eight-round ceiling). The externally hosted ChatGPT/Codex loop is unchanged.
+
+`ToolExecutionLoop` is an actor shared across all tools in one generation, including concurrent calls. It allows at most 12 executions and two correction opportunities (the third failure stops). Repeating a failed tool name plus unchanged JSON arguments stops before execution, normalizing JSON key order and whitespace. Limits do not reset after a successful call or switching tools; a new generation gets a new budget. Cancellation, permission/setup/revocation failures, uncertain outcomes, and potentially side-effecting operations remain terminal. The policy allows known input errors for Reminders/other native service reads, stash list/read operations, Calendar date validation, and skill-file reads, not arbitrary exceptions.
+
+Debug-on Foundation history has a dedicated ordered Agent loop section containing each call start, canonical arguments, feedback sent to the model, successful completion, counters, and stop decisions. Its Apple transcript section retains actual instructions, prompts, tool arguments, complete model-visible outputs, and response text, with entry indexes. The underlying invocation recorder still marks failed attempts as failed; a successful correction is its own numbered invocation. On termination, `ModelGenerationError.partial` preserves diagnostics and usage. The app-level `--tool-recovery-self-test` injects the Todos timestamp-date regression against fixtures and verifies actual Foundation Model correction, scope preservation, and debug retention. `Tests/AgentLoop` covers trace contents, repeat detection, failure/total budgets, concurrency, cancellation, and bounded feedback.
+
+## Native Apple services
+
+`AppleServices` is a per-agent enablement flag, not a callable tool. Reminders exposes operation-specific `ListReminderLists`, `FindReminders`, and `ReadReminder` tools; edit grants additionally expose `CreateReminder`, `UpdateReminder`, and `SetReminderCompleted`, with `DeleteReminder` requiring deletion permission. Consultations expose only the three read tools. The old callable `AppleReminders` is no longer advertised or accepted. Other configured services retain `AppleNotes`, `AppleContacts`, `ApplePhone`, `AppleMessages`, and `AppleMail` with action fields. Foundation Models wrappers and JSON tool dispatch execute through the same `AppleServiceRuntime`; provider schemas have a self-test. The toolbox's Foundation Models tool list is named `foundationModelTools`.
+
+`Agent.appleServiceGrantsJSON` is an additive optional field. A missing or invalid value grants nothing. Service grants separately cover selected containers/conversations, edits, reminder deletion, history, scheduled use, delegated use, and exact standing communication destinations/sending identities. Tool definitions are selected at invocation creation; grants are checked live before work and before returning results. Configuration changes revoke in-flight fences and cancel pending communications. Calendar retains its existing tool name and selection semantics, with live policy validation around its reads.
+
+Consultation remains read-only. The delegation context now propagates `isBackground` through every descendant and refreshed invocation. A heartbeat's child requires both background and delegation grants; dispatch cannot turn scheduled work into an interactive invocation.
+
+Writes use durable action IDs. Existing-item changes require a revision from a read result. Communications first prepare an exact, agent-owned action; execution uses an applicable standing destination grant or a user click on its review card. Model arguments cannot supply approval. Ambiguous completion is recorded as uncertain and is not automatically retried. Prepared communications expire after an hour. Free-form user text does not independently bypass the review/standing-grant boundary in this implementation.
+
+Most services return bounded records, revisions, observation time, scan coverage, and `nextOffset`; Reminders uses its own smaller response shape described below. Pagination is over live data, not a stable snapshot. Notes/Mail/Messages search can return an empty scanned page with a continuation. Service content is untrusted data; it may inform a response but cannot change grants or authorize an action. Unsupported content is explicitly labeled.
+
+`FindReminders` separates optional `listName` (exact unique name or list ID) from optional `textContains` (title/notes filter). Omitting `listName` searches ALL allowed lists; omit `textContains` when listing a list's contents. `status` defaults to `incomplete`; `completed`/`all` require an explicit user request. Optional `dueFrom`/`dueThrough` specify inclusive local calendar days. List discovery and search use five-item pages with `offset`/`nextOffset`. Search returns only ID/title/due summaries and one scope label; `ReadReminder` supplies bounded details and the original edit revision. All new Reminders responses are capped at 4,096 UTF-8 bytes (or a smaller caller budget). Output-driven page shrinkage advances by the number actually returned so it never skips omitted records. Truncated content is labeled. Mutations use `retryKey`, translated to the existing runtime `actionID`; permissions, revision checks, durable receipts, and debug capture remain shared. The chat debug icon opens the turn in a dedicated resizable window with a single scrolling document.
+
+Enabling a service turns on the global managed-script setting, which disables unrestricted skill execution throughout the agent graph. The user may opt back into broader script access in Apple Services settings; native scopes do not sandbox those scripts. Apple Services do not override an agent's explicit Debug log setting. With Debug off, native service tool traces contain only status/count metadata. With Debug on, they retain the exact structured request and bounded result returned to the model; prepared-action receipts remain in the app-owned action store.
+
+The integration uses no command-line clients. Apple owns account authentication and synchronization. Reminders and Contacts use their frameworks; Notes, Mail, and Messages sending use typed Apple Events. Messages history uses read-only SQLite and a bounded attributed-text decoder. Phone is a system call handoff. Files become sendable through an agent-scoped import reference and are checked again before use. See `docs/apple-services-implementation.md` for setup, limits, and verification.
 
 ## Agent state and snapshot boundaries
 
@@ -27,6 +56,7 @@ An agent has:
 - An optional avatar image and crop used only by the app UI
 - Individual instructions, stored as `soul`
 - Persistent memory
+- A persistent working stash of text keys and values
 - A selected model
 - Optional text-to-speech settings: a configured tool, voice name, and voice model
 - Per-agent enablement of model tools and skills
@@ -108,6 +138,14 @@ Memory rules:
 ```
 
 The user can edit the complete memory text directly in the agent editor. Those edits save immediately.
+
+### Working stash
+
+The stash is persistent per agent but deliberately separate from long-term Memory. It is not injected into every prompt. When the `Stash` tool is enabled, the model gets three small focused tools: `ListAgentStash` returns keys and `updatedAt` timestamps, `ReadAgentStash` returns one bounded value and its timestamp, and `WriteAgentStash` idempotently creates or replaces one key. Consulted agents can list/read their own stash but cannot write it; normal chats, heartbeats, and dispatched work can write. Live tool enablement is checked again for each operation.
+
+Keys are single-line, trimmed, matched case/diacritic/width-insensitively, and limited to 80 characters. Each agent can store 100 entries; full values are limited to 32,000 UTF-8 bytes. Model reads return at most 8,000 characters and explicitly mark truncation, while the editor shows the full multiline value. `updatedAt` is information for the agent rather than an automatic cache-expiration policy. Stash values are untrusted data, not instructions.
+
+The Stash tab allows the user to add, rename, edit, and delete entries even when the agent tool is disabled. Deleting an agent deletes its stash rows. With Debug on, stash tool arguments and model-visible results are recorded in full; with Debug off, stash contents are omitted from tool history. The app-level `--agent-stash-self-test` uses an in-memory store to check persistence, multiline round trips, focused Foundation/OpenAI schema parity, case-insensitive upserts, live revocation, retry policy, and debug capture/redaction.
 
 ### Model memory writes
 
@@ -324,7 +362,7 @@ Every invocation has a four-minute execution window and a revocable lease. User 
 
 `AgentInvocationRecord` stores the execution tree IDs, caller and target snapshots, mode, state, bounded task/result/error previews, model/backend, depth, timing, token counts, and a compact tool trace containing tool names and success/failure. When a heartbeat starts with its agent's Debug log enabled, the heartbeat turn ID is also used as the collaboration tree root and each invocation stores a full debug payload: exact assignment and prepared/sent prompts, raw/visible reply, the exact bounded envelope or receipt returned to the caller, reasoning and intermediate output, provider transcript metadata, errors, and complete tool arguments/results. This debug flag is snapshotted for the whole tree and propagated to nested and asynchronous dispatches; ordinary runs keep the redacted compact audit. A completed dispatch's full user-visible post is held temporarily in a durable outbox until it has been inserted idempotently into the target chat, then cleared. The Collaboration editor shows the latest 20 related rows and lets the user stop an active branch. Compact terminal history is kept for at most 30 days and 500 records; heartbeat debug rows remain with their run. Deleting an agent also redacts correlated root delegation tool rows and removes provider debug payloads that may duplicate the exchange. Its scrubbed root-wide privacy tombstones are retention-exempt so an in-flight parent or later descendant cannot recreate deleted content.
 
-If the root heartbeat returns an exact pass, the entire collaboration tree is suppressed too. A content-free root marker is confirmed durable before the pass is committed and hides the whole tree even if its child rows are temporarily unreadable; inability to save that marker turns the attempt into a compact visible storage-failure row instead of a silent pass, while still omitting the detailed trace because the actual model reply was PASS. For cancellation/error results, the marker carries a durable handoff bit until any already-written timeout generation graph and its compact-run link are removed; launch recovery completes that scrub after a crash. The marker is removed after that handoff and the tree's operational rows are gone. Finished rows are deleted immediately. Already-accepted independent dispatches keep only hidden, scrubbed operational state until their idempotent delivery finishes, then that state is deleted; nested work inherits the suppression. This preserves dispatch behavior without leaving a heartbeat-PASS debug or collaboration trail.
+An exact heartbeat pass changes only chat delivery: it posts no bubble. Its generation turn, tools, and compact collaboration audit are retained like every other destination-resolved heartbeat. When Debug log was enabled for the run, the full root and delegated-agent debug payloads are retained too, including assignments, prompts, replies, provider artifacts, and complete tool arguments/results.
 
 Queued and running records found after relaunch are marked failed and surfaced in the target chat through the same durable outbox. The task payload itself is intentionally in-memory, so accepted dispatches are not resumed after Chat quits.
 
@@ -359,7 +397,7 @@ The Heartbeats window exposes three actions for an upcoming heartbeat:
 
 A claimed heartbeat is removed from Upcoming and shown in the in-memory Running section. Its elapsed running time updates once per second. Right-clicking a running heartbeat and choosing `Abort` requests task cancellation. The harness checks cancellation again after the backend returns and before processing memory or posting, so an aborted run cannot add memory or a chat message. Its normal next-run date remains scheduled.
 
-Every execution has a five-minute timeout. At five minutes the scheduler removes the heartbeat from Running, requests cancellation, creates a completed timeout audit record, and schedules the next attempt one full interval after the timeout. With Debug log enabled, the timeout payload preserves any model input already constructed and tool calls completed by the timeout; otherwise the compact record omits prompt content. A backend that ignores cancellation may continue working after the UI timeout, but its eventual response is discarded before memory or message processing. If that late response is an exact pass, the detailed timeout graph is removed and only the compact timeout history row remains.
+Every execution has a five-minute timeout. At five minutes the scheduler removes the heartbeat from Running, requests cancellation, creates a completed timeout audit record, and schedules the next attempt one full interval after the timeout. With Debug log enabled, the timeout payload preserves any model input already constructed and tool calls completed by the timeout; otherwise the compact record omits prompt content. A backend that ignores cancellation may continue working after the UI timeout, but its eventual response is discarded before memory or message processing. When that late response arrives, including an exact pass, its final tool snapshot and Debug artifacts enrich the existing timed-out turn without changing the timeout outcome.
 
 ### Destination selection
 
@@ -419,9 +457,9 @@ The result is processed in this order:
 
 A generation, destination, or abort error is stored on the heartbeat for display in the agent editor. Unlike ordinary group-generation errors, heartbeat errors are not posted into the chat.
 
-Every completed heartbeat attempt creates a persistent compact `HeartbeatRun` history record. Recorded runs snapshot the agent name, heartbeat instruction, destination label, start and completion times, action, token usage, and any error. An exact pass creates only this compact row: it creates no `GenerationTurn`, tool rows, provider/debug payload, or collaboration trace. These records remain available in the Heartbeats window even if the heartbeat or agent is later edited or deleted.
+Every completed heartbeat attempt creates a persistent compact `HeartbeatRun` history record. Recorded runs snapshot the agent name, heartbeat instruction, destination label, start and completion times, action, token usage, and any error. Once a destination chat is known, every run, including an exact pass, also creates a linked `GenerationTurn` and ordered tool rows. Failures before destination resolution remain compact-run-only because `GenerationTurn.chatID` is required. These records remain available in the Heartbeats window even if the heartbeat or agent is later edited or deleted.
 
-With Debug log enabled, the linked generation turn stores the exact `SYSTEM` and `USER` prompts, the raw model output, intermediate/provider artifacts, complete root tool arguments/results, and every correlated delegated-agent exchange. Asynchronous dispatch rows continue updating after the root heartbeat finishes, and inspectors observe newly inserted descendants live. Debug-off runs retain only compact tool fields. Aborted and timed-out runs are saved as completed audit records with their corresponding action and error. If a cancellation-resistant provider exits after the five-minute timeout, its final tool snapshot and debug artifacts enrich that same timed-out turn without changing the terminal outcome or scheduling state, unless its late result is an exact pass; PASS removes the detailed graph while retaining the compact timeout row.
+With Debug log enabled, the linked generation turn stores the exact `SYSTEM` and `USER` prompts, the raw model output, intermediate/provider artifacts, complete root tool arguments/results, and every correlated delegated-agent exchange. This includes exact-pass runs. Asynchronous dispatch rows continue updating after the root heartbeat finishes, and inspectors observe newly inserted descendants live. Debug-off runs retain compact tool fields. Aborted and timed-out runs are saved as completed audit records with their corresponding action and error. If a cancellation-resistant provider exits after the five-minute timeout, its final tool snapshot and Debug artifacts enrich that same timed-out turn without changing the terminal outcome or scheduling state, including when the late result is an exact pass.
 
 ## Pass handling
 
@@ -433,7 +471,7 @@ A response is treated as a pass only when its complete visible content, after tr
 
 Memory blocks are removed before this check, so an agent can append memory and pass without posting.
 
-A heartbeat pass remains visible in compact execution history but is omitted from generation, tool, provider/debug, and collaboration logging. It still counts as a completed attempt for scheduling and for the next heartbeat prompt's elapsed-time calculation.
+A heartbeat pass posts no chat bubble, but it remains visible in compact execution history and uses the same destination-resolved generation, tool, provider/debug, and collaboration logging as any other heartbeat result. It still counts as a completed attempt for scheduling and for the next heartbeat prompt's elapsed-time calculation.
 
 ## Values not sent as conversational context
 
@@ -467,9 +505,9 @@ The configured OpenAI-compatible model ID is sent in the request's `model` field
 
 6. **Single-flight deferral can create schedule drift.** A heartbeat that becomes due while another heartbeat is running is postponed by its complete configured interval. Repeated contention can defer a heartbeat more than once, especially when a long-interval heartbeat happens to become due during frequent runs.
 
-7. **Execution control is in-memory and backend cancellation is cooperative.** If the app terminates after a heartbeat is claimed, the model request stops without a completed or aborted audit record, while the already-advanced next-run date remains persisted. At the five-minute UI timeout the global heartbeat slot is released; a non-cooperative backend may continue consuming resources and overlap a later heartbeat until it returns. When it does return, Debug mode refreshes the already-terminal timeout trace but never posts the late reply or changes scheduling; an exact late pass removes that detailed trace instead.
+7. **Execution control is in-memory and backend cancellation is cooperative.** If the app terminates after a heartbeat is claimed, the model request stops without a completed or aborted audit record, while the already-advanced next-run date remains persisted. At the five-minute UI timeout the global heartbeat slot is released; a non-cooperative backend may continue consuming resources and overlap a later heartbeat until it returns. When it does return, Debug mode refreshes the already-terminal timeout trace, including for an exact pass, but never posts the late reply or changes scheduling.
 
-8. **Recorded heartbeat history has no retention limit.** Compact runs, including exact passes, accumulate indefinitely, while Debug-enabled non-PASS runs additionally retain full prompts, raw/provider output, root tool exchanges, and correlated delegated-agent traces. Root generation fields have per-field caps, but the aggregate delegated-agent debug JSON has no additional storage cap beyond the collaboration/tool runtime bounds. Scrubbed privacy tombstones created by agent deletion are also retained without a cap to prevent late work from restoring deleted content. Frequent schedules and repeated agent deletion can therefore make the SwiftData store grow.
+8. **Recorded heartbeat history has no retention limit.** Compact runs and their destination-resolved generation/tool traces, including exact passes, accumulate indefinitely. Debug-enabled runs additionally retain full prompts, raw/provider output, root tool exchanges, and correlated delegated-agent traces. Root generation fields have per-field caps, but the aggregate delegated-agent debug JSON has no additional storage cap beyond the collaboration/tool runtime bounds. Scrubbed privacy tombstones created by agent deletion are also retained without a cap to prevent late work from restoring deleted content. Frequent schedules and repeated agent deletion can therefore make the SwiftData store grow.
 
 9. **Extra-chat turns and heartbeat turns use different name and model snapshot rules.** Default chats and heartbeats use current agent configuration, with an optional per-heartbeat model override. Extra chats retain snapshotted names and model choices. All paths use current individual instructions and memory, but a heartbeat post can still differ from the agent's next ordinary reply in an extra chat because of its name or model.
 

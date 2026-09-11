@@ -423,7 +423,7 @@ private struct CompletedHeartbeatRow: View {
                 debugCaptureEnabled: run.debugCaptureEnabled == true
             )
         } else if run.passedWithoutDebugLog {
-            Text("The model returned PASS. Compact history was kept, but no debug log was stored.")
+            Text("This PASS was recorded by an older build that did not retain its generation trace.")
                 .font(theme.font(theme.typography.xs))
                 .foregroundStyle(theme.colors.mutedForeground)
         } else if run.debugCaptureEnabled == true {

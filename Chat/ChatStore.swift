@@ -636,7 +636,6 @@ final class ChatStore: ObservableObject {
         error: Error
     ) -> HeartbeatExecutionReport {
         let wasAborted = (error as? HeartbeatModelFailure)?.wasAborted == true
-        let omitDetailedTrace = (error as? HeartbeatModelFailure)?.omitDetailedTrace == true
         let actionSummary: String
         if wasAborted {
             actionSummary = "Run was aborted. No chat message was posted."
@@ -665,9 +664,8 @@ final class ChatStore: ObservableObject {
             memoryEntryCount: 0,
             modelIdentifier: modelIdentifier,
             backendRawValue: backendRawValue,
-            toolInvocations: omitDetailedTrace ? [] : toolInvocations,
-            debug: debugCaptureEnabled && !omitDetailedTrace ? debug : nil,
-            omitDetailedTrace: omitDetailedTrace,
+            toolInvocations: toolInvocations,
+            debug: debugCaptureEnabled ? debug : nil,
             promptTokenCount: storedTokenUsage(from: error)?.promptTokens,
             completionTokenCount: storedTokenUsage(from: error)?.completionTokens
         )

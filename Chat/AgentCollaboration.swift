@@ -275,6 +275,7 @@ private nonisolated struct AgentDelegationContext: Sendable {
     let deadline: Date
     let callerBackend: ChatBackend
     let captureDebug: Bool
+    let isBackground: Bool
     let budget: AgentDelegationBudget
     let parentLease: AgentInvocationLease?
 
@@ -283,7 +284,8 @@ private nonisolated struct AgentDelegationContext: Sendable {
         callerBackend: ChatBackend,
         deadline: Date,
         rootInvocationID: UUID? = nil,
-        captureDebug: Bool = false
+        captureDebug: Bool = false,
+        isBackground: Bool = false
     ) -> AgentDelegationContext {
         AgentDelegationContext(
             rootInvocationID: rootInvocationID ?? UUID(),
@@ -293,6 +295,7 @@ private nonisolated struct AgentDelegationContext: Sendable {
             deadline: deadline,
             callerBackend: callerBackend,
             captureDebug: captureDebug,
+            isBackground: isBackground,
             budget: AgentDelegationBudget(
                 maximumNodes: 12,
                 maximumActiveChildren: 3,
@@ -317,6 +320,7 @@ private nonisolated struct AgentDelegationContext: Sendable {
             deadline: deadline,
             callerBackend: callerBackend,
             captureDebug: captureDebug,
+            isBackground: isBackground,
             budget: budget,
             parentLease: lease
         )
@@ -331,6 +335,7 @@ private nonisolated struct AgentDelegationContext: Sendable {
             deadline: max(deadline, minimumDeadline),
             callerBackend: callerBackend,
             captureDebug: captureDebug,
+            isBackground: isBackground,
             budget: budget,
             parentLease: parentLease
         )
@@ -515,10 +520,7 @@ final class AgentCollaborationCoordinator {
     )
     private var deliveryHandler: DeliveryHandler?
     private var cancellationHandlers: [UUID: @MainActor () -> Void] = [:]
-    private var suppressedRootInvocationIDs = Set<UUID>()
-    private var startupRecoverableTraceSuppressionRootIDs = Set<UUID>()
     private var agentConfigurationCancellable: AnyCancellable?
-    private var heartbeatTraceSuppressionCancellable: AnyCancellable?
     private var skillCatalogCancellable: AnyCancellable?
     private var modelConfigurationCancellable: AnyCancellable?
 
@@ -534,17 +536,12 @@ final class AgentCollaborationCoordinator {
         self.skillCatalog = skillCatalog
         self.replyFilterStore = replyFilterStore
         self.modelContext = modelContext
-        restoreSuppressedRoots()
+        retireLegacyPassSuppression()
         reconcileInterruptedInvocations()
         pruneInvocationHistory()
         agentConfigurationCancellable = agentStore.agentConfigurationDidChange
             .sink { [weak self] agentID in
                 self?.revalidateActiveInvocations(afterChangeTo: agentID)
-            }
-        heartbeatTraceSuppressionCancellable = agentStore
-            .heartbeatTraceSuppressionDidComplete
-            .sink { [weak self] rootInvocationID in
-                self?.completeHeartbeatTraceSuppression(rootInvocationID)
             }
         skillCatalogCancellable = skillCatalog.objectWillChange
             .sink { [weak self] _ in
@@ -571,7 +568,8 @@ final class AgentCollaborationCoordinator {
         backend: ChatBackend,
         deadline: Date? = nil,
         rootInvocationID: UUID? = nil,
-        captureDebug: Bool = false
+        captureDebug: Bool = false,
+        isBackground: Bool = false
     ) -> AgentDelegationRuntime {
         runtime(
             for: caller,
@@ -580,126 +578,10 @@ final class AgentCollaborationCoordinator {
                 callerBackend: backend,
                 deadline: deadline ?? Date().addingTimeInterval(Self.defaultRootLifetime),
                 rootInvocationID: rootInvocationID,
-                captureDebug: captureDebug
+                captureDebug: captureDebug,
+                isBackground: isBackground
             )
         )
-    }
-
-    /// A heartbeat that resolves to PASS has no collaboration/debug log.
-    /// Independent dispatches are allowed to finish, so their rows are
-    /// retained only as hidden operational state until outbox delivery.
-    func suppressHeartbeatLog(
-        rootInvocationID: UUID,
-        retainUntilGenerationTraceRemoved: Bool = false
-    ) async -> Bool {
-        suppressedRootInvocationIDs.insert(rootInvocationID)
-        var markerDescriptor = FetchDescriptor<SuppressedAgentInvocationRoot>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        markerDescriptor.fetchLimit = 1
-        let storedMarker: SuppressedAgentInvocationRoot?
-        do {
-            storedMarker = try modelContext.fetch(markerDescriptor).first
-        } catch {
-            Self.logger.error(
-                "Failed to inspect heartbeat suppression marker \(rootInvocationID.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
-            // The in-memory root is already fail-closed. Scrub its rows now
-            // (with the same bounded retry path used after marker durability)
-            // so the caller's compact failure save can make that state durable.
-            suppressHeartbeatLog(
-                rootInvocationID: rootInvocationID,
-                remainingAttempts: 3
-            )
-            return false
-        }
-        var insertedMarker: SuppressedAgentInvocationRoot?
-        let priorTraceSuppressionState = storedMarker?.generationTraceSuppressionPending
-        if let storedMarker {
-            if retainUntilGenerationTraceRemoved {
-                storedMarker.generationTraceSuppressionPending = true
-            }
-        } else {
-            let marker = SuppressedAgentInvocationRoot(
-                rootInvocationID: rootInvocationID,
-                generationTraceSuppressionPending: retainUntilGenerationTraceRemoved
-            )
-            modelContext.insert(marker)
-            insertedMarker = marker
-        }
-
-        for attempt in 0..<4 {
-            if saveChanges() {
-                suppressHeartbeatLog(rootInvocationID: rootInvocationID, remainingAttempts: 3)
-                return true
-            }
-            if attempt < 3 {
-                // Deliberately continue this tiny durability fence even if the
-                // calling generation is cancelled. A completed PASS must not
-                // be exposed again after relaunch.
-                try? await Task.sleep(for: .milliseconds(100))
-            }
-        }
-
-        // Keep the current process fail-closed, but report failure so callers
-        // never commit a silent PASS without a durable marker. Do not perform
-        // a fifth implicit save here after the durability result is decided.
-        let descriptor = FetchDescriptor<AgentInvocationRecord>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        if let records = try? modelContext.fetch(descriptor) {
-            for record in records {
-                record.logSuppressed = true
-                Self.scrubSuppressedLogFields(record)
-            }
-        }
-        if let insertedMarker {
-            // A failed save is transactional, so this object was never durable.
-            // Cancel its pending insertion so the shared context can still
-            // persist the visible storage-failure report.
-            modelContext.delete(insertedMarker)
-        } else if let storedMarker {
-            storedMarker.generationTraceSuppressionPending = priorTraceSuppressionState
-        }
-        Self.logger.error(
-            "Failed to durably suppress heartbeat collaboration log \(rootInvocationID.uuidString, privacy: .public)"
-        )
-        return false
-    }
-
-    private func suppressHeartbeatLog(
-        rootInvocationID: UUID,
-        remainingAttempts: Int
-    ) {
-        suppressedRootInvocationIDs.insert(rootInvocationID)
-        let descriptor = FetchDescriptor<AgentInvocationRecord>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        let records: [AgentInvocationRecord]
-        do {
-            records = try modelContext.fetch(descriptor)
-        } catch {
-            guard remainingAttempts > 0 else {
-                Self.logger.error(
-                    "Failed to suppress heartbeat collaboration log \(rootInvocationID.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-                )
-                return
-            }
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(100))
-                self?.suppressHeartbeatLog(
-                    rootInvocationID: rootInvocationID,
-                    remainingAttempts: remainingAttempts - 1
-                )
-            }
-            return
-        }
-        for record in records {
-            record.logSuppressed = true
-            Self.scrubSuppressedLogFields(record)
-        }
-        _ = saveChanges()
-        cleanupSuppressedRoot(rootInvocationID)
     }
 
     func cancelInvocation(_ invocationID: UUID) {
@@ -777,7 +659,6 @@ final class AgentCollaborationCoordinator {
             for pendingID in pendingDeliveryIDs {
                 deliverPendingInvocation(pendingID)
             }
-            cleanupSuppressedRoot(rootID)
         }
     }
 
@@ -820,9 +701,6 @@ final class AgentCollaborationCoordinator {
         if saveChanges() {
             for pendingID in pendingDeliveryIDs {
                 deliverPendingInvocation(pendingID)
-            }
-            for rootID in Set(activeRecords.map(\.rootInvocationID)) {
-                cleanupSuppressedRoot(rootID)
             }
         }
     }
@@ -873,9 +751,6 @@ final class AgentCollaborationCoordinator {
         if saveChanges() {
             for pendingID in pendingDeliveryIDs {
                 deliverPendingInvocation(pendingID)
-            }
-            for rootID in Set(affectedRecords.map(\.rootInvocationID)) {
-                cleanupSuppressedRoot(rootID)
             }
         }
     }
@@ -1259,9 +1134,11 @@ final class AgentCollaborationCoordinator {
                 ? [
                     AgentToolID.readSkillFile.rawValue,
                     AgentToolID.readCalendarEvents.rawValue,
+                    AgentToolID.agentStash.rawValue,
+                    AgentToolID.appleServices.rawValue,
                 ]
                 : nil
-            let recorder = ToolCallRecorder()
+            let recorder = ToolCallRecorder(capturesFullContent: childContext.captureDebug)
             let authorization = toolAuthorization(
                 invocationID: invocationID,
                 callerAgentID: caller.id,
@@ -1278,7 +1155,10 @@ final class AgentCollaborationCoordinator {
                 recorder: recorder,
                 delegationRuntime: childRuntime,
                 allowedToolIDs: allowedToolIDs,
-                authorization: authorization
+                authorization: authorization,
+                serviceOrigin: childContext.isBackground
+                    ? (mode == .consult ? .backgroundConsultation : .backgroundDelegated)
+                    : (mode == .consult ? .consultation : .delegated)
             )
             let supportPrompt = ModelPrompts.toolsPrompt(enabledIDs: tools.enabledToolIDs)
                 + ModelPrompts.skillsPrompt(for: tools.runtime.skills)
@@ -1355,7 +1235,6 @@ final class AgentCollaborationCoordinator {
                 continue
             }
 
-            let suppressesLog = isRootLogSuppressed(context.rootInvocationID)
             let redactsContent = isRootContentRedacted(context.rootInvocationID)
             let record = AgentInvocationRecord(
                 id: invocationID,
@@ -1367,12 +1246,10 @@ final class AgentCollaborationCoordinator {
                 targetName: target.displayName,
                 mode: mode,
                 state: .queued,
-                taskPreview: suppressesLog
-                    ? ""
-                    : redactsContent
-                        ? "(redacted when an involved agent was deleted)"
-                        : Self.preview(task),
-                debugLogJSON: context.captureDebug && !suppressesLog && !redactsContent
+                taskPreview: redactsContent
+                    ? "(redacted when an involved agent was deleted)"
+                    : Self.preview(task),
+                debugLogJSON: context.captureDebug && !redactsContent
                     ? Self.encodeDebugLog(
                         AgentInvocationDebugLog(
                             assignment: task,
@@ -1390,7 +1267,7 @@ final class AgentCollaborationCoordinator {
                         )
                     )
                     : nil,
-                logSuppressed: suppressesLog,
+                logSuppressed: false,
                 contentRedacted: redactsContent,
                 modelIdentifier: modelIdentifier,
                 backendRawValue: backend.persistenceName,
@@ -1547,19 +1424,14 @@ final class AgentCollaborationCoordinator {
             )
         }
 
-        let suppressesRootLog = isRootLogSuppressed(invocation.context.rootInvocationID)
         guard updateRecord(invocation.invocationID, update: { record in
             record.state = .running
             record.startedAt = .now
             record.modelStartedAt = .now
             record.modelIdentifier = invocation.modelIdentifier
             record.backendRawValue = invocation.backend.persistenceName
-            if suppressesRootLog {
-                record.logSuppressed = true
-                Self.scrubSuppressedLogFields(record)
-            } else if invocation.context.captureDebug,
-                      !record.isLogSuppressed,
-                      !record.isContentRedacted {
+            record.logSuppressed = false
+            if invocation.context.captureDebug, !record.isContentRedacted {
                 record.debugLogJSON = Self.debugLogJSON(
                     for: invocation,
                     existingJSON: record.debugLogJSON
@@ -1693,6 +1565,8 @@ final class AgentCollaborationCoordinator {
             ? [
                 AgentToolID.readSkillFile.rawValue,
                 AgentToolID.readCalendarEvents.rawValue,
+                AgentToolID.agentStash.rawValue,
+                AgentToolID.appleServices.rawValue,
             ]
             : nil
         let authorization = toolAuthorization(
@@ -1711,7 +1585,10 @@ final class AgentCollaborationCoordinator {
             recorder: accepted.recorder,
             delegationRuntime: childRuntime,
             allowedToolIDs: allowedToolIDs,
-            authorization: authorization
+            authorization: authorization,
+            serviceOrigin: accepted.context.isBackground
+                ? (accepted.mode == .consult ? .backgroundConsultation : .backgroundDelegated)
+                : (accepted.mode == .consult ? .consultation : .delegated)
         )
         let supportPrompt = ModelPrompts.toolsPrompt(enabledIDs: tools.enabledToolIDs)
             + ModelPrompts.skillsPrompt(for: tools.runtime.skills)
@@ -1870,15 +1747,8 @@ final class AgentCollaborationCoordinator {
         for invocation: PreparedAgentInvocation,
         completion: Result<ModelGenerationResult, any Error>
     ) {
-        let suppressesRootLog = isRootLogSuppressed(invocation.context.rootInvocationID)
         _ = updateRecord(invocation.invocationID) { record in
-            if suppressesRootLog {
-                record.logSuppressed = true
-            }
-            guard !record.isLogSuppressed else {
-                Self.scrubSuppressedLogFields(record)
-                return
-            }
+            record.logSuppressed = false
             guard !record.isContentRedacted else { return }
             let snapshot = invocation.recorder.snapshot()
             record.toolTraceSummary = Self.toolTraceSummary(snapshot)
@@ -1953,7 +1823,6 @@ final class AgentCollaborationCoordinator {
             pendingDeliveryText = nil
         }
 
-        let suppressesRootLog = isRootLogSuppressed(invocation.context.rootInvocationID)
         guard updateRecord(invocation.invocationID, update: { record in
             record.state = state
             record.completedAt = .now
@@ -1961,12 +1830,8 @@ final class AgentCollaborationCoordinator {
                 record.promptTokenCount = recordedUsage.promptTokens
                 record.completionTokenCount = recordedUsage.completionTokens
             }
-            if suppressesRootLog {
-                record.logSuppressed = true
-            }
-            if record.isLogSuppressed {
-                Self.scrubSuppressedLogFields(record)
-            } else if !record.isContentRedacted {
+            record.logSuppressed = false
+            if !record.isContentRedacted {
                 record.resultPreview = summary.map(Self.preview)
                 record.errorMessage = error.map(Self.preview)
                 record.toolTraceSummary = Self.toolTraceSummary(invocation.recorder.snapshot())
@@ -2002,8 +1867,6 @@ final class AgentCollaborationCoordinator {
         if pendingDeliveryText != nil {
             deliverPendingInvocation(invocation.invocationID)
         }
-        cleanupSuppressedRoot(invocation.context.rootInvocationID)
-
         return IndexedDelegationOutcome(
             index: invocation.index,
             outcome: AgentDelegationOutcome(
@@ -2050,12 +1913,7 @@ final class AgentCollaborationCoordinator {
             guard let record = try? modelContext.fetch(descriptor).first else {
                 continue
             }
-            if isRootLogSuppressed(record.rootInvocationID) {
-                record.logSuppressed = true
-                Self.scrubSuppressedLogFields(record)
-                changed = true
-                continue
-            }
+            record.logSuppressed = false
             guard !record.isContentRedacted,
                   var debugLog = record.debugLog else {
                 continue
@@ -2067,44 +1925,6 @@ final class AgentCollaborationCoordinator {
         if changed {
             _ = saveChanges()
         }
-    }
-
-    private func isRootLogSuppressed(_ rootInvocationID: UUID) -> Bool {
-        if suppressedRootInvocationIDs.contains(rootInvocationID) {
-            return true
-        }
-        var markerDescriptor = FetchDescriptor<SuppressedAgentInvocationRoot>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        markerDescriptor.fetchLimit = 1
-        do {
-            if try modelContext.fetch(markerDescriptor).first != nil {
-                suppressedRootInvocationIDs.insert(rootInvocationID)
-                return true
-            }
-        } catch {
-            // Fail closed so a temporary storage read error cannot create a
-            // visible descendant under a root that may already be suppressed.
-            Self.logger.error(
-                "Failed to inspect root suppression marker \(rootInvocationID.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
-            return true
-        }
-        let descriptor = FetchDescriptor<AgentInvocationRecord>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        do {
-            guard try modelContext.fetch(descriptor).contains(where: \.isLogSuppressed) else {
-                return false
-            }
-        } catch {
-            Self.logger.error(
-                "Failed to inspect root suppression state \(rootInvocationID.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
-            return true
-        }
-        suppressedRootInvocationIDs.insert(rootInvocationID)
-        return true
     }
 
     private func isRootContentRedacted(_ rootInvocationID: UUID) -> Bool {
@@ -2123,150 +1943,25 @@ final class AgentCollaborationCoordinator {
         }
     }
 
-    private static func scrubSuppressedLogFields(_ record: AgentInvocationRecord) {
-        record.taskPreview = ""
-        record.resultPreview = nil
-        record.errorMessage = nil
-        record.toolTraceSummary = nil
-        record.debugLogJSON = nil
-        record.promptTokenCount = nil
-        record.completionTokenCount = nil
-    }
-
-    private func cleanupSuppressedRoot(
-        _ rootInvocationID: UUID,
-        recoverPendingGenerationTrace: Bool = false
-    ) {
-        let markerDescriptor = FetchDescriptor<SuppressedAgentInvocationRoot>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        guard let markers = try? modelContext.fetch(markerDescriptor) else { return }
-        let descriptor = FetchDescriptor<AgentInvocationRecord>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        guard let records = try? modelContext.fetch(descriptor) else { return }
-        guard suppressedRootInvocationIDs.contains(rootInvocationID)
-                || !markers.isEmpty
-                || records.contains(where: { $0.isLogSuppressed }) else {
+    /// Older builds used durable markers and a per-row bit to hide heartbeat
+    /// PASS traces. Retire that state without deleting any surviving audit data.
+    private func retireLegacyPassSuppression() {
+        guard let markers = try? modelContext.fetch(
+            FetchDescriptor<SuppressedAgentInvocationRoot>()
+        ), let records = try? modelContext.fetch(
+            FetchDescriptor<AgentInvocationRecord>()
+        ) else {
             return
         }
-        suppressedRootInvocationIDs.insert(rootInvocationID)
-        for record in records {
-            record.logSuppressed = true
-            Self.scrubSuppressedLogFields(record)
-            let isTerminal = record.state != .queued && record.state != .running
-            if isTerminal, record.pendingDeliveryText?.nilIfBlank == nil {
-                modelContext.delete(record)
-            }
-        }
-        guard saveChanges() else { return }
-
-        guard let remaining = try? modelContext.fetch(descriptor), remaining.isEmpty else {
-            return
-        }
-        if markers.contains(where: { $0.generationTraceSuppressionPending == true }) {
-            let canRecoverPendingTrace = recoverPendingGenerationTrace
-                || startupRecoverableTraceSuppressionRootIDs.contains(rootInvocationID)
-            guard canRecoverPendingTrace,
-                  stageRecoveredHeartbeatTraceSuppression(rootInvocationID) else {
-                return
-            }
+        let suppressedRecords = records.filter(\.isLogSuppressed)
+        guard !markers.isEmpty || !suppressedRecords.isEmpty else { return }
+        for record in suppressedRecords {
+            record.logSuppressed = false
         }
         for marker in markers {
             modelContext.delete(marker)
         }
-        if saveChanges() {
-            suppressedRootInvocationIDs.remove(rootInvocationID)
-            startupRecoverableTraceSuppressionRootIDs.remove(rootInvocationID)
-        }
-    }
-
-    private func restoreSuppressedRoots() {
-        let descriptor = FetchDescriptor<SuppressedAgentInvocationRoot>()
-        guard let markers = try? modelContext.fetch(descriptor) else { return }
-        for marker in markers {
-            suppressedRootInvocationIDs.insert(marker.rootInvocationID)
-            if marker.generationTraceSuppressionPending == true {
-                startupRecoverableTraceSuppressionRootIDs.insert(marker.rootInvocationID)
-            }
-        }
-        for rootInvocationID in Array(suppressedRootInvocationIDs) {
-            cleanupSuppressedRoot(
-                rootInvocationID,
-                recoverPendingGenerationTrace: true
-            )
-        }
-    }
-
-    /// AgentStore has atomically confirmed that the root generation graph is
-    /// absent. Release the handoff bit, then let normal collaboration cleanup
-    /// retain or remove the marker according to any outstanding dispatches.
-    private func completeHeartbeatTraceSuppression(
-        _ rootInvocationID: UUID,
-        remainingAttempts: Int = 3
-    ) {
-        let descriptor = FetchDescriptor<SuppressedAgentInvocationRoot>(
-            predicate: #Predicate { $0.rootInvocationID == rootInvocationID }
-        )
-        let markers: [SuppressedAgentInvocationRoot]
-        do {
-            markers = try modelContext.fetch(descriptor)
-        } catch {
-            Self.logger.error(
-                "Failed to complete heartbeat trace suppression: \(error.localizedDescription, privacy: .public)"
-            )
-            guard remainingAttempts > 0 else {
-                suppressHeartbeatLog(
-                    rootInvocationID: rootInvocationID,
-                    remainingAttempts: 3
-                )
-                return
-            }
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(100))
-                self?.completeHeartbeatTraceSuppression(
-                    rootInvocationID,
-                    remainingAttempts: remainingAttempts - 1
-                )
-            }
-            return
-        }
-        for marker in markers {
-            marker.generationTraceSuppressionPending = false
-        }
-        guard saveChanges() else { return }
-        cleanupSuppressedRoot(rootInvocationID)
-    }
-
-    /// A pending marker survived a prior process, so no generation task can
-    /// still commit after this point. Remove an already-terminal timeout graph
-    /// and its run link in the same transaction that consumes the marker.
-    private func stageRecoveredHeartbeatTraceSuppression(
-        _ rootInvocationID: UUID
-    ) -> Bool {
-        let optionalRootID: UUID? = rootInvocationID
-        let runDescriptor = FetchDescriptor<HeartbeatRun>(
-            predicate: #Predicate { $0.generationTurnID == optionalRootID }
-        )
-        let linkedRuns: [HeartbeatRun]
-        do {
-            linkedRuns = try modelContext.fetch(runDescriptor)
-        } catch {
-            Self.logger.error(
-                "Failed to load heartbeat runs for suppression recovery: \(error.localizedDescription, privacy: .public)"
-            )
-            return false
-        }
-        guard GenerationStore.removeTimedOutHeartbeatTrace(
-            turnID: rootInvocationID,
-            in: modelContext
-        ) else {
-            return false
-        }
-        for run in linkedRuns {
-            run.generationTurnID = nil
-        }
-        return true
+        _ = saveChanges()
     }
 
     private func deliverPendingInvocation(_ invocationID: UUID) {
@@ -2296,8 +1991,6 @@ final class AgentCollaborationCoordinator {
             // in-memory outbox item too so this process can safely retry.
             record.pendingDeliveryText = pendingText
             record.deliveryCompletedAt = nil
-        } else {
-            cleanupSuppressedRoot(rootInvocationID)
         }
     }
 
@@ -2362,11 +2055,7 @@ final class AgentCollaborationCoordinator {
                 record.deliveryCompletedAt = nil
             }
         }
-        if saveChanges() {
-            for rootID in Set(interrupted.map(\.rootInvocationID)) {
-                cleanupSuppressedRoot(rootID)
-            }
-        }
+        _ = saveChanges()
     }
 
     private func pruneInvocationHistory() {
@@ -2380,10 +2069,7 @@ final class AgentCollaborationCoordinator {
         for record in records {
             guard record.state != .queued && record.state != .running else { continue }
             guard record.pendingDeliveryText?.nilIfBlank == nil else { continue }
-            if record.isLogSuppressed {
-                modelContext.delete(record)
-                continue
-            }
+            record.logSuppressed = false
             // Keep privacy tombstones until their root generation has safely
             // observed them. They contain no captured content and prevent an
             // in-flight parent or future descendant from recreating it.

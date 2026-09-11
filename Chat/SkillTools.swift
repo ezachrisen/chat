@@ -1,3 +1,4 @@
+import SwiftData
 import Foundation
 import FoundationModels
 
@@ -100,6 +101,7 @@ nonisolated enum SkillFileAccess {
         arguments: String?,
         runtime: SkillRuntime
     ) async throws -> String {
+        guard !AppleServiceSecurity.managedMode else { throw AppleServiceError.unsupported("Skill scripts are disabled while managed Apple service access is enabled.") }
         let skill = try requireSkill(named: skillName, runtime: runtime)
         let scriptURL = try confinedFileURL(skillRoot: skill.directoryURL, relativePath: scriptName)
         guard FileManager.default.fileExists(atPath: scriptURL.path) else {
@@ -262,7 +264,12 @@ nonisolated final class ToolCallRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var invocations: [CapturedToolInvocation] = []
     private var nextSequence = 0
+    let capturesFullContent: Bool
     var roundProvider: @Sendable () -> Int = { 0 }
+
+    init(capturesFullContent: Bool = false) {
+        self.capturesFullContent = capturesFullContent
+    }
 
     func snapshot() -> [CapturedToolInvocation] {
         lock.lock()
@@ -460,6 +467,7 @@ struct SendNotificationTool: Tool {
 
 struct ReadCalendarEventsTool: Tool {
     let policy: CalendarAccessPolicy
+    let livePolicy: @MainActor @Sendable () throws -> CalendarAccessPolicy
     let recorder: ToolCallRecorder?
     let authorization: AgentToolAuthorization?
 
@@ -501,12 +509,14 @@ struct ReadCalendarEventsTool: Tool {
         }
 
         do {
+            let currentPolicy = try await livePolicy()
             let output = try await CalendarDirectory.shared.readEvents(
                 start: arguments.start,
                 end: arguments.end,
                 calendarIDsRaw: arguments.calendar_ids,
-                policy: policy
+                policy: currentPolicy
             )
+            guard try await livePolicy() == currentPolicy else { throw AppleServiceError.forbidden }
             let validatedOutput = try await authorization?.validatedOutput(output, toolName: name) ?? output
             capturedResult = .success(validatedOutput)
             return validatedOutput
@@ -812,6 +822,13 @@ struct AgentToolBox: Sendable {
     let recorder: ToolCallRecorder?
     let agentName: String
     let calendarPolicy: CalendarAccessPolicy
+    let liveCalendarPolicy: @MainActor @Sendable () throws -> CalendarAccessPolicy
+    let appleServiceContext: AppleServiceContext?
+    let services: [AppleServiceID]
+    var reminderChangesAllowed = false
+    var reminderDeletionAllowed = false
+    let stashRuntime: AgentStashRuntime?
+    var stashWriteAllowed = true
     let delegationRuntime: AgentDelegationRuntime?
     let authorization: AgentToolAuthorization?
 
@@ -823,10 +840,10 @@ struct AgentToolBox: Sendable {
     }
 
     var isEmpty: Bool {
-        appleTools.isEmpty
+        foundationModelTools.isEmpty
     }
 
-    var appleTools: [any Tool] {
+    var foundationModelTools: [any Tool] {
         var tools: [any Tool] = []
         if enabledToolIDs.contains(AgentToolID.readSkillFile.rawValue) {
             tools.append(ReadSkillFileTool(runtime: runtime, recorder: recorder, authorization: authorization))
@@ -838,8 +855,9 @@ struct AgentToolBox: Sendable {
             tools.append(SendNotificationTool(agentName: agentName, recorder: recorder, authorization: authorization))
         }
         if enabledToolIDs.contains(AgentToolID.readCalendarEvents.rawValue) {
-            tools.append(ReadCalendarEventsTool(policy: calendarPolicy, recorder: recorder, authorization: authorization))
+            tools.append(ReadCalendarEventsTool(policy: calendarPolicy, livePolicy: liveCalendarPolicy, recorder: recorder, authorization: authorization))
         }
+        tools += stashTools.map(\.tool)
         if enabledToolIDs.contains(AgentToolID.askAgents.rawValue),
            let delegationRuntime,
            delegationRuntime.canConsult {
@@ -850,11 +868,39 @@ struct AgentToolBox: Sendable {
            delegationRuntime.canDispatch {
             tools.append(SendToAgentsTool(runtime: delegationRuntime, recorder: recorder, authorization: authorization))
         }
+        if let appleServiceContext {
+            for service in services where service != .reminders { tools.append(AppleServiceTool(service: service, context: appleServiceContext, recorder: recorder, authorization: authorization)) }
+        }
+        tools += reminderTools.map(\.tool)
         return tools
     }
 
+    var reminderTools: [ReminderToolEntry] {
+        guard services.contains(.reminders), let appleServiceContext else { return [] }
+        return ReminderTools.entries(context: appleServiceContext, recorder: recorder, authorization: authorization,
+                                     allowsChanges: reminderChangesAllowed, allowsDeletion: reminderDeletionAllowed)
+    }
+
+    var stashTools: [AgentStashToolEntry] {
+        guard enabledToolIDs.contains(AgentToolID.agentStash.rawValue),
+              let stashRuntime else { return [] }
+        return AgentStashTools.entries(
+            runtime: stashRuntime,
+            recorder: recorder,
+            authorization: authorization,
+            allowsWrite: stashWriteAllowed
+        )
+    }
+
     var openAITools: [OpenAITool] {
-        appleTools.map { tool in
+        foundationModelTools.map { tool in
+            if let reminder = reminderTools.first(where: { $0.tool.name == tool.name }) { return reminder.schema }
+            if let stash = stashTools.first(where: { $0.tool.name == tool.name }) { return stash.schema }
+            if let service = AppleServiceID.allCases.first(where: { $0.toolName == tool.name }) {
+                var schema = AppleServiceTool.schema(service)
+                schema.function.description = tool.description
+                return schema
+            }
             switch tool.name {
             case AgentToolID.readSkillFile.rawValue:
                 return OpenAITool.function(
@@ -935,6 +981,46 @@ struct AgentToolBox: Sendable {
     }
 
     func execute(name: String, argumentsJSON: String) async throws -> String {
+        if AgentStashTools.allNames.contains(name) {
+            guard let tool = stashTools.first(where: { $0.tool.name == name }) else {
+                let error = AgentStashError.unavailable
+                recorder?.record(
+                    startedAt: .now,
+                    toolName: name,
+                    argumentsJSON: recorder?.capturesFullContent == true
+                        ? argumentsJSON
+                        : "{\"content\":\"redacted\"}",
+                    skillName: nil,
+                    result: .failure(error)
+                )
+                throw error
+            }
+            return try await tool.execute(argumentsJSON)
+        }
+        if ReminderTools.allNames.contains(name) || name == AppleServiceID.reminders.toolName {
+            guard let tool = reminderTools.first(where: { $0.tool.name == name }) else {
+                let error: AppleServiceError = name == AppleServiceID.reminders.toolName
+                    ? .invalid("AppleReminders has been replaced. Use FindReminders with listName to select a list; textContains filters reminder text.")
+                    : .forbidden
+                recorder?.record(startedAt: .now, toolName: name,
+                                 argumentsJSON: recorder?.capturesFullContent == true ? argumentsJSON : AppleServiceDiagnosticTrace.redactedArgumentsJSON,
+                                 skillName: nil, result: .failure(recorder?.capturesFullContent == true ? error : AppleServiceError.unavailable("Service operation failed; content omitted.")))
+                throw error
+            }
+            return try await tool.execute(argumentsJSON)
+        }
+        if let service = AppleServiceID.allCases.first(where: { $0.toolName == name }) {
+            guard services.contains(service), let appleServiceContext else { throw AppleServiceError.forbidden }
+            let request = try JSONDecoder().decode(AppleServiceRequest.self, from: Data(argumentsJSON.utf8))
+            return try await AppleServiceTool.execute(
+                service,
+                request: request,
+                originalArgumentsJSON: argumentsJSON,
+                context: appleServiceContext,
+                recorder: recorder,
+                authorization: authorization
+            )
+        }
         try Task.checkCancellation()
         try authorization?.check(toolName: name)
         let startedAt = Date()
@@ -995,12 +1081,14 @@ struct AgentToolBox: Sendable {
                 )
             case AgentToolID.readCalendarEvents.rawValue:
                 let arguments = try JSONDecoder().decode(ReadCalendarEventsCall.self, from: data)
+                let currentPolicy = try liveCalendarPolicy()
                 output = try await CalendarDirectory.shared.readEvents(
                     start: arguments.start,
                     end: arguments.end,
                     calendarIDsRaw: arguments.calendar_ids,
-                    policy: calendarPolicy
+                    policy: currentPolicy
                 )
+                guard try liveCalendarPolicy() == currentPolicy else { throw AppleServiceError.forbidden }
             case AgentToolID.askAgents.rawValue:
                 let arguments = try JSONDecoder().decode(AgentDelegationCall.self, from: data)
                 recordedArgumentsJSON = DelegationToolTrace.arguments(
@@ -1075,7 +1163,8 @@ struct AgentToolBox: Sendable {
         recorder: ToolCallRecorder? = nil,
         delegationRuntime: AgentDelegationRuntime? = nil,
         allowedToolIDs: Set<String>? = nil,
-        authorization: AgentToolAuthorization? = nil
+        authorization: AgentToolAuthorization? = nil,
+        serviceOrigin: AppleServiceOrigin = .interactive
     ) -> AgentToolBox {
         var enabledToolIDs = catalog.enabledToolIDs(for: agent)
         if let allowedToolIDs {
@@ -1094,6 +1183,19 @@ struct AgentToolBox: Sendable {
             recorder: recorder,
             agentName: agent?.displayName ?? "Chat",
             calendarPolicy: agent?.calendarAccessPolicy ?? .none,
+            liveCalendarPolicy: { [weak agent] in
+                guard let agent, !agent.isDeleted, agent.isToolEnabled(.readCalendarEvents) else { throw AppleServiceError.forbidden }
+                return agent.calendarAccessPolicy
+            },
+            appleServiceContext: agent.map { AppleServiceRuntime.context(agent: $0, origin: serviceOrigin, authorization: authorization) },
+            services: enabledToolIDs.contains(AgentToolID.appleServices.rawValue) ? AppleServiceID.allCases.filter {
+                guard let grant = agent?.appleServiceGrants[$0.rawValue], grant.enabled else { return false }
+                return (!serviceOrigin.isBackground || grant.allowsBackground) && (!serviceOrigin.isDelegated || grant.allowsDelegation)
+            } : [],
+            reminderChangesAllowed: agent?.appleServiceGrants[AppleServiceID.reminders.rawValue]?.allowsChanges == true,
+            reminderDeletionAllowed: agent?.appleServiceGrants[AppleServiceID.reminders.rawValue]?.allowsDeletion == true,
+            stashRuntime: agent.flatMap(AgentStashRuntime.init(agent:)),
+            stashWriteAllowed: !serviceOrigin.isConsultation,
             delegationRuntime: delegationRuntime,
             authorization: authorization
         )
@@ -1158,18 +1260,22 @@ struct OpenAIJSONSchema: Encodable, Sendable {
     var required: [String]
 }
 
-struct OpenAIJSONProperty: Encodable, Sendable {
+nonisolated struct OpenAIJSONProperty: Encodable, Sendable {
     var type: String
     var description: String
     var items: OpenAIJSONSchema?
+    var enumValues: [String]?
+    enum CodingKeys: String, CodingKey { case type, description, items; case enumValues = "enum" }
 
     init(
         type: String,
         description: String,
-        items: OpenAIJSONSchema? = nil
+        items: OpenAIJSONSchema? = nil,
+        enumValues: [String]? = nil
     ) {
         self.type = type
         self.description = description
         self.items = items
+        self.enumValues = enumValues
     }
 }

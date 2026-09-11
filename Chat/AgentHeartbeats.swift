@@ -223,7 +223,6 @@ struct HeartbeatExecutionReport {
     let backendRawValue: String
     let toolInvocations: [CapturedToolInvocation]
     let debug: GenerationDebugPayloadDraft?
-    var omitDetailedTrace: Bool = false
     var promptTokenCount: Int? = nil
     var completionTokenCount: Int? = nil
 }
@@ -269,7 +268,6 @@ struct HeartbeatModelFailure: LocalizedError {
     var toolInvocations: [CapturedToolInvocation]
     var debug: GenerationDebugPayloadDraft?
     var backendRawValue: String
-    var omitDetailedTrace: Bool = false
     var tokenUsage: TokenUsage = .zero
 
     var errorDescription: String? {
@@ -386,8 +384,8 @@ final class HeartbeatScheduler: ObservableObject {
         let executionToken = UUID()
         let runID = UUID()
         let turnID = UUID()
-        let recorder = ToolCallRecorder()
         let debugCaptureEnabled = agentStore.agent(for: heartbeat.agentID)?.isDebugLogEnabled == true
+        let recorder = ToolCallRecorder(capturesFullContent: debugCaptureEnabled)
         let runningHeartbeat = RunningHeartbeat(
             id: heartbeat.id,
             agentID: heartbeat.agentID,
