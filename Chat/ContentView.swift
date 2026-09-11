@@ -337,6 +337,12 @@ struct ChatSidebar: View {
     @ObservedObject var presentation: ChatSidebarPresentation
     @State private var collapsedAgentIDs: Set<Agent.ID> = []
     @State private var groupChatsAreCollapsed = false
+    @AppStorage(ChatAppearancePreferences.sidebarAvatarSizeKey)
+    private var storedSidebarAvatarSize = ChatAppearancePreferences.defaultSidebarAvatarSize
+
+    private var sidebarAvatarSize: CGFloat {
+        ChatAppearancePreferences.sidebarAvatarSize(storedSidebarAvatarSize)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -350,6 +356,8 @@ struct ChatSidebar: View {
                         if !chatStore.groupChats.isEmpty {
                             GroupChatSection(
                                 chats: chatStore.groupChats,
+                                agentStore: agentStore,
+                                avatarSize: sidebarAvatarSize,
                                 selectedChatID: $chatStore.selectedChatID,
                                 isCollapsed: groupChatsAreCollapsed,
                                 onRenameChat: presentation.beginRenaming,
@@ -363,6 +371,7 @@ struct ChatSidebar: View {
                         ForEach(agentStore.agents) { agent in
                             AgentSidebarSection(
                                 agent: agent,
+                                avatarSize: sidebarAvatarSize,
                                 defaultChat: chatStore.defaultChat(for: agent.id),
                                 extraChats: chatStore.extraChats(for: agent.id),
                                 selectedChatID: $chatStore.selectedChatID,
@@ -467,8 +476,60 @@ struct AgentAvatar: View {
     }
 }
 
+struct AgentAvatarGroup: View {
+    let agents: [Agent]
+    var size: CGFloat = 32
+    var maximumVisible = 4
+
+    private var visibleAgents: [Agent] {
+        Array(agents.prefix(maximumVisible))
+    }
+
+    private var hiddenCount: Int {
+        max(0, agents.count - visibleAgents.count)
+    }
+
+    var body: some View {
+        if agents.isEmpty {
+            ShadAvatar(image: .symbol(.users), fallback: "", customSize: size)
+                .accessibilityHidden(true)
+        } else {
+            ShadAvatarGroup(overlap: max(5, size * 0.28)) {
+                ForEach(visibleAgents) { agent in
+                    AgentAvatar(agent: agent, size: size)
+                }
+
+                if hiddenCount > 0 {
+                    AgentAvatarGroupOverflow(count: hiddenCount, size: size)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(agents.map(\.displayName).joined(separator: ", "))
+        }
+    }
+}
+
+private struct AgentAvatarGroupOverflow: View {
+    let count: Int
+    let size: CGFloat
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        Circle()
+            .fill(theme.colors.muted)
+            .overlay {
+                Text("+\(count)")
+                    .font(theme.font(max(8, size * 0.34), theme.typography.medium))
+                    .foregroundStyle(theme.colors.mutedForeground)
+            }
+            .frame(width: size, height: size)
+            .overlay(Circle().strokeBorder(theme.colors.background, lineWidth: 2))
+    }
+}
+
 struct AgentSidebarSection: View {
     let agent: Agent
+    let avatarSize: CGFloat
     let defaultChat: ChatViewModel?
     let extraChats: [ChatViewModel]
     @Binding var selectedChatID: ChatViewModel.ID?
@@ -480,6 +541,7 @@ struct AgentSidebarSection: View {
     let onSelectDefault: () -> Void
     let onToggle: () -> Void
     @Environment(\.shadTheme) private var theme
+    @State private var isHovering = false
 
     private var isDefaultSelected: Bool {
         defaultChat.map { selectedChatID == $0.id } ?? false
@@ -490,7 +552,7 @@ struct AgentSidebarSection: View {
             ShadSidebarMenuItem {
                 Button(action: onSelectDefault) {
                     HStack(spacing: 10) {
-                        AgentAvatar(agent: agent)
+                        AgentAvatar(agent: agent, size: avatarSize)
 
                         Text(agent.displayName)
                             .font(theme.font(theme.typography.sm, theme.typography.medium))
@@ -499,14 +561,20 @@ struct AgentSidebarSection: View {
                         Spacer(minLength: 0)
                     }
                     .foregroundStyle(theme.colors.sidebarForeground)
+                    .padding(.horizontal, 8)
+                    .frame(minHeight: max(28, avatarSize + 8))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.shad(.ghost, size: .sm, fillsWidth: true))
+                .buttonStyle(.shadPlain)
+                .focusEffectDisabled()
                 .background(
                     ShadRoundedRectangle(cornerRadius: theme.radius.md)
-                        .fill(isDefaultSelected ? theme.colors.sidebarAccent : .clear)
+                        .fill(isDefaultSelected || isHovering ? theme.colors.sidebarAccent : .clear)
                 )
+                .onHover { hovering in
+                    isHovering = hovering
+                }
                 .accessibilityAddTraits(isDefaultSelected ? .isSelected : [])
 
                 if !extraChats.isEmpty {
@@ -561,6 +629,8 @@ struct AgentSidebarSection: View {
 
 struct GroupChatSection: View {
     let chats: [ChatViewModel]
+    @ObservedObject var agentStore: AgentStore
+    let avatarSize: CGFloat
     @Binding var selectedChatID: ChatViewModel.ID?
     let isCollapsed: Bool
     let onRenameChat: (ChatViewModel) -> Void
@@ -584,6 +654,8 @@ struct GroupChatSection: View {
                     ForEach(chats) { chat in
                         ChatRow(
                             chat: chat,
+                            participantAgentStore: agentStore,
+                            avatarSize: avatarSize,
                             isSelected: selectedChatID == chat.id,
                             onRename: {
                                 onRenameChat(chat)
@@ -606,14 +678,64 @@ struct GroupChatSection: View {
 
 struct ChatRow: View {
     @ObservedObject var chat: ChatViewModel
+    var participantAgentStore: AgentStore?
+    var avatarSize: CGFloat = 20
     let isSelected: Bool
     let onRename: (() -> Void)?
     let onReset: () -> Void
     let onDelete: (() -> Void)?
     let onSelect: () -> Void
+    @Environment(\.shadTheme) private var theme
+    @State private var isHovering = false
+
+    private var participantAgents: [Agent] {
+        guard let participantAgentStore else { return [] }
+        return chat.groupParticipants.compactMap { participantAgentStore.agent(for: $0.agentID) }
+    }
 
     var body: some View {
-        ShadSidebarMenuSubButton(chat.title, isActive: isSelected, action: onSelect)
+        Group {
+            if participantAgentStore == nil {
+                ShadSidebarMenuSubButton(chat.title, isActive: isSelected, action: onSelect)
+            } else {
+                Button(action: onSelect) {
+                    HStack(spacing: 8) {
+                        AgentAvatarGroup(
+                            agents: participantAgents,
+                            size: avatarSize,
+                            maximumVisible: 3
+                        )
+
+                        Text(chat.title)
+                            .font(theme.font(
+                                theme.typography.sm,
+                                isSelected ? theme.typography.medium : theme.typography.regular
+                            ))
+                            .lineLimit(1)
+
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(
+                        isSelected
+                            ? theme.colors.sidebarAccentForeground
+                            : theme.colors.sidebarForeground.opacity(0.8)
+                    )
+                    .padding(.horizontal, 8)
+                    .frame(minHeight: max(28, avatarSize + 8))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        ShadRoundedRectangle(cornerRadius: theme.radius.md)
+                            .fill(isHovering || isSelected ? theme.colors.sidebarAccent : .clear)
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.shadPlain)
+                .focusEffectDisabled()
+                .onHover { hovering in
+                    isHovering = hovering
+                }
+            }
+        }
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .contextMenu {
             if let onRename {
@@ -662,22 +784,20 @@ struct ChatDetailView: View {
     @State private var voiceObservedMessageIDs: Set<ChatMessage.ID> = []
     @Environment(\.shadTheme) private var theme
 
+    private let chatShelfHeight: CGFloat = 92
+
     var body: some View {
-        VStack(spacing: 0) {
-            modelStatus
-                .padding(.horizontal)
-                .padding(.top)
-
-            if chat.isGroupChat {
-                GroupChatConfigurationView(chat: chat)
-                    .padding(.horizontal)
-                    .padding(.top, 10)
-            }
-
+        ZStack(alignment: .top) {
             ShadMessageScrollerProvider(messageScroller) {
                 ShadMessageScroller {
                     ShadMessageScrollerViewport {
                         ShadMessageScrollerContent(ids: transcriptRowIDs, spacing: theme.spacing.lg) {
+                            modelStatus
+
+                            if chat.isGroupChat {
+                                GroupChatConfigurationView(chat: chat)
+                            }
+
                             if chat.isGroupChat, chat.messages.isEmpty {
                                 GroupChatEmptyState(mentions: chat.availableAgentMentions)
                             }
@@ -722,6 +842,7 @@ struct ChatDetailView: View {
                                 }
                             }
                         }
+                        .padding(.top, chatShelfHeight)
                     }
 
                     if shouldShowMoreMessagesButton {
@@ -774,6 +895,15 @@ struct ChatDetailView: View {
                     }
                 }
             }
+
+            chatIdentityShelf
+                .zIndex(1)
+
+            chatActionsMenu
+                .padding(.top, theme.spacing.lg)
+                .padding(.trailing, theme.spacing.xl)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .zIndex(2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -787,63 +917,6 @@ struct ChatDetailView: View {
                 .background(theme.colors.background)
         }
         .navigationTitle(chat.displayTitle)
-        .toolbar {
-            ToolbarItem {
-                ShadDropdownMenu(alignment: .bottomTrailing) { _ in
-                    Group {
-                        if chat.isCompacting {
-                            ShadSpinner(size: theme.typography.base)
-                        } else {
-                            ShadIconView(.moreHorizontal, size: theme.typography.base)
-                        }
-                    }
-                    .frame(width: theme.spacing.xxl, height: theme.spacing.xxl)
-                    .contentShape(
-                        ShadRoundedRectangle(cornerRadius: theme.radius.md)
-                    )
-                } content: {
-                    ShadDropdownMenuCheckboxItem("Render Markdown", isOn: rendersMarkdown)
-
-                    ShadDropdownMenuSeparator()
-
-                    ShadDropdownMenuItem(
-                        chat.isCompacting ? "Compacting…" : "Compact",
-                        icon: chat.isCompacting
-                            ? .loaderCircle
-                            : .custom("rectangle.compress.vertical")
-                    ) {
-                        Task {
-                            await chat.compactConversation()
-                        }
-                    }
-                    .disabled(chat.isResponding || chat.isCompacting)
-
-                    ShadDropdownMenuItem("Compaction Status", icon: .info) {
-                        onPresentCompactionStatus()
-                    }
-
-                    ShadDropdownMenuSeparator()
-
-                    ShadDropdownMenuItem("Reset Chat", icon: .refresh) {
-                        onResetChat()
-                    }
-                    .disabled(chat.isResponding || chat.isCompacting)
-
-                    if chat.canDelete {
-                        ShadDropdownMenuItem(
-                            "Delete Chat",
-                            icon: .trash,
-                            variant: .destructive
-                        ) {
-                            onDeleteChat()
-                        }
-                        .disabled(chat.isResponding)
-                    }
-                }
-                .help("Chat actions")
-                .accessibilityLabel("Chat actions")
-            }
-        }
         .onDisappear {
             stopVoiceModes()
             voicePlayback.clearGeneratedAudio()
@@ -871,6 +944,95 @@ struct ChatDetailView: View {
             get: { chat.rendersMarkdown },
             set: { chat.setRendersMarkdown($0) }
         )
+    }
+
+    private var chatActionsMenu: some View {
+        ShadDropdownMenu(alignment: .bottomTrailing) { _ in
+            ChatActionsMenuTrigger(isLoading: chat.isCompacting)
+        } content: {
+            ShadDropdownMenuCheckboxItem("Render Markdown", isOn: rendersMarkdown)
+
+            ShadDropdownMenuSeparator()
+
+            ShadDropdownMenuItem(
+                chat.isCompacting ? "Compacting…" : "Compact",
+                icon: chat.isCompacting
+                    ? .loaderCircle
+                    : .custom("rectangle.compress.vertical")
+            ) {
+                Task {
+                    await chat.compactConversation()
+                }
+            }
+            .disabled(chat.isResponding || chat.isCompacting)
+
+            ShadDropdownMenuItem("Compaction Status", icon: .info) {
+                onPresentCompactionStatus()
+            }
+
+            ShadDropdownMenuSeparator()
+
+            ShadDropdownMenuItem("Reset Chat", icon: .refresh) {
+                onResetChat()
+            }
+            .disabled(chat.isResponding || chat.isCompacting)
+
+            if chat.canDelete {
+                ShadDropdownMenuItem(
+                    "Delete Chat",
+                    icon: .trash,
+                    variant: .destructive
+                ) {
+                    onDeleteChat()
+                }
+                .disabled(chat.isResponding)
+            }
+        }
+        .help("Chat actions")
+        .accessibilityLabel("Chat actions")
+    }
+
+    private var chatAgents: [Agent] {
+        if chat.isGroupChat {
+            return chat.groupParticipants.compactMap { agentStore.agent(for: $0.agentID) }
+        }
+        return agentStore.agent(for: chat.agentID).map { [$0] } ?? []
+    }
+
+    private var chatIdentityShelf: some View {
+        VStack(spacing: theme.spacing.xs) {
+            if chat.isGroupChat {
+                AgentAvatarGroup(agents: chatAgents, size: 44, maximumVisible: 5)
+            } else if let agent = chatAgents.first {
+                AgentAvatar(agent: agent, size: 48)
+            } else {
+                ShadAvatar(fallback: "?", customSize: 48)
+            }
+
+            Text(chatParticipantNames)
+                .font(theme.font(theme.typography.sm, theme.typography.semibold))
+                .foregroundStyle(theme.colors.foreground)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: chatShelfHeight)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(theme.colors.border.opacity(0.65))
+                .frame(height: theme.borderWidth)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var chatParticipantNames: String {
+        if chat.isGroupChat {
+            let names = chat.groupParticipants.map { participant in
+                agentStore.agent(for: participant.agentID)?.displayName ?? participant.agentName
+            }
+            return names.isEmpty ? "No agents" : names.formatted(.list(type: .and))
+        }
+        return chatAgents.first?.displayName ?? chat.agentName
     }
 
     private var modelStatus: some View {
@@ -1303,6 +1465,24 @@ struct ChatDetailView: View {
     }
 }
 
+private struct ChatActionsMenuTrigger: View {
+    let isLoading: Bool
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        ZStack {
+            if isLoading {
+                ShadSpinner(size: theme.typography.base)
+            } else {
+                ShadIconView(.moreHorizontal, size: theme.typography.base)
+            }
+        }
+        .foregroundStyle(theme.colors.foreground)
+        .frame(width: 28, height: 28)
+        .contentShape(Rectangle())
+    }
+}
+
 struct MessageBubble: View {
     let message: ChatMessage
     var rendersMarkdown = false
@@ -1314,6 +1494,7 @@ struct MessageBubble: View {
     let onSeekAudio: (TimeInterval) -> Void
 
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.shadTheme) private var theme
     @State private var generationTurn: GenerationTurn?
 
@@ -1329,7 +1510,6 @@ struct MessageBubble: View {
                         HStack(alignment: .bottom, spacing: theme.spacing.sm) {
                             bubble
                             audioControls
-                            inspectorControl
                         }
 
                         if playingAudioChunkIndex != nil {
@@ -1339,6 +1519,13 @@ struct MessageBubble: View {
                                 onSeek: onSeekAudio
                             )
                             .frame(maxWidth: 340)
+                        }
+                    }
+                }
+                .contextMenu {
+                    if let generationTurn {
+                        Button("Debug Info") {
+                            openWindow(id: "generation-debug", value: generationTurn.id)
                         }
                     }
                 }
@@ -1393,14 +1580,6 @@ struct MessageBubble: View {
                     .accessibilityLabel(isPlaying ? "Stop audio" : "Replay audio part \(chunkIndex + 1)")
                 }
             }
-        }
-    }
-
-    @ViewBuilder
-    private var inspectorControl: some View {
-        if let generationTurn,
-           generationTurn.toolCallCount > 0 || generationTurn.debugCaptureEnabled {
-            GenerationInspectorButton(turn: generationTurn)
         }
     }
 

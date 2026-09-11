@@ -245,12 +245,13 @@ final class AgentStore: ObservableObject {
     }
 
     func finalizeAgentMentionHandle(id: Agent.ID) {
-        guard let agent = agent(for: id),
-              AgentMention.normalizedHandle(agent.mentionHandle) == nil else {
-            return
-        }
+        guard let agent = agent(for: id) else { return }
         let normalizedName = agent.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedName.isEmpty else { return }
+        let isMissing = AgentMention.normalizedHandle(agent.mentionHandle) == nil
+        let isDefaultPlaceholder = isDefaultAgent(agent)
+            && AgentMention.isDefaultPlaceholder(agent.mentionHandle, agentName: normalizedName)
+        guard isMissing || isDefaultPlaceholder else { return }
         agent.mentionHandle = uniqueMentionHandle(for: normalizedName, excluding: id)
         guard saveChanges() else { return }
         objectWillChange.send()
@@ -907,6 +908,14 @@ final class AgentStore: ObservableObject {
 
     private func backfillAgentMentionHandles() {
         var usedHandles = Set<String>()
+
+        if let defaultAgent = agents.first,
+           AgentMention.isDefaultPlaceholder(
+               defaultAgent.mentionHandle,
+               agentName: defaultAgent.name
+           ) {
+            defaultAgent.mentionHandle = nil
+        }
 
         for agent in agents {
             guard let existing = AgentMention.normalizedHandle(agent.mentionHandle) else { continue }

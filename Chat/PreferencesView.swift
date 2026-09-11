@@ -8,6 +8,7 @@ import AppKit
 #endif
 
 enum PreferencesSection: String, CaseIterable, Identifiable {
+    case appearance
     case agents
     case models
     case skills
@@ -18,6 +19,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .appearance:
+            return "Appearance"
         case .agents:
             return "Agents"
         case .models:
@@ -33,6 +36,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
 
     var icon: ShadIcon {
         switch self {
+        case .appearance:
+            return .custom("paintbrush")
         case .agents:
             return .users
         case .models:
@@ -69,6 +74,8 @@ struct PreferencesView: View {
 
             ShadSidebarInset {
                 switch navigation.selection {
+                case .appearance:
+                    AppearancePreferencesView()
                 case .agents:
                     AgentsPreferencesView(
                         store: agentStore,
@@ -104,6 +111,16 @@ struct PreferencesView: View {
                 .frame(width: 0, height: 0)
         )
 #endif
+    }
+}
+
+enum ChatAppearancePreferences {
+    static let sidebarAvatarSizeKey = "sidebarAvatarSize"
+    static let defaultSidebarAvatarSize = 20.0
+    static let sidebarAvatarSizeRange = 16.0...48.0
+
+    static func sidebarAvatarSize(_ value: Double) -> CGFloat {
+        CGFloat(min(max(value, sidebarAvatarSizeRange.lowerBound), sidebarAvatarSizeRange.upperBound))
     }
 }
 
@@ -283,6 +300,64 @@ extension View {
         ShadCard(spacing: 0) {
             self
         }
+    }
+}
+
+struct AppearancePreferencesView: View {
+    @AppStorage(ChatAppearancePreferences.sidebarAvatarSizeKey)
+    private var sidebarAvatarSize = ChatAppearancePreferences.defaultSidebarAvatarSize
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 32) {
+                ShadSettingsPageHeader(
+                    title: "Appearance",
+                    description: "Adjust how chats and agents are presented."
+                )
+
+                VStack(alignment: .leading, spacing: 0) {
+                    ShadSettingsRow(
+                        title: "Sidebar avatar size",
+                        description: "Change the size of agent and group avatars in the chat sidebar."
+                    ) {
+                        HStack(spacing: theme.spacing.md) {
+                            AgentAvatarSizePreview(size: 16)
+
+                            ShadSlider(
+                                value: $sidebarAvatarSize,
+                                in: ChatAppearancePreferences.sidebarAvatarSizeRange,
+                                step: 1
+                            )
+                            .frame(width: 220)
+                            .accessibilityLabel("Sidebar avatar size")
+                            .accessibilityValue("\(Int(sidebarAvatarSize.rounded())) points")
+
+                            AgentAvatarSizePreview(size: 48)
+
+                            Text("\(Int(sidebarAvatarSize.rounded())) pt")
+                                .font(theme.monoFont(theme.typography.xs).monospacedDigit())
+                                .foregroundStyle(theme.colors.mutedForeground)
+                                .frame(width: 42, alignment: .trailing)
+                        }
+                    }
+                }
+                .shadSettingsCard()
+            }
+            .frame(maxWidth: 800, alignment: .leading)
+            .padding(.horizontal, 40)
+            .padding(.vertical, 36)
+        }
+        .background(theme.colors.background)
+    }
+}
+
+private struct AgentAvatarSizePreview: View {
+    let size: CGFloat
+
+    var body: some View {
+        ShadAvatar(fallback: "A", customSize: size)
+            .accessibilityHidden(true)
     }
 }
 

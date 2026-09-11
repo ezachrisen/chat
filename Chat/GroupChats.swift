@@ -74,6 +74,14 @@ enum AgentMention {
         normalizedHandle(agentName) ?? "agent"
     }
 
+    static func isDefaultPlaceholder(_ handle: String?, agentName: String) -> Bool {
+        guard let handle = normalizedHandle(handle),
+              lookupKey(for: handle) == lookupKey(for: "Default") else {
+            return false
+        }
+        return lookupKey(for: Self.handle(for: agentName)) != lookupKey(for: "Default")
+    }
+
     static func normalizedHandle(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

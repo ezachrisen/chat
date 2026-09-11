@@ -13,6 +13,27 @@ enum AppleServicesProbe {
             func check(_ value: Bool, _ message: String = "Self-test invariant failed") throws {
                 guard value else { throw AppleServiceError.invalid(message) }
             }
+            let mentionContainer = try ChatModelContainer.make(
+                configuration: ModelConfiguration(isStoredInMemoryOnly: true)
+            )
+            let legacyDefault = Agent(
+                name: "Jo",
+                soul: "",
+                mentionHandle: "Default"
+            )
+            mentionContainer.mainContext.insert(legacyDefault)
+            try mentionContainer.mainContext.save()
+            let mentionStore = AgentStore(modelContext: mentionContainer.mainContext)
+            try check(
+                mentionStore.defaultAgent?.mention == "@Jo",
+                "Renamed default agent retained the @Default placeholder"
+            )
+            mentionStore.updateAgentName(id: legacyDefault.id, name: "Joseph")
+            mentionStore.finalizeAgentMentionHandle(id: legacyDefault.id)
+            try check(
+                mentionStore.defaultAgent?.mention == "@Jo",
+                "Migrated mention handle did not remain stable"
+            )
             let context = container.mainContext
             let agent = Agent(name: "Service test", soul: "")
             context.insert(agent)

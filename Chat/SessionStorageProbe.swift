@@ -541,9 +541,10 @@ enum SessionStorageProbe {
             }
             if onTurn.assistantMessageID != nil {
                 let inspectorTurn = GenerationQuery.fetchTurn(forAssistantMessage: onTurn.assistantMessageID!, in: context)
-                check(inspectorTurn?.id == onTurn.id, "inspector lookup by assistantMessageID")
-                let shouldShow = onTurn.toolCallCount > 0 || onTurn.debugCaptureEnabled
-                check(shouldShow, "inspector control would appear on debug-on assistant bubble")
+                check(
+                    inspectorTurn?.id == onTurn.id,
+                    "Debug Info context menu can resolve the debug-on assistant bubble"
+                )
             }
         }
 
