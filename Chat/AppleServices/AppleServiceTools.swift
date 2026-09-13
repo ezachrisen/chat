@@ -158,7 +158,6 @@ struct AppleServiceTool: Tool {
 
 nonisolated enum AppleServiceSecurity {
     static var protectsContent: Bool { UserDefaults.standard.bool(forKey: "appleServicesContentUsed") }
-    static var managedMode: Bool { UserDefaults.standard.bool(forKey: "appleServicesManagedMode") }
 }
 
 @MainActor

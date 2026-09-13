@@ -2,6 +2,18 @@ import Foundation
 
 nonisolated enum ToolRecoveryPolicy {
     static func canRecover(_ error: any Error, toolName: String, argumentsJSON: String) -> Bool {
+        // ExecuteSkillScript can safely correct failures that happen while resolving the
+        // requested script, before any process has started. Runtime failures remain
+        // terminal because the script may already have produced side effects.
+        if toolName == AgentToolID.executeSkillScript.rawValue,
+           let skillError = error as? SkillAccessError {
+            switch skillError {
+            case .emptyPath, .pathEscape, .notFound, .notAFile:
+                return true
+            default:
+                return false
+            }
+        }
         guard isRead(toolName: toolName, argumentsJSON: argumentsJSON) else { return false }
         if error is DecodingError { return true }
         if let serviceError = error as? AppleServiceError {

@@ -1,3 +1,4 @@
+import Foundation
 import ShadSwift
 import SwiftData
 import SwiftUI
@@ -82,6 +83,11 @@ struct GenerationTurnInspector: View {
                         Text("\(turn.kind.rawValue) · \(turn.status.rawValue) · \(turn.toolCallCount) tool\(turn.toolCallCount == 1 ? "" : "s")")
                             .font(theme.font(theme.typography.xs))
                             .foregroundStyle(theme.colors.mutedForeground)
+
+                        Text("Response time \(formattedResponseTime)")
+                            .font(theme.monoFont(theme.typography.xs).monospacedDigit())
+                            .foregroundStyle(theme.colors.mutedForeground)
+                            .help(responseTimeHelp)
                     }
                 }
 
@@ -100,6 +106,31 @@ struct GenerationTurnInspector: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var responseDuration: TimeInterval {
+        max(0, turn.completedAt.timeIntervalSince(turn.startedAt))
+    }
+
+    private var formattedResponseTime: String {
+        if responseDuration < 1 {
+            return "\(Int((responseDuration * 1_000).rounded())) ms"
+        }
+        if responseDuration < 10 {
+            return String(format: "%.2f s", responseDuration)
+        }
+        if responseDuration < 60 {
+            return String(format: "%.1f s", responseDuration)
+        }
+        let minutes = Int(responseDuration) / 60
+        let seconds = Int(responseDuration.rounded(.towardZero)) % 60
+        return String(format: "%dm %02ds", minutes, seconds)
+    }
+
+    private var responseTimeHelp: String {
+        let started = turn.startedAt.formatted(date: .abbreviated, time: .standard)
+        let completed = turn.completedAt.formatted(date: .abbreviated, time: .standard)
+        return "Started \(started) · completed \(completed)"
     }
 }
 

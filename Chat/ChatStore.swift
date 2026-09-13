@@ -19,8 +19,10 @@ final class StoredChat: Identifiable {
     var compactedAt: Date?
     var compactedMessageCount: Int?
     var rendersMarkdown: Bool?
+    var responseEditPatternsText: String?
     var isDefaultChat: Bool?
     var clearedThroughMessageID: UUID?
+    var unreadCount: Int?
 
     init(
         id: UUID = UUID(),
@@ -38,8 +40,10 @@ final class StoredChat: Identifiable {
         compactedAt: Date? = nil,
         compactedMessageCount: Int? = nil,
         rendersMarkdown: Bool? = nil,
+        responseEditPatternsText: String? = nil,
         isDefaultChat: Bool? = nil,
-        clearedThroughMessageID: UUID? = nil
+        clearedThroughMessageID: UUID? = nil,
+        unreadCount: Int? = nil
     ) {
         self.id = id
         self.agentID = agentID
@@ -56,8 +60,10 @@ final class StoredChat: Identifiable {
         self.compactedAt = compactedAt
         self.compactedMessageCount = compactedMessageCount
         self.rendersMarkdown = rendersMarkdown
+        self.responseEditPatternsText = responseEditPatternsText
         self.isDefaultChat = isDefaultChat
         self.clearedThroughMessageID = clearedThroughMessageID
+        self.unreadCount = unreadCount
     }
 
     var kind: ChatKind {
@@ -75,6 +81,7 @@ final class StoredChatMessage: Identifiable {
     var authorName: String?
     var sourceInvocationID: UUID?
     var createdAt: Date
+    var isUnread: Bool?
 
     init(
         id: UUID = UUID(),
@@ -84,7 +91,8 @@ final class StoredChatMessage: Identifiable {
         authorAgentID: UUID? = nil,
         authorName: String? = nil,
         sourceInvocationID: UUID? = nil,
-        createdAt: Date = .now
+        createdAt: Date = .now,
+        isUnread: Bool? = nil
     ) {
         self.id = id
         self.chatID = chatID
@@ -94,6 +102,7 @@ final class StoredChatMessage: Identifiable {
         self.authorName = authorName
         self.sourceInvocationID = sourceInvocationID
         self.createdAt = createdAt
+        self.isUnread = isUnread
     }
 
     var role: ChatRole {
@@ -109,9 +118,15 @@ final class ChatStore: ObservableObject {
     }
 
     private static let messageBatchSize = 40
+    private static let selectedChatIDDefaultsKey = "ChatStore.selectedChatID"
 
     @Published var chats: [ChatViewModel] = []
-    @Published var selectedChatID: ChatViewModel.ID?
+    @Published var selectedChatID: ChatViewModel.ID? {
+        didSet {
+            persistSelectedChatID()
+        }
+    }
+    @Published private(set) var totalUnreadCount = 0
 
     private let modelContext: ModelContext
     private let agentStore: AgentStore
@@ -122,6 +137,8 @@ final class ChatStore: ObservableObject {
     private var agentsCancellable: AnyCancellable?
     private var agentConfigurationCancellable: AnyCancellable?
     private var chatActivityCancellables: [ChatViewModel.ID: AnyCancellable] = [:]
+    private var chatUnreadCancellables: [ChatViewModel.ID: AnyCancellable] = [:]
+    private var unreadCountsByChatID: [ChatViewModel.ID: Int] = [:]
 
     var selectedChat: ChatViewModel? {
         guard let selectedChatID else { return nil }
@@ -149,7 +166,13 @@ final class ChatStore: ObservableObject {
         )
         loadChats()
         ensureDefaultChats(for: agentStore.agents)
-        selectedChatID = chats.first?.id
+        let restoredChatID = UserDefaults.standard
+            .string(forKey: Self.selectedChatIDDefaultsKey)
+            .flatMap(UUID.init(uuidString:))
+        selectedChatID = restoredChatID.flatMap { candidate in
+            chats.contains(where: { $0.id == candidate }) ? candidate : nil
+        } ?? chats.first?.id
+        persistSelectedChatID()
 
         collaborationCoordinator.setDeliveryHandler { [weak self] agentID, agentName, text, invocationID in
             self?.deliverDelegatedResult(
@@ -197,9 +220,11 @@ final class ChatStore: ObservableObject {
                 role: .assistant,
                 text: "New chat with \(agent.displayName). What would you like to ask?",
                 authorAgentID: agent.id,
-                authorName: agent.displayName
+                authorName: agent.displayName,
+                isUnread: true
             )
             modelContext.insert(greeting)
+            storedChat.unreadCount = 1
             storedMessages = [greeting]
         }
         saveChanges()
@@ -287,6 +312,11 @@ final class ChatStore: ObservableObject {
 
     func selectDefaultChat(for agent: Agent) {
         let chat = defaultChat(for: agent.id) ?? makeDirectChat(with: agent, isDefault: true)
+        selectChat(chat)
+    }
+
+    func selectChat(_ chat: ChatViewModel) {
+        chat.markAllMessagesRead()
         selectedChatID = chat.id
     }
 
@@ -746,12 +776,48 @@ final class ChatStore: ObservableObject {
     }
 
     private func refreshChatActivityObservations() {
+        unreadCountsByChatID = Dictionary(uniqueKeysWithValues: chats.map {
+            ($0.id, $0.unreadCount)
+        })
         chatActivityCancellables = Dictionary(uniqueKeysWithValues: chats.map { chat in
             let cancellable = chat.objectWillChange.sink { [weak self] _ in
                 self?.objectWillChange.send()
             }
             return (chat.id, cancellable)
         })
+        chatUnreadCancellables = Dictionary(uniqueKeysWithValues: chats.map { chat in
+            let chatID = chat.id
+            let cancellable = chat.$unreadCount.sink { [weak self] count in
+                self?.setUnreadCount(count, for: chatID)
+            }
+            return (chatID, cancellable)
+        })
+        refreshTotalUnreadCount()
+    }
+
+    private func setUnreadCount(_ count: Int, for chatID: ChatViewModel.ID) {
+        let normalizedCount = max(0, count)
+        guard unreadCountsByChatID[chatID] != normalizedCount else { return }
+        unreadCountsByChatID[chatID] = normalizedCount
+        refreshTotalUnreadCount()
+    }
+
+    private func refreshTotalUnreadCount() {
+        let count = unreadCountsByChatID.values.reduce(0, +)
+        if totalUnreadCount != count {
+            totalUnreadCount = count
+        }
+    }
+
+    private func persistSelectedChatID() {
+        if let selectedChatID {
+            UserDefaults.standard.set(
+                selectedChatID.uuidString,
+                forKey: Self.selectedChatIDDefaultsKey
+            )
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.selectedChatIDDefaultsKey)
+        }
     }
 
     private func saveChanges() {
@@ -772,6 +838,7 @@ struct ChatMessage: Identifiable, Equatable {
     let authorAgentID: UUID?
     let authorName: String?
     let createdAt: Date
+    var isUnread: Bool
 
     init(
         id: UUID = UUID(),
@@ -779,7 +846,8 @@ struct ChatMessage: Identifiable, Equatable {
         text: String,
         authorAgentID: UUID? = nil,
         authorName: String? = nil,
-        createdAt: Date = .now
+        createdAt: Date = .now,
+        isUnread: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -787,6 +855,7 @@ struct ChatMessage: Identifiable, Equatable {
         self.authorAgentID = authorAgentID
         self.authorName = authorName
         self.createdAt = createdAt
+        self.isUnread = isUnread
     }
 
     init(storedMessage: StoredChatMessage, fallbackAssistantName: String? = nil) {
@@ -796,6 +865,7 @@ struct ChatMessage: Identifiable, Equatable {
         authorAgentID = storedMessage.authorAgentID
         authorName = storedMessage.authorName ?? (storedMessage.role == .assistant ? fallbackAssistantName : nil)
         createdAt = storedMessage.createdAt
+        isUnread = storedMessage.isUnread == true
     }
 }
 

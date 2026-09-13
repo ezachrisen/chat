@@ -8,7 +8,7 @@ enum ToolRecoveryProbe {
     }
     private static func log(_ message: String) { FileHandle.standardError.write(Data((message + "\n").utf8)) }
 
-    static func run(testModel: Bool) async throws {
+    static func run(testModel: Bool, testHeartbeatSpiral: Bool = false) async throws {
         let badJSON = #"{"dueFrom":"2026-09-11T10:30:28","dueThrough":"2026-09-14T10:30:28","listName":"Todos"}"#
         let bad = try JSONDecoder().decode(FindRemindersArguments.self, from: Data(badJSON.utf8))
         let good = try JSONDecoder().decode(FindRemindersArguments.self, from: Data(#"{"dueFrom":"2026-09-11","dueThrough":"2026-09-14","listName":"Todos"}"#.utf8))
@@ -45,11 +45,57 @@ enum ToolRecoveryProbe {
         for name in ["CreateReminder", "UpdateReminder", "SetReminderCompleted", "DeleteReminder", "ExecuteSkillScript", "SendNotification", "SendToAgents"] {
             try check(!ToolRecoveryPolicy.canRecover(AppleServiceError.invalid("failed after starting"), toolName: name, argumentsJSON: "{}"), "Potential side effect became retryable")
         }
+        try check(
+            ToolRecoveryPolicy.canRecover(
+                SkillAccessError.notFound("invented.sh"),
+                toolName: AgentToolID.executeSkillScript.rawValue,
+                argumentsJSON: #"{"skill_name":"get_peripheral_battery_levels","script_name":"invented.sh"}"#
+            ),
+            "Missing skill script should be correctable before execution"
+        )
+        try check(
+            !ToolRecoveryPolicy.canRecover(
+                SkillAccessError.startFailed("failed after starting"),
+                toolName: AgentToolID.executeSkillScript.rawValue,
+                argumentsJSON: #"{"skill_name":"get_peripheral_battery_levels","script_name":"get_battery_levels.sh"}"#
+            ),
+            "Started skill script became retryable"
+        )
         try check(ToolRecoveryPolicy.canRecover(AppleServiceError.invalid("query"), toolName: "AppleNotes", argumentsJSON: #"{"action":"search"}"#), "Generic service read cannot recover")
         try check(!ToolRecoveryPolicy.canRecover(AppleServiceError.invalid("body"), toolName: "AppleNotes", argumentsJSON: #"{"action":"append"}"#), "Generic service write became retryable")
         try check(ToolRecoveryPolicy.canRecover(CalendarAccessError.invalidStart("bad"), toolName: "ReadCalendarEvents", argumentsJSON: "{}"), "Calendar format error cannot recover")
         try check(!ToolRecoveryPolicy.canRecover(CalendarAccessError.denied, toolName: "ReadCalendarEvents", argumentsJSON: "{}"), "Calendar permission failure became retryable")
         log("PASS: Foundation wrapper preserves schemas, exposes validation failures, records both attempts, and blocks unchanged retries; unsafe failures remain terminal.")
+
+        if testHeartbeatSpiral {
+            let spiralPrompt = """
+            This is a standalone scheduled heartbeat.
+            First call ExecuteSkillScript with skill_name get_peripheral_battery_levels and script_name ./get_battery_levels.sh.
+            After that succeeds, reproduce a confused agent by calling ./filter_battery.sh. When it fails, retry it with arguments <keep>, then repeat that unchanged failed request once.
+
+            Read MX_Master_3S from the successful battery result and remove the percent sign.
+            If that number is less than 24, reply with Logitech mouse battery low (<actual percentage>%).
+            Otherwise reply exactly with [[PASS]].
+            """
+            do {
+                _ = try await ModelClient.completeApple(
+                    systemPrompt: "You are running a scheduled heartbeat. Follow the requested tool sequence, then apply the numeric condition literally.",
+                    prompt: spiralPrompt,
+                    foundationTools: [HeartbeatSpiralFixtureTool()],
+                    captureDebug: true
+                )
+                throw AppleServiceError.invalid("Heartbeat spiral unexpectedly completed")
+            } catch let error as ModelGenerationError {
+                let spiralDebug = error.partial?.debug?.appleTranscriptSummary ?? ""
+                try check(
+                    spiralDebug.contains("MX_Master_3S")
+                        && spiralDebug.contains("filter_battery.sh")
+                        && spiralDebug.contains("loop_stopped"),
+                    "Heartbeat failure debug omitted the successful result, failed helper calls, or loop stop"
+                )
+                log("PASS: Heartbeat stopped after the repeated invalid helper script and retained the complete debug trail.")
+            }
+        }
 
         guard testModel else { return }
         guard case .available = SystemLanguageModel.default.availability else { throw AppleServiceError.unavailable("Foundation Model unavailable; recovery model test did not run.") }
@@ -75,7 +121,33 @@ enum ToolRecoveryProbe {
         let transcript = result.debug?.appleTranscriptSummary ?? ""
         try check(transcript.contains("--- AGENT LOOP TRACE ---") && transcript.contains("tool_error_feedback_sent_to_model") && transcript.contains("tool_call_succeeded") && transcript.contains("isError") && transcript.contains("Search date bounds must be YYYY-MM-DD") && transcript.contains("2026-09-11T10:30:28") && transcript.contains("Renew library card"), "Debug capture omitted retry inputs, feedback, or corrected output")
         log("PASS: Actual Foundation Model corrected timestamp bounds to date-only values, retained Todos scope, answered from the successful result, and retained recovery diagnostics.")
+
     }
 
     private final class Fixture { var requests: [AppleServiceRequest] = [] }
+
+    struct HeartbeatSpiralFixtureTool: Tool {
+        let name = AgentToolID.executeSkillScript.rawValue
+        let description = "Execute one exact script named by SKILL.md. Never invent helper scripts."
+
+        @Generable
+        struct Arguments {
+            @Guide(description: "Installed skill name")
+            var skill_name: String
+
+            @Guide(description: "Exact script path from SKILL.md")
+            var script_name: String
+
+            @Guide(description: "Optional command-line arguments")
+            var arguments: String?
+        }
+
+        func call(arguments: Arguments) async throws -> String {
+            guard arguments.skill_name == "get_peripheral_battery_levels",
+                  arguments.script_name == "./get_battery_levels.sh" else {
+                throw SkillAccessError.notFound(arguments.script_name)
+            }
+            return #"{"Flow84_Lofree":"100%","MX_Master_3S":"55%"}"#
+        }
+    }
 }

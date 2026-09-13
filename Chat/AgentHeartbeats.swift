@@ -7,6 +7,67 @@ enum HeartbeatTargetKind: String {
     case groupChat
 }
 
+enum HeartbeatScheduleKind: String, CaseIterable, Hashable {
+    case interval
+    case specificTime
+
+    var label: String {
+        switch self {
+        case .interval:
+            return "At an interval"
+        case .specificTime:
+            return "At a specific time"
+        }
+    }
+}
+
+enum HeartbeatWeekday: Int, CaseIterable, Identifiable {
+    case sunday = 1
+    case monday
+    case tuesday
+    case wednesday
+    case thursday
+    case friday
+    case saturday
+
+    var id: Int { rawValue }
+
+    var shortLabel: String {
+        switch self {
+        case .sunday: return "S"
+        case .monday: return "M"
+        case .tuesday: return "T"
+        case .wednesday: return "W"
+        case .thursday: return "T"
+        case .friday: return "F"
+        case .saturday: return "S"
+        }
+    }
+
+    var summaryLabel: String {
+        String(accessibilityLabel.prefix(3))
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .sunday: return "Sunday"
+        case .monday: return "Monday"
+        case .tuesday: return "Tuesday"
+        case .wednesday: return "Wednesday"
+        case .thursday: return "Thursday"
+        case .friday: return "Friday"
+        case .saturday: return "Saturday"
+        }
+    }
+
+    var bit: Int { 1 << (rawValue - 1) }
+
+    static let allMask = allCases.reduce(0) { $0 | $1.bit }
+    static let weekdaysMask = [monday, tuesday, wednesday, thursday, friday]
+        .reduce(0) { $0 | $1.bit }
+    static let weekendMask = [sunday, saturday].reduce(0) { $0 | $1.bit }
+}
+
 enum HeartbeatExecutionError: LocalizedError {
     case agentMissing
     case emptyInstruction
@@ -31,6 +92,11 @@ final class AgentHeartbeat: Identifiable {
     var title: String?
     var instruction: String
     var intervalMinutes: Int
+    /// Optional schedule fields preserve compatibility with stores created
+    /// before weekday and time-of-day scheduling was introduced.
+    var scheduleKindRawValue: String?
+    var weekdayMask: Int?
+    var scheduledTimeMinutes: Int?
     var isEnabled: Bool
     var targetKindRawValue: String
     var targetChatID: UUID?
@@ -49,6 +115,9 @@ final class AgentHeartbeat: Identifiable {
         title: String? = nil,
         instruction: String = "Check whether you have anything useful to add.",
         intervalMinutes: Int = 60,
+        scheduleKind: HeartbeatScheduleKind = .interval,
+        weekdayMask: Int? = nil,
+        scheduledTimeMinutes: Int? = nil,
         isEnabled: Bool = false,
         targetKind: HeartbeatTargetKind = .privateChat,
         targetChatID: UUID? = nil,
@@ -64,6 +133,9 @@ final class AgentHeartbeat: Identifiable {
         self.title = title
         self.instruction = instruction
         self.intervalMinutes = intervalMinutes
+        scheduleKindRawValue = scheduleKind.rawValue
+        self.weekdayMask = weekdayMask
+        self.scheduledTimeMinutes = scheduledTimeMinutes
         self.isEnabled = isEnabled
         targetKindRawValue = targetKind.rawValue
         self.targetChatID = targetChatID
@@ -83,12 +155,138 @@ final class AgentHeartbeat: Identifiable {
         min(max(intervalMinutes, 1), 10_080)
     }
 
+    var scheduleKind: HeartbeatScheduleKind {
+        HeartbeatScheduleKind(rawValue: scheduleKindRawValue ?? "") ?? .interval
+    }
+
+    var normalizedWeekdayMask: Int {
+        let storedMask = weekdayMask ?? HeartbeatWeekday.allMask
+        let validMask = storedMask & HeartbeatWeekday.allMask
+        return validMask == 0 ? HeartbeatWeekday.allMask : validMask
+    }
+
+    var normalizedScheduledTimeMinutes: Int {
+        min(max(scheduledTimeMinutes ?? (17 * 60), 0), (24 * 60) - 1)
+    }
+
+    func runs(on weekday: HeartbeatWeekday) -> Bool {
+        normalizedWeekdayMask & weekday.bit != 0
+    }
+
+    func nextScheduledRun(after date: Date, calendar: Calendar = .autoupdatingCurrent) -> Date {
+        switch scheduleKind {
+        case .interval:
+            let candidate = date.addingTimeInterval(TimeInterval(normalizedIntervalMinutes * 60))
+            return nextAllowedIntervalDate(onOrAfter: candidate, calendar: calendar)
+        case .specificTime:
+            return nextSpecificTimeDate(after: date, calendar: calendar)
+        }
+    }
+
+    var scheduleDescription: String {
+        let base: String
+        switch scheduleKind {
+        case .interval:
+            base = heartbeatIntervalDescription(normalizedIntervalMinutes)
+        case .specificTime:
+            let calendar = Calendar.autoupdatingCurrent
+            let startOfDay = calendar.startOfDay(for: .now)
+            let date = calendar.date(
+                byAdding: .minute,
+                value: normalizedScheduledTimeMinutes,
+                to: startOfDay
+            ) ?? startOfDay
+            base = date.formatted(date: .omitted, time: .shortened)
+        }
+
+        let days = weekdayDescription
+        return days == "Every day" ? base : "\(base) · \(days)"
+    }
+
+    var weekdayDescription: String {
+        switch normalizedWeekdayMask {
+        case HeartbeatWeekday.allMask:
+            return "Every day"
+        case HeartbeatWeekday.weekdaysMask:
+            return "Weekdays"
+        case HeartbeatWeekday.weekendMask:
+            return "Weekends"
+        default:
+            return HeartbeatWeekday.allCases
+                .filter(runs(on:))
+                .map(\.summaryLabel)
+                .joined(separator: ", ")
+        }
+    }
+
+    private func nextAllowedIntervalDate(onOrAfter candidate: Date, calendar: Calendar) -> Date {
+        guard normalizedWeekdayMask != HeartbeatWeekday.allMask else {
+            return candidate
+        }
+
+        var eligibleDate = candidate
+        for _ in 0..<7 {
+            if let weekday = HeartbeatWeekday(rawValue: calendar.component(.weekday, from: eligibleDate)),
+               runs(on: weekday) {
+                return eligibleDate
+            }
+            guard let nextDay = calendar.date(byAdding: .day, value: 1, to: eligibleDate) else {
+                break
+            }
+            eligibleDate = nextDay
+        }
+        return candidate
+    }
+
+    private func nextSpecificTimeDate(after date: Date, calendar: Calendar) -> Date {
+        let components = DateComponents(
+            hour: normalizedScheduledTimeMinutes / 60,
+            minute: normalizedScheduledTimeMinutes % 60
+        )
+        var cursor = date
+
+        for _ in 0..<14 {
+            guard let candidate = calendar.nextDate(
+                after: cursor,
+                matching: components,
+                matchingPolicy: .nextTime,
+                repeatedTimePolicy: .first,
+                direction: .forward
+            ) else {
+                break
+            }
+            if let weekday = HeartbeatWeekday(rawValue: calendar.component(.weekday, from: candidate)),
+               runs(on: weekday) {
+                return candidate
+            }
+            cursor = candidate.addingTimeInterval(1)
+        }
+
+        return date.addingTimeInterval(24 * 60 * 60)
+    }
+
     var displayTitle: String {
         let normalizedTitle = title?
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ") ?? ""
         return normalizedTitle.isEmpty ? "Untitled heartbeat" : normalizedTitle
     }
+}
+
+private func heartbeatIntervalDescription(_ minutes: Int) -> String {
+    let minutes = min(max(minutes, 1), 10_080)
+    if minutes == 10_080 {
+        return "Every week"
+    }
+    if minutes.isMultiple(of: 1_440) {
+        let days = minutes / 1_440
+        return days == 1 ? "Every day" : "Every \(days) days"
+    }
+    if minutes.isMultiple(of: 60) {
+        let hours = minutes / 60
+        return hours == 1 ? "Every hour" : "Every \(hours) hours"
+    }
+    return minutes == 1 ? "Every minute" : "Every \(minutes) min"
 }
 
 @Model

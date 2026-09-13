@@ -4,7 +4,6 @@ import ShadSwift
 
 struct AppleServicesPreferencesView: View {
     @ObservedObject private var connections = AppleServiceConnections.shared
-    @AppStorage("appleServicesManagedMode") private var managed = false
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -34,8 +33,6 @@ struct AppleServicesPreferencesView: View {
                 Text("Messages history is separate from sending. To read local history, enable Full Disk Access for Chat, restart Chat, and enable History for the agent. Rich message content may be unavailable.").font(.callout).foregroundStyle(.secondary)
                 Button("Open Full Disk Access settings") { openPrivacy("Privacy_AllFiles") }
                 Button("Open Automation settings") { openPrivacy("Privacy_Automation") }
-                Toggle("Restrict skill scripts while using Apple services", isOn: $managed)
-                Text(managed ? "Unrestricted skill scripts are disabled for every agent and delegated task. Native service tools remain available." : "Skill scripts have broader system access. Per-agent Apple service scopes do not restrict scripts. Enabling a service turns this protection on.").font(.caption).foregroundStyle(.secondary)
                 Text("Debug logging remains available per agent when Apple Services are enabled. When it is on, saved diagnostics include Apple service requests and the bounded results returned to that agent. When it is off, native-service tool rows omit request and result content.").font(.caption).foregroundStyle(.secondary)
                 Text("Phone opens the system calling app. Call history, call control and agent voice calls are unavailable. Notes with rich formatting are protected from replacement; Mail and Messages accept files deliberately imported for the agent; other attachments remain in the Apple apps.").font(.caption).foregroundStyle(.secondary)
             }.padding(28).frame(maxWidth: 850, alignment: .leading)

@@ -14,6 +14,13 @@ struct AgentsPreferencesView: View {
     @State private var isPresentingEditor = false
     @State private var avatarEditorState = ShadAvatarEditorState()
     @State private var editingHeartbeatID: AgentHeartbeat.ID?
+    @State private var agentBeingDuplicatedID: Agent.ID?
+    @State private var duplicateAgentNameDraft = ""
+    @State private var duplicateAgentDialogIsPresented = false
+    @State private var agentPendingDeleteID: Agent.ID?
+    @State private var deleteAgentDialogIsPresented = false
+    @Query(sort: \AgentInvocationRecord.startedAt, order: .reverse)
+    private var collaborationInvocations: [AgentInvocationRecord]
     @Environment(\.shadTheme) private var theme
 
     private var editingHeartbeat: AgentHeartbeat? {
@@ -51,6 +58,12 @@ struct AgentsPreferencesView: View {
         .shadDialog(isPresented: heartbeatEditorIsPresented) {
             heartbeatEditorDialog
         }
+        .shadDialog(isPresented: $duplicateAgentDialogIsPresented) {
+            duplicateAgentDialog
+        }
+        .shadAlertDialog(isPresented: $deleteAgentDialogIsPresented) {
+            deleteAgentDialog
+        }
         .onChange(of: store.selectedAgentID) {
             editingHeartbeatID = nil
         }
@@ -60,6 +73,16 @@ struct AgentsPreferencesView: View {
                 return
             }
             self.editingHeartbeatID = nil
+        }
+        .onChange(of: store.agents.map(\.id)) {
+            if let agentBeingDuplicatedID,
+               !store.agents.contains(where: { $0.id == agentBeingDuplicatedID }) {
+                finishDuplicatingAgent()
+            }
+            if let agentPendingDeleteID,
+               !store.agents.contains(where: { $0.id == agentPendingDeleteID }) {
+                finishDeletingAgent()
+            }
         }
     }
 
@@ -97,6 +120,18 @@ struct AgentsPreferencesView: View {
                         }
                     }
                     .accessibilityLabel("Edit \(agent.displayName)")
+                    .contextMenu {
+                        Button("Duplicate…") {
+                            beginDuplicating(agent)
+                        }
+
+                        Divider()
+
+                        Button("Delete…", role: .destructive) {
+                            beginDeleting(agent)
+                        }
+                        .disabled(!canBeginDeleting(agent))
+                    }
 
                     if index < store.agents.count - 1 {
                         ShadSeparator()
@@ -168,6 +203,145 @@ struct AgentsPreferencesView: View {
             cropOffsetX: Double(photo.crop.offset.width),
             cropOffsetY: Double(photo.crop.offset.height)
         )
+    }
+
+    @ViewBuilder
+    private var duplicateAgentDialog: some View {
+        ShadDialogContent(maxWidth: 420, showsCloseButton: false) {
+            ShadDialogHeader {
+                ShadDialogTitle("Duplicate agent")
+                ShadDialogDescription(
+                    "Copy this agent's setup into a new agent. Chats, heartbeats, stash entries, and collaboration history won't be copied."
+                )
+            }
+            ShadInput(
+                "Agent name",
+                text: $duplicateAgentNameDraft,
+                onSubmit: duplicateAgent
+            )
+            .accessibilityLabel("Agent name")
+            ShadDialogFooter {
+                ShadDialogClose("Cancel") {
+                    finishDuplicatingAgent()
+                }
+                ShadButton("Duplicate", action: duplicateAgent)
+                    .disabled(duplicateAgentNameIsEmpty)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var deleteAgentDialog: some View {
+        if let agent = agentPendingDelete {
+            ShadAlertDialogContent {
+                ShadAlertDialogTitle("Delete \(agent.displayName)?")
+                ShadAlertDialogDescription(
+                    "The agent and its heartbeat schedules will be deleted. Existing messages and generation history are preserved. This cannot be undone."
+                )
+            } actions: {
+                ShadAlertDialogCancel {
+                    finishDeletingAgent()
+                }
+                ShadAlertDialogAction("Delete Agent", variant: .destructive) {
+                    confirmAgentDeletion(agent)
+                }
+            }
+        }
+    }
+
+    private var agentBeingDuplicated: Agent? {
+        agentBeingDuplicatedID.flatMap(store.agent(for:))
+    }
+
+    private var agentPendingDelete: Agent? {
+        agentPendingDeleteID.flatMap(store.agent(for:))
+    }
+
+    private var duplicateAgentNameIsEmpty: Bool {
+        duplicateAgentNameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func beginDuplicating(_ agent: Agent) {
+        agentBeingDuplicatedID = agent.id
+        duplicateAgentNameDraft = "\(agent.displayName) Copy"
+        duplicateAgentDialogIsPresented = true
+    }
+
+    private func finishDuplicatingAgent() {
+        agentBeingDuplicatedID = nil
+        duplicateAgentNameDraft = ""
+        duplicateAgentDialogIsPresented = false
+    }
+
+    private func duplicateAgent() {
+        guard !duplicateAgentNameIsEmpty,
+              let source = agentBeingDuplicated,
+              store.duplicateAgent(source, named: duplicateAgentNameDraft) != nil else {
+            return
+        }
+        finishDuplicatingAgent()
+        isPresentingEditor = true
+    }
+
+    private func canBeginDeleting(_ agent: Agent) -> Bool {
+        store.canDeleteAgent(agent) && !hasActiveWork(for: agent)
+    }
+
+    private func hasActiveWork(for agent: Agent) -> Bool {
+        let hasRunningHeartbeat = heartbeatScheduler.runningHeartbeats.contains {
+            $0.agentID == agent.id
+        }
+        let hasActiveDirectChat = chatStore.chats(for: agent.id).contains {
+            $0.isResponding || $0.isCompacting
+        }
+        let hasActiveGroupChat = chatStore.groupChats.contains { chat in
+            (chat.isResponding || chat.isCompacting)
+                && chat.groupParticipants.contains { $0.agentID == agent.id }
+        }
+        let hasActiveDelegatedWork = collaborationInvocations.contains {
+            ($0.callerAgentID == agent.id || $0.targetAgentID == agent.id)
+                && ($0.state == .queued || $0.state == .running)
+        }
+        return hasRunningHeartbeat
+            || hasActiveDirectChat
+            || hasActiveGroupChat
+            || hasActiveDelegatedWork
+    }
+
+    private func beginDeleting(_ agent: Agent) {
+        guard canBeginDeleting(agent) else { return }
+        agentPendingDeleteID = agent.id
+        deleteAgentDialogIsPresented = true
+    }
+
+    private func finishDeletingAgent() {
+        agentPendingDeleteID = nil
+        deleteAgentDialogIsPresented = false
+    }
+
+    private func confirmAgentDeletion(_ agent: Agent) {
+        guard canBeginDeleting(agent) else {
+            finishDeletingAgent()
+            return
+        }
+
+        let agentID = agent.id
+        var deactivationPlan: ChatStore.AgentDeactivationPlan?
+        guard store.removeAgent(
+            id: agentID,
+            beforeSaving: {
+                deactivationPlan = chatStore.stageAgentDeactivation(agentID)
+            }
+        ) else {
+            return
+        }
+
+        guard let deactivationPlan else { return }
+        let deletedChatWasSelected = chatStore.applyAgentDeactivation(deactivationPlan)
+        if deletedChatWasSelected, let nextAgent = store.selectedAgent {
+            chatStore.selectDefaultChat(for: nextAgent)
+        }
+        finishDeletingAgent()
     }
 
     @ViewBuilder
@@ -565,7 +739,7 @@ struct AgentEditor: View {
                 VStack(alignment: .leading, spacing: 10) {
                     ShadSettingsSectionHeader(
                         title: "Tools",
-                        description: "Off until you enable them. The agent can only call tools that are on."
+                        description: "A tool must be on here and in Settings → Tools before this agent can call it."
                     )
 
                     VStack(spacing: 0) {
@@ -573,18 +747,27 @@ struct AgentEditor: View {
                             VStack(spacing: 0) {
                                 ShadSettingsRow(
                                     title: toolID.title,
-                                    description: toolID.description
+                                    description: skillCatalog.isToolEnabled(toolID)
+                                        ? toolID.description
+                                        : "\(toolID.description) This tool is off in Settings → Tools."
                                 ) {
                                     ShadSwitch(isOn: toolEnabled(toolID))
-                                    .accessibilityLabel(toolID.title)
-                                    .disabled(selectedAgent == nil)
+                                        .accessibilityLabel(toolID.title)
+                                        .disabled(
+                                            selectedAgent == nil
+                                                || !skillCatalog.isToolEnabled(toolID)
+                                        )
                                 }
 
-                                if toolID == .appleServices, let agent = selectedAgent, agent.isToolEnabled(.appleServices) {
+                                if toolID == .appleServices,
+                                   skillCatalog.isToolEnabled(toolID),
+                                   let agent = selectedAgent,
+                                   agent.isToolEnabled(.appleServices) {
                                     AgentAppleServicesView(agent: agent)
                                 }
 
                                 if toolID == .readCalendarEvents,
+                                   skillCatalog.isToolEnabled(toolID),
                                    selectedAgent?.isToolEnabled(.readCalendarEvents) == true {
                                     ShadSeparator()
                                     calendarAccessPanel
@@ -784,7 +967,8 @@ struct AgentEditor: View {
                     VStack(spacing: 0) {
                         ShadSettingsRow(
                             title: "Debug log",
-                            description: "Store full prompts and intermediate output for chats and heartbeats, plus complete tool and delegated-agent exchanges for heartbeats. PASS runs are included, and Debug remains available with Apple Services enabled. Off by default — this is a lot of data."
+                            description: "Store full prompts and intermediate output for chats and heartbeats, plus complete tool and delegated-agent exchanges for heartbeats. PASS runs are included, and Debug remains available with Apple Services enabled. Off by default — this is a lot of data.",
+                            labelWidth: 500
                         ) {
                             ShadSwitch(isOn: debugLogEnabled)
                                 .accessibilityLabel("Debug log")
@@ -855,8 +1039,20 @@ struct AgentEditor: View {
 
                     VStack(spacing: 0) {
                         ShadSettingsRow(
+                            title: "Show in sidebar",
+                            description: "Show this agent in the chat sidebar and its New Chat menu.",
+                            labelWidth: 500
+                        ) {
+                            ShadSwitch(isOn: agentSidebarVisibility)
+                                .accessibilityLabel("Show in sidebar")
+                        }
+
+                        ShadSeparator()
+
+                        ShadSettingsRow(
                             title: store.isDefaultAgent(agent) ? "Default agent" : "Delete agent",
-                            description: deletionDescription(for: agent)
+                            description: deletionDescription(for: agent),
+                            labelWidth: 500
                         ) {
                             ShadButton("Delete Agent", variant: .outline, size: .sm, icon: .trash) {
                                 beginDeleting(agent)
@@ -869,7 +1065,7 @@ struct AgentEditor: View {
                 }
             }
         }
-        .frame(maxWidth: 720, alignment: .topLeading)
+        .frame(maxWidth: 900, alignment: .topLeading)
         .shadAlertDialog(isPresented: $deleteDialogIsPresented) {
             ShadAlertDialogContent {
                 ShadAlertDialogTitle("Delete \(agent.displayName)?")
@@ -1266,6 +1462,15 @@ struct AgentEditor: View {
             store.updateAgentDebugLog(id: agentID, enabled: newValue)
         }
     }
+
+    private var agentSidebarVisibility: Binding<Bool> {
+        Binding {
+            selectedAgent?.isVisibleInSidebar ?? true
+        } set: { isVisible in
+            guard let agentID = selectedAgent?.id else { return }
+            store.updateAgentSidebarVisibility(id: agentID, isVisible: isVisible)
+        }
+    }
 }
 
 private struct AgentHeartbeatsTab: View {
@@ -1355,17 +1560,18 @@ private struct AgentHeartbeatsTab: View {
                 .help(isRunning ? "This heartbeat cannot be changed while it is running." : "Turn this heartbeat on or off.")
             },
             ShadTableColumn(
-                "Frequency",
-                width: .fixed(120),
+                "Schedule",
+                width: .fixed(160),
                 canHide: false,
                 searchValue: nil
             ) { heartbeat in
                 HeartbeatEditCellButton(title: heartbeat.displayTitle) {
                     onEditHeartbeat(heartbeat.id)
                 } content: {
-                    Text(heartbeatFrequencyText(heartbeat.normalizedIntervalMinutes))
+                    Text(heartbeat.scheduleDescription)
                         .font(theme.font(theme.typography.sm))
                         .monospacedDigit()
+                        .lineLimit(1)
                 }
             },
             ShadTableColumn(
@@ -1401,26 +1607,52 @@ private struct AgentHeartbeatsTab: View {
             },
             ShadTableColumn(
                 "",
-                id: "delete",
+                id: "actions",
                 alignment: .trailing,
-                width: .fixed(48),
+                width: .fixed(88),
                 canHide: false,
                 searchValue: nil
             ) { heartbeat in
                 let isRunning = isHeartbeatRunning(heartbeat)
-                ShadButton(
-                    icon: .trash,
-                    variant: .destructive,
-                    size: .icon,
-                    accessibilityLabel: "Delete \(heartbeat.displayTitle)"
-                ) {
-                    deleteHeartbeat(heartbeat)
+                HStack(spacing: 4) {
+                    ShadButton(
+                        icon: .play,
+                        variant: .ghost,
+                        size: .icon,
+                        accessibilityLabel: "Run \(heartbeat.displayTitle)"
+                    ) {
+                        heartbeatScheduler.runNow(heartbeat.id)
+                    }
+                    .disabled(!heartbeatScheduler.runningHeartbeats.isEmpty)
+                    .accessibilityHint(runHeartbeatHint)
+                    .help(runHeartbeatHelp)
+
+                    ShadButton(
+                        icon: .trash,
+                        variant: .destructive,
+                        size: .icon,
+                        accessibilityLabel: "Delete \(heartbeat.displayTitle)"
+                    ) {
+                        deleteHeartbeat(heartbeat)
+                    }
+                    .disabled(isRunning)
+                    .accessibilityHint(isRunning ? "Wait for the current run to finish before deleting this heartbeat." : "Permanently deletes this heartbeat.")
+                    .help(isRunning ? "Wait for this heartbeat to finish before deleting it." : "Delete this heartbeat")
                 }
-                .disabled(isRunning)
-                .accessibilityHint(isRunning ? "Wait for the current run to finish before deleting this heartbeat." : "Permanently deletes this heartbeat.")
-                .help(isRunning ? "Wait for this heartbeat to finish before deleting it." : "Delete this heartbeat")
             },
         ]
+    }
+
+    private var runHeartbeatHint: String {
+        heartbeatScheduler.runningHeartbeats.isEmpty
+            ? "Runs this heartbeat now, even when its schedule is disabled."
+            : "Wait for the current heartbeat to finish before starting another."
+    }
+
+    private var runHeartbeatHelp: String {
+        heartbeatScheduler.runningHeartbeats.isEmpty
+            ? "Run this heartbeat now"
+            : "Wait for the current heartbeat to finish"
     }
 
     private func isHeartbeatRunning(_ heartbeat: AgentHeartbeat) -> Bool {
@@ -1579,7 +1811,7 @@ private struct HeartbeatEditorDialog: View {
             ShadDialogHeader {
                 ShadDialogTitle(heartbeat.displayTitle)
                 ShadDialogDescription(
-                    "\(heartbeatFrequencyText(heartbeat.normalizedIntervalMinutes)). Changes save automatically."
+                    "\(heartbeat.scheduleDescription). Changes save automatically."
                 )
             }
 
@@ -1592,6 +1824,15 @@ private struct HeartbeatEditorDialog: View {
             )
             .id(heartbeat.id)
         } footer: {
+            ShadButton("Run", variant: .secondary, icon: .play) {
+                heartbeatScheduler.runNow(heartbeat.id)
+            }
+            .disabled(!heartbeatScheduler.runningHeartbeats.isEmpty)
+            .help(
+                heartbeatScheduler.runningHeartbeats.isEmpty
+                    ? "Run this heartbeat now, even when disabled"
+                    : "Wait for the current heartbeat to finish"
+            )
             ShadDialogClose("Done", variant: .default)
         }
     }
@@ -1605,7 +1846,7 @@ private enum HeartbeatEditorTab: Hashable {
 
 struct AgentHeartbeatEditor: View {
     private static let executionHistoryLimit = 50
-    private static let tabPanelHeight: CGFloat = 320
+    private static let tabPanelHeight: CGFloat = 450
 
     let heartbeat: AgentHeartbeat
     @ObservedObject var store: AgentStore
@@ -1704,40 +1945,96 @@ struct AgentHeartbeatEditor: View {
 
             ShadSettingsRow(
                 title: "Schedule",
-                description: "How often this heartbeat runs."
+                description: "Run repeatedly or at a set time."
             ) {
-                HStack(spacing: theme.spacing.md) {
-                    ShadButton(
-                        icon: .minus,
-                        variant: .outline,
-                        size: .iconSM,
-                        accessibilityLabel: "Decrease interval"
-                    ) {
-                        intervalMinutes.wrappedValue = max(1, intervalMinutes.wrappedValue - 1)
-                    }
-                    .buttonRepeatBehavior(.enabled)
-                    .disabled(intervalMinutes.wrappedValue <= 1)
+                ShadSelect(
+                    selection: optionalScheduleKind,
+                    options: scheduleKindOptions,
+                    width: 300
+                )
+                .accessibilityLabel("Heartbeat schedule type")
+            }
 
-                    ShadSelect(
-                        selection: optionalIntervalMinutes,
-                        options: intervalOptions,
-                        width: 200
-                    )
-                    .accessibilityLabel("Heartbeat frequency")
-                    .accessibilityValue(heartbeatFrequencyText(heartbeat.normalizedIntervalMinutes))
+            ShadSeparator()
 
-                    ShadButton(
-                        icon: .plus,
-                        variant: .outline,
-                        size: .iconSM,
-                        accessibilityLabel: "Increase interval"
-                    ) {
-                        intervalMinutes.wrappedValue = min(10_080, intervalMinutes.wrappedValue + 1)
+            if heartbeat.scheduleKind == .interval {
+                ShadSettingsRow(
+                    title: "Interval",
+                    description: "Time between eligible runs."
+                ) {
+                    HStack(spacing: theme.spacing.md) {
+                        ShadButton(
+                            icon: .minus,
+                            variant: .outline,
+                            size: .iconSM,
+                            accessibilityLabel: "Decrease interval"
+                        ) {
+                            intervalMinutes.wrappedValue = max(1, intervalMinutes.wrappedValue - 1)
+                        }
+                        .buttonRepeatBehavior(.enabled)
+                        .disabled(intervalMinutes.wrappedValue <= 1)
+
+                        ShadSelect(
+                            selection: optionalIntervalMinutes,
+                            options: intervalOptions,
+                            width: 200
+                        )
+                        .accessibilityLabel("Heartbeat frequency")
+                        .accessibilityValue(heartbeatFrequencyText(heartbeat.normalizedIntervalMinutes))
+
+                        ShadButton(
+                            icon: .plus,
+                            variant: .outline,
+                            size: .iconSM,
+                            accessibilityLabel: "Increase interval"
+                        ) {
+                            intervalMinutes.wrappedValue = min(10_080, intervalMinutes.wrappedValue + 1)
+                        }
+                        .buttonRepeatBehavior(.enabled)
+                        .disabled(intervalMinutes.wrappedValue >= 10_080)
                     }
-                    .buttonRepeatBehavior(.enabled)
-                    .disabled(intervalMinutes.wrappedValue >= 10_080)
+                    .frame(width: 300)
                 }
-                .frame(width: 300)
+            } else {
+                ShadSettingsRow(
+                    title: "Time",
+                    description: "Local time on selected days."
+                ) {
+                    DatePicker(
+                        "Run time",
+                        selection: scheduledTime,
+                        displayedComponents: .hourAndMinute
+                    )
+                    .labelsHidden()
+                    .datePickerStyle(.field)
+                    .frame(width: 300, alignment: .trailing)
+                    .accessibilityLabel("Heartbeat run time")
+                }
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
+                title: "Days",
+                description: "Days when this heartbeat may run."
+            ) {
+                HStack(spacing: 6) {
+                    ForEach(HeartbeatWeekday.allCases) { weekday in
+                        let isSelected = heartbeat.runs(on: weekday)
+                        ShadButton(
+                            weekday.shortLabel,
+                            variant: isSelected ? .default : .outline,
+                            size: .sm,
+                            shape: .pill
+                        ) {
+                            toggle(weekday)
+                        }
+                        .frame(width: 34)
+                        .accessibilityLabel(weekday.accessibilityLabel)
+                        .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                    }
+                }
+                .frame(width: 300, alignment: .trailing)
             }
 
             ShadSeparator()
@@ -1773,7 +2070,6 @@ struct AgentHeartbeatEditor: View {
 
     private var promptTab: some View {
         ShadField {
-            ShadFieldLabel("Prompt")
             ShadFieldDescription("Tell the agent what to consider when this heartbeat runs.")
             MentionHighlightingTextArea(
                 placeholder: "Tell the agent what to consider",
@@ -1782,10 +2078,6 @@ struct AgentHeartbeatEditor: View {
             )
             .frame(height: 168)
             .accessibilityLabel("Heartbeat prompt")
-
-            Text("Known agent handles are highlighted as links. Plain @text does not trigger delegation on its own; the heartbeat agent decides whether to use its collaboration tools.")
-                .font(theme.font(theme.typography.xs))
-                .foregroundStyle(theme.colors.mutedForeground)
         }
         .padding(16)
         .frame(maxHeight: .infinity, alignment: .topLeading)
@@ -1871,6 +2163,48 @@ struct AgentHeartbeatEditor: View {
             get: { heartbeat.normalizedIntervalMinutes },
             set: { store.updateHeartbeatInterval(heartbeat, minutes: $0) }
         )
+    }
+
+    private var optionalScheduleKind: Binding<HeartbeatScheduleKind?> {
+        Binding(
+            get: { heartbeat.scheduleKind },
+            set: { scheduleKind in
+                guard let scheduleKind else { return }
+                store.updateHeartbeatScheduleKind(heartbeat, scheduleKind: scheduleKind)
+            }
+        )
+    }
+
+    private var scheduleKindOptions: [ShadSelectOption<HeartbeatScheduleKind>] {
+        HeartbeatScheduleKind.allCases.map { kind in
+            ShadSelectOption(kind.label, value: kind)
+        }
+    }
+
+    private var scheduledTime: Binding<Date> {
+        Binding(
+            get: {
+                let calendar = Calendar.autoupdatingCurrent
+                let startOfDay = calendar.startOfDay(for: .now)
+                return calendar.date(
+                    byAdding: .minute,
+                    value: heartbeat.normalizedScheduledTimeMinutes,
+                    to: startOfDay
+                ) ?? startOfDay
+            },
+            set: { date in
+                let components = Calendar.autoupdatingCurrent.dateComponents([.hour, .minute], from: date)
+                let minutes = (components.hour ?? 0) * 60 + (components.minute ?? 0)
+                store.updateHeartbeatScheduledTime(heartbeat, minutes: minutes)
+            }
+        )
+    }
+
+    private func toggle(_ weekday: HeartbeatWeekday) {
+        let currentMask = heartbeat.normalizedWeekdayMask
+        let updatedMask = currentMask ^ weekday.bit
+        guard updatedMask != 0 else { return }
+        store.updateHeartbeatWeekdayMask(heartbeat, weekdayMask: updatedMask)
     }
 
     private var optionalIntervalMinutes: Binding<Int?> {

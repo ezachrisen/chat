@@ -11,6 +11,7 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
     case appearance
     case agents
     case models
+    case tools
     case skills
     case textToSpeech
     case appleServices
@@ -25,6 +26,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return "Agents"
         case .models:
             return "Models"
+        case .tools:
+            return "Tools"
         case .skills:
             return "Skills"
         case .appleServices:
@@ -42,6 +45,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return .users
         case .models:
             return .custom("cpu")
+        case .tools:
+            return .custom("wrench.and.screwdriver")
         case .skills:
             return .custom("book")
         case .appleServices:
@@ -87,6 +92,8 @@ struct PreferencesView: View {
                     )
                 case .models:
                     ModelPreferencesView(store: localModelStore, replyFilterStore: replyFilterStore)
+                case .tools:
+                    ToolPreferencesView(catalog: skillCatalog)
                 case .skills:
                     SkillPreferencesView(catalog: skillCatalog)
                 case .appleServices:
@@ -97,8 +104,8 @@ struct PreferencesView: View {
             }
         }
         .frame(
-            minWidth: 940,
-            idealWidth: 1_080,
+            minWidth: 1_000,
+            idealWidth: 1_200,
             maxWidth: .infinity,
             minHeight: 640,
             idealHeight: 760,
@@ -111,6 +118,104 @@ struct PreferencesView: View {
                 .frame(width: 0, height: 0)
         )
 #endif
+    }
+}
+
+struct ToolPreferencesView: View {
+    @ObservedObject var catalog: SkillCatalog
+    @State private var copiedToolID: AgentToolID?
+    @Environment(\.shadTheme) private var theme
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 32) {
+                ShadSettingsPageHeader(
+                    title: "Tools",
+                    description: "Control which tools are available anywhere in Chat. Turning a tool off preserves each agent's individual selection."
+                )
+
+                VStack(spacing: 0) {
+                    ForEach(Array(AgentToolID.allCases.enumerated()), id: \.element.id) { index, toolID in
+                        toolRow(toolID)
+
+                        if index < AgentToolID.allCases.count - 1 {
+                            ShadSeparator()
+                        }
+                    }
+                }
+                .shadSettingsCard()
+            }
+            .frame(maxWidth: 800, alignment: .leading)
+            .padding(.horizontal, 40)
+            .padding(.vertical, 36)
+        }
+        .background(theme.colors.background)
+    }
+
+    private func toolRow(_ toolID: AgentToolID) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(toolID.title)
+                        .font(theme.font(theme.typography.sm, theme.typography.semibold))
+                        .foregroundStyle(theme.colors.foreground)
+
+                    Text(toolID.rawValue)
+                        .font(theme.monoFont(theme.typography.xs))
+                        .foregroundStyle(theme.colors.mutedForeground)
+                        .textSelection(.enabled)
+                }
+
+                Spacer(minLength: 12)
+
+                ShadButton(
+                    icon: copiedToolID == toolID ? .check : .copy,
+                    variant: .ghost,
+                    size: .icon,
+                    accessibilityLabel: "Copy agent instruction for \(toolID.title)"
+                ) {
+                    copyInstruction(for: toolID)
+                }
+                .help(copiedToolID == toolID ? "Copied" : "Copy agent instruction")
+
+                ShadSwitch(
+                    isOn: Binding(
+                        get: { catalog.isToolEnabled(toolID) },
+                        set: { catalog.setToolEnabled(toolID, enabled: $0) }
+                    ),
+                    size: .sm
+                )
+                .accessibilityLabel("Enable \(toolID.title) globally")
+                .accessibilityValue(catalog.isToolEnabled(toolID) ? "On" : "Off")
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Agent instruction")
+                    .font(theme.font(theme.typography.xs, theme.typography.medium))
+                    .foregroundStyle(theme.colors.mutedForeground)
+
+                Text(toolID.toolDescription)
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.foreground)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(16)
+    }
+
+    private func copyInstruction(for toolID: AgentToolID) {
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(toolID.toolDescription, forType: .string)
+#endif
+        copiedToolID = toolID
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.5))
+            if copiedToolID == toolID {
+                copiedToolID = nil
+            }
+        }
     }
 }
 
@@ -145,14 +250,14 @@ private struct PreferencesWindowConfigurator: NSViewRepresentable {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.styleMask.insert(.resizable)
-            window.minSize = NSSize(width: 940, height: 640)
+            window.minSize = NSSize(width: 1_000, height: 640)
 
             guard let visibleFrame = (window.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame else {
                 return
             }
 
             let size = NSSize(
-                width: floor(visibleFrame.width * 2 / 3),
+                width: min(1_200, floor(visibleFrame.width * 0.9)),
                 height: floor(visibleFrame.height * 2 / 3)
             )
             let origin = NSPoint(
@@ -252,15 +357,18 @@ struct ShadSettingsSectionHeader: View {
 struct ShadSettingsRow<Control: View>: View {
     let title: String
     let description: String
+    let labelWidth: CGFloat
     @ViewBuilder let control: () -> Control
 
     init(
         title: String,
         description: String,
+        labelWidth: CGFloat = 300,
         @ViewBuilder control: @escaping () -> Control
     ) {
         self.title = title
         self.description = description
+        self.labelWidth = labelWidth
         self.control = control
     }
 
@@ -269,7 +377,7 @@ struct ShadSettingsRow<Control: View>: View {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .center, spacing: 20) {
                     labels
-                        .frame(width: 240, alignment: .leading)
+                        .frame(width: labelWidth, alignment: .leading)
 
                     Spacer(minLength: 0)
 

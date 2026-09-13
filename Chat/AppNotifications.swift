@@ -1,6 +1,8 @@
 import AppKit
+import Combine
 import Foundation
-import UserNotifications
+import OSLog
+@preconcurrency import UserNotifications
 
 nonisolated enum AppNotificationError: LocalizedError {
     case emptyBody
@@ -22,6 +24,84 @@ nonisolated enum AppNotificationError: LocalizedError {
 final class ChatAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppNotifications.prepare()
+        DockBadgeController.shared.applicationDidFinishLaunching()
+    }
+}
+
+@MainActor
+final class DockBadgeController {
+    static let shared = DockBadgeController()
+    private nonisolated static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "Chat",
+        category: "DockBadge"
+    )
+
+    private var unreadCountCancellable: AnyCancellable?
+    private var latestUnreadCount = 0
+    private var didRequestBadgeAuthorization = false
+
+    private init() {}
+
+    func observe(_ chatStore: ChatStore) {
+        unreadCountCancellable = chatStore.$totalUnreadCount.sink { [weak self] count in
+            guard let self else { return }
+            latestUnreadCount = max(0, count)
+            updateDockBadgeIfReady()
+        }
+    }
+
+    func applicationDidFinishLaunching() {
+        updateDockBadge()
+    }
+
+    private func updateDockBadgeIfReady() {
+        updateDockBadge()
+    }
+
+    private func updateDockBadge() {
+        guard let application = NSApp else { return }
+        let count = latestUnreadCount
+        let dockTile = application.dockTile
+        dockTile.badgeLabel = count == 0 ? nil : String(count)
+        dockTile.display()
+
+        // Keep the notification-center badge in sync as well. On recent macOS
+        // releases this is the system-owned path that persists across Dock tile
+        // refreshes, while NSDockTile keeps the running app responsive immediately.
+        let notificationCenter = UNUserNotificationCenter.current()
+        notificationCenter.setBadgeCount(count) { error in
+            if let error {
+                Self.logger.error(
+                    "System badge update to \(count) failed: \(error.localizedDescription, privacy: .public)"
+                )
+            } else {
+                Self.logger.debug("System badge updated to \(count)")
+            }
+        }
+
+        if count > 0, !didRequestBadgeAuthorization {
+            didRequestBadgeAuthorization = true
+            notificationCenter.getNotificationSettings { settings in
+                guard settings.badgeSetting != .enabled,
+                      settings.authorizationStatus != .denied else { return }
+                notificationCenter.requestAuthorization(options: [.badge]) { granted, error in
+                    if let error {
+                        Self.logger.error(
+                            "Badge authorization request failed: \(error.localizedDescription, privacy: .public)"
+                        )
+                        return
+                    }
+                    guard granted else { return }
+                    notificationCenter.setBadgeCount(count) { retryError in
+                        if let retryError {
+                            Self.logger.error(
+                                "System badge retry to \(count) failed: \(retryError.localizedDescription, privacy: .public)"
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -62,6 +62,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     @Published private(set) var respondingAgentName: String?
     @Published private(set) var availabilityMessage = ""
     @Published private(set) var canSend = false
+    @Published private(set) var unreadCount: Int
 
     private let modelContext: ModelContext
     private let storedChat: StoredChat
@@ -71,6 +72,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private let replyFilterStore: ReplyFilterStore
     private let collaborationCoordinator: AgentCollaborationCoordinator
     private var modelStoreCancellable: AnyCancellable?
+    private var visibleUnreadMessageIDs: Set<ChatMessage.ID> = []
+    private var pendingReadTasks: [ChatMessage.ID: Task<Void, Never>] = [:]
 
     private var backend: ChatBackend {
         localModelStore.backend(for: directModelIdentifier)
@@ -91,8 +94,22 @@ final class ChatViewModel: ObservableObject, Identifiable {
         storedChat.rendersMarkdown ?? true
     }
 
+    var responseEditPatternsText: String {
+        storedChat.responseEditPatternsText ?? ""
+    }
+
+    var responseEditPatterns: [String] {
+        ReplySanitizer.patternList(from: responseEditPatternsText)
+    }
+
     func setRendersMarkdown(_ enabled: Bool) {
         storedChat.rendersMarkdown = enabled
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateResponseEditPatternsText(_ text: String) {
+        storedChat.responseEditPatternsText = text
         saveChanges()
         objectWillChange.send()
     }
@@ -141,6 +158,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         groupParticipants = storedGroupParticipants
         groupSystemInstructions = storedChat.groupSystemInstructions ?? ""
         respondingAgentName = nil
+        unreadCount = max(0, storedChat.unreadCount ?? 0)
         hasOlderMessages = storedMessages.count == ChatViewModel.messageBatchSize
         updateAvailability()
         modelStoreCancellable = localModelStore.objectWillChange.sink { [weak self] _ in
@@ -236,8 +254,11 @@ final class ChatViewModel: ObservableObject, Identifiable {
         storedChat.compactedAt = nil
         storedChat.compactedMessageCount = nil
         storedChat.updatedAt = .now
+        storedChat.unreadCount = 0
         messages = []
+        unreadCount = 0
         hasOlderMessages = false
+        stopTrackingVisibleUnreadMessages()
         saveChanges()
         objectWillChange.send()
     }
@@ -307,7 +328,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 text: "Fake message \(messageNumber)",
                 authorAgentID: role == .assistant ? groupParticipants.first?.agentID ?? agentID : nil,
                 authorName: role == .assistant ? groupParticipants.first?.agentName ?? agentName : nil,
-                createdAt: Date().addingTimeInterval(TimeInterval(offset) * 0.001)
+                createdAt: Date().addingTimeInterval(TimeInterval(offset) * 0.001),
+                isUnread: role == .assistant
             )
         }
 
@@ -316,6 +338,13 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
 
         storedChat.updatedAt = .now
+        let newUnreadCount = storedMessages.reduce(into: unreadCount) { count, message in
+            if message.isUnread == true {
+                count += 1
+            }
+        }
+        storedChat.unreadCount = newUnreadCount
+        unreadCount = newUnreadCount
         saveChanges()
         messages.append(contentsOf: storedMessages.map {
             ChatMessage(storedMessage: $0, fallbackAssistantName: isGroupChat ? nil : agentName)
@@ -368,17 +397,108 @@ final class ChatViewModel: ObservableObject, Identifiable {
             text: visibleText,
             authorAgentID: agentID,
             authorName: agentName,
-            sourceInvocationID: invocationID
+            sourceInvocationID: invocationID,
+            isUnread: true
         )
         modelContext.insert(storedMessage)
         storedChat.updatedAt = .now
+        let previousUnreadCount = unreadCount
+        unreadCount += 1
+        storedChat.unreadCount = unreadCount
         guard saveChanges() else {
             modelContext.delete(storedMessage)
             storedChat.updatedAt = previousUpdatedAt
+            unreadCount = previousUnreadCount
+            storedChat.unreadCount = previousUnreadCount
             return false
         }
         messages.append(ChatMessage(storedMessage: storedMessage))
         return true
+    }
+
+    func updateVisibleUnreadMessages(_ visibleMessageIDs: Set<ChatMessage.ID>) {
+        let unreadAssistantIDs: Set<ChatMessage.ID> = Set(messages.compactMap { message in
+            guard message.role == .assistant,
+                  message.isUnread,
+                  visibleMessageIDs.contains(message.id) else {
+                return nil
+            }
+            return message.id
+        })
+        visibleUnreadMessageIDs = unreadAssistantIDs
+
+        let noLongerVisibleIDs = pendingReadTasks.keys.filter {
+            !unreadAssistantIDs.contains($0)
+        }
+        for messageID in noLongerVisibleIDs {
+            pendingReadTasks.removeValue(forKey: messageID)?.cancel()
+        }
+
+        for messageID in unreadAssistantIDs where pendingReadTasks[messageID] == nil {
+            pendingReadTasks[messageID] = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: .seconds(5))
+                } catch {
+                    return
+                }
+                guard let self,
+                      self.visibleUnreadMessageIDs.contains(messageID) else {
+                    return
+                }
+                self.markMessageRead(messageID)
+                self.pendingReadTasks[messageID] = nil
+            }
+        }
+    }
+
+    func stopTrackingVisibleUnreadMessages() {
+        visibleUnreadMessageIDs.removeAll()
+        for task in pendingReadTasks.values {
+            task.cancel()
+        }
+        pendingReadTasks.removeAll()
+    }
+
+    func markAllMessagesRead() {
+        guard unreadCount > 0 else { return }
+
+        stopTrackingVisibleUnreadMessages()
+        for storedMessage in allStoredMessages() where storedMessage.isUnread == true {
+            storedMessage.isUnread = false
+        }
+        messages = messages.map { message in
+            var updatedMessage = message
+            updatedMessage.isUnread = false
+            return updatedMessage
+        }
+        unreadCount = 0
+        storedChat.unreadCount = 0
+        saveChanges()
+    }
+
+    private func markMessageRead(_ messageID: ChatMessage.ID) {
+        guard let index = messages.firstIndex(where: { $0.id == messageID }),
+              messages[index].role == .assistant,
+              messages[index].isUnread else {
+            return
+        }
+
+        var descriptor = FetchDescriptor<StoredChatMessage>(
+            predicate: #Predicate { message in
+                message.id == messageID
+            }
+        )
+        descriptor.fetchLimit = 1
+        guard let storedMessage = try? modelContext.fetch(descriptor).first,
+              storedMessage.isUnread == true else {
+            return
+        }
+
+        storedMessage.isUnread = false
+        messages[index].isUnread = false
+        unreadCount = max(0, unreadCount - 1)
+        storedChat.unreadCount = unreadCount
+        saveChanges()
     }
 
     func send() {
@@ -502,15 +622,11 @@ final class ChatViewModel: ObservableObject, Identifiable {
             captureCollaborationDebug: debugCaptureEnabled
         )
         let systemInstructions = ModelPrompts.heartbeatSystemInstructions(
-            agentName: agent.displayName,
-            soul: agent.soul,
-            memory: agent.memoryText,
             isGroupChat: isGroupChat,
             groupInstructions: groupSystemInstructions,
-            skillsPrompt: generation.skillsPrompt
+            skillsPrompt: generation.heartbeatPrompt
         )
         let conversationPrompt = ModelPrompts.heartbeatConversationPrompt(
-            agentName: agent.displayName,
             instruction: instruction,
             lastCompletedAt: lastCompletedAt,
             referenceDate: referenceDate
@@ -527,6 +643,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 prompt: conversationPrompt,
                 tools: generation.tools,
                 captureDebug: debugCaptureEnabled,
+                appleGreedySampling: true,
                 missingLocalModelMessage: "The selected local model is no longer configured."
             )
         } catch {
@@ -649,7 +766,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             systemPrompt: systemInstructions,
             toolsEnabled: !generation.tools.isEmpty
         )
-        let appleFoundationPrompt = ModelPrompts.directConversationPrompt(
+        let conversationPrompt = ModelPrompts.directConversationPrompt(
             agentName: resolvedAgentName,
             transcript: ModelPrompts.withDigest(
                 prepared.digestText,
@@ -660,21 +777,19 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 )
             )
         )
-        let recordedSystemPrompt: String
-        if case .openAICompatible = backend {
-            recordedSystemPrompt = systemInstructions + ModelPrompts.digestSystemSection(prepared.digestText)
-        } else {
-            recordedSystemPrompt = systemInstructions
-        }
+        let conversation = ModelConversationContext(
+            systemPrompt: systemInstructions,
+            digest: prepared.digestText,
+            messages: prepared.tail.map {
+                ChatMessage(storedMessage: $0, fallbackAssistantName: resolvedAgentName)
+            },
+            labeledPrompt: conversationPrompt
+        )
 
         do {
             let result = try await ModelClient.complete(
                 using: backend,
-                systemPrompt: recordedSystemPrompt,
-                messages: prepared.tail.map {
-                    ChatMessage(storedMessage: $0, fallbackAssistantName: resolvedAgentName)
-                },
-                appleFoundationPrompt: appleFoundationPrompt,
+                conversation: conversation,
                 tools: generation.tools,
                 captureDebug: debugCaptureEnabled,
                 missingLocalModelMessage: "This chat's local model is no longer configured. Choose a configured model for the agent and start a new chat."
@@ -697,8 +812,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 startedAt: startedAt,
                 parsedResponse: parsedResponse,
                 result: result,
-                systemPrompt: recordedSystemPrompt,
-                conversationPrompt: appleFoundationPrompt,
+                systemPrompt: systemInstructions,
+                conversationPrompt: conversationPrompt,
                 debugCaptureEnabled: debugCaptureEnabled,
                 recorder: recorder
             )
@@ -712,8 +827,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 backend: backend,
                 startedAt: startedAt,
                 error: error,
-                systemPrompt: recordedSystemPrompt,
-                conversationPrompt: appleFoundationPrompt,
+                systemPrompt: systemInstructions,
+                conversationPrompt: conversationPrompt,
                 debugCaptureEnabled: debugCaptureEnabled,
                 recorder: recorder
             )
@@ -923,12 +1038,25 @@ final class ChatViewModel: ObservableObject, Identifiable {
             wasDirectlyMentioned: wasDirectlyMentioned,
             isFollowUp: isFollowUp
         )
+        let conversation = ModelConversationContext(
+            systemPrompt: systemInstructions,
+            digest: prepared.digestText,
+            messages: groupModelMessages(
+                prepared.tail,
+                respondingAgentID: participant.agentID,
+                turnInstruction: ModelPrompts.groupTurnInstruction(
+                    agentName: participant.agentName,
+                    wasDirectlyMentioned: wasDirectlyMentioned,
+                    isFollowUp: isFollowUp
+                )
+            ),
+            labeledPrompt: conversationPrompt
+        )
 
         do {
             let result = try await ModelClient.complete(
                 using: backend,
-                systemPrompt: systemInstructions,
-                prompt: conversationPrompt,
+                conversation: conversation,
                 tools: generation.tools,
                 captureDebug: captureDebug,
                 missingLocalModelMessage: "This agent's local model is no longer configured."
@@ -949,6 +1077,69 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
     }
 
+    private func groupModelMessages(
+        _ messages: [StoredChatMessage],
+        respondingAgentID: UUID,
+        turnInstruction: String
+    ) -> [ChatMessage] {
+        var result: [ChatMessage] = []
+        for message in messages {
+            let role: ChatRole
+            let text: String
+            if message.role == .user {
+                role = .user
+                text = "User: \(message.text)"
+            } else if message.authorAgentID == respondingAgentID {
+                role = .assistant
+                text = message.text
+            } else {
+                role = .user
+                text = "\(message.authorName ?? "Agent"): \(message.text)"
+            }
+
+            if let previous = result.last, previous.role == role {
+                result.removeLast()
+                result.append(
+                    ChatMessage(
+                        id: previous.id,
+                        role: role,
+                        text: previous.text + "\n\n" + text,
+                        authorAgentID: role == .assistant ? respondingAgentID : nil,
+                        authorName: role == .assistant ? previous.authorName : nil,
+                        createdAt: previous.createdAt
+                    )
+                )
+            } else {
+                result.append(
+                    ChatMessage(
+                        id: message.id,
+                        role: role,
+                        text: text,
+                        authorAgentID: role == .assistant ? respondingAgentID : nil,
+                        authorName: role == .assistant ? message.authorName : nil,
+                        createdAt: message.createdAt
+                    )
+                )
+            }
+        }
+
+        let instruction = turnInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let latest = result.last, latest.role == .user {
+            result.removeLast()
+            result.append(
+                ChatMessage(
+                    id: latest.id,
+                    role: .user,
+                    text: latest.text + "\n\n" + instruction,
+                    createdAt: latest.createdAt
+                )
+            )
+        } else {
+            result.append(ChatMessage(role: .user, text: instruction))
+        }
+        return result
+    }
+
     private func generationSupport(
         for agent: Agent?,
         recorder: ToolCallRecorder? = nil,
@@ -956,7 +1147,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         collaborationDeadline: Date? = nil,
         collaborationRootInvocationID: UUID? = nil,
         captureCollaborationDebug: Bool = false
-    ) -> (tools: AgentToolBox, skillsPrompt: String) {
+    ) -> (tools: AgentToolBox, skillsPrompt: String, heartbeatPrompt: String) {
         let delegationRuntime = agent.map {
             collaborationCoordinator.rootRuntime(
                 for: $0,
@@ -974,10 +1165,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
             delegationRuntime: delegationRuntime,
             serviceOrigin: collaborationDeadline == nil ? .interactive : .heartbeat
         )
+        let skillDiscoveryPrompt = ModelPrompts.skillsPrompt(for: tools.runtime.skills)
         return (
             tools,
             ModelPrompts.toolsPrompt(enabledIDs: tools.enabledToolIDs)
-                + ModelPrompts.skillsPrompt(for: tools.runtime.skills)
+                + skillDiscoveryPrompt
+                + tools.collaborationPrompt,
+            ModelPrompts.heartbeatToolsPrompt(enabledIDs: tools.enabledToolIDs)
+                + skillDiscoveryPrompt
                 + tools.collaborationPrompt
         )
     }
@@ -1213,16 +1408,22 @@ final class ChatViewModel: ObservableObject, Identifiable {
         sourceInvocationID: UUID? = nil,
         save: Bool = true
     ) -> StoredChatMessage {
+        let isUnread = role == .assistant
         let storedMessage = StoredChatMessage(
             chatID: id,
             role: role,
             text: text,
             authorAgentID: authorAgentID,
             authorName: authorName,
-            sourceInvocationID: sourceInvocationID
+            sourceInvocationID: sourceInvocationID,
+            isUnread: isUnread
         )
         modelContext.insert(storedMessage)
         storedChat.updatedAt = .now
+        if isUnread {
+            unreadCount += 1
+            storedChat.unreadCount = unreadCount
+        }
         if save {
             saveChanges()
         }

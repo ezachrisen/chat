@@ -57,6 +57,8 @@ enum SessionStorageProbe {
                 writeLog("PASS \(message)")
             }
         }
+        check(ModelPrompts.isPassResponse("[[[PASS]]]"), "extra-bracket PASS sentinel is recognized")
+        check(!ModelPrompts.isPassResponse("Please pass this along"), "ordinary pass text is not a PASS sentinel")
         if usesInMemoryStore {
             await verifySyntheticPassStorageOnly(
                 container: container,
@@ -110,14 +112,8 @@ enum SessionStorageProbe {
         check: (Bool, String) -> Void
     ) async {
         let defaults = UserDefaults.standard
-        let previousManagedMode = defaults.object(forKey: "appleServicesManagedMode")
         let previousContentUsed = defaults.object(forKey: "appleServicesContentUsed")
         defer {
-            if let previousManagedMode {
-                defaults.set(previousManagedMode, forKey: "appleServicesManagedMode")
-            } else {
-                defaults.removeObject(forKey: "appleServicesManagedMode")
-            }
             if let previousContentUsed {
                 defaults.set(previousContentUsed, forKey: "appleServicesContentUsed")
             } else {

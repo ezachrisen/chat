@@ -101,7 +101,6 @@ nonisolated enum SkillFileAccess {
         arguments: String?,
         runtime: SkillRuntime
     ) async throws -> String {
-        guard !AppleServiceSecurity.managedMode else { throw AppleServiceError.unsupported("Skill scripts are disabled while managed Apple service access is enabled.") }
         let skill = try requireSkill(named: skillName, runtime: runtime)
         let scriptURL = try confinedFileURL(skillRoot: skill.directoryURL, relativePath: scriptName)
         guard FileManager.default.fileExists(atPath: scriptURL.path) else {
@@ -540,7 +539,7 @@ struct ExecuteSkillScriptTool: Tool {
         @Guide(description: "The skill name from the available skills list.")
         var skill_name: String
 
-        @Guide(description: "A script path relative to the skill folder, such as get_battery_levels.sh.")
+        @Guide(description: "The exact script path specified by SKILL.md. Never invent a script name or a helper script.")
         var script_name: String
 
         @Guide(description: "Optional extra command-line arguments as one whitespace-separated string.")

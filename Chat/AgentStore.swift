@@ -51,6 +51,46 @@ final class AgentStore: ObservableObject {
         loadAgents(selecting: agent.id)
     }
 
+    @discardableResult
+    func duplicateAgent(_ source: Agent, named name: String) -> Agent? {
+        guard let source = agent(for: source.id) else { return nil }
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedName.isEmpty else { return nil }
+
+        let duplicate = Agent(
+            name: normalizedName,
+            soul: source.soul,
+            mentionHandle: uniqueMentionHandle(for: normalizedName),
+            routingDescription: source.routingDescription,
+            memory: source.memory,
+            modelIdentifier: source.modelIdentifier,
+            voiceTriggerPhrase: source.voiceTriggerPhrase,
+            textToSpeechToolID: source.textToSpeechToolID,
+            textToSpeechVoiceName: source.textToSpeechVoiceName,
+            textToSpeechVoiceModel: source.textToSpeechVoiceModel,
+            enabledToolIDsJSON: source.enabledToolIDsJSON,
+            enabledSkillIDsJSON: source.enabledSkillIDsJSON,
+            debugLogEnabled: source.debugLogEnabled,
+            calendarAccessAll: source.calendarAccessAll,
+            allowedCalendarIDsJSON: source.allowedCalendarIDsJSON,
+            avatarImageData: source.avatarImageData,
+            avatarCropZoom: source.avatarCropZoom,
+            avatarCropOffsetX: source.avatarCropOffsetX,
+            avatarCropOffsetY: source.avatarCropOffsetY
+        )
+        duplicate.appleServiceGrantsJSON = source.appleServiceGrantsJSON
+        modelContext.insert(duplicate)
+
+        let previousSelection = selectedAgentID
+        guard saveChanges() else {
+            modelContext.rollback()
+            loadAgents(selecting: previousSelection)
+            return nil
+        }
+        loadAgents(selecting: duplicate.id)
+        return agent(for: duplicate.id)
+    }
+
     func isDefaultAgent(_ agent: Agent) -> Bool {
         defaultAgent?.id == agent.id
     }
@@ -400,6 +440,13 @@ final class AgentStore: ObservableObject {
         objectWillChange.send()
     }
 
+    func updateAgentSidebarVisibility(id: Agent.ID, isVisible: Bool) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
+        agent.hiddenFromSidebar = isVisible ? nil : true
+        saveChanges()
+        objectWillChange.send()
+    }
+
     func loadOlderHeartbeatRuns() {
         guard hasOlderHeartbeatRuns,
               !isLoadingOlderHeartbeatRuns,
@@ -577,9 +624,33 @@ final class AgentStore: ObservableObject {
 
     func updateHeartbeatInterval(_ heartbeat: AgentHeartbeat, minutes: Int) {
         heartbeat.intervalMinutes = min(max(minutes, 1), 10_080)
-        if heartbeat.isEnabled {
-            heartbeat.nextRunAt = Date().addingTimeInterval(TimeInterval(heartbeat.intervalMinutes * 60))
-        }
+        rescheduleEnabledHeartbeat(heartbeat, after: .now)
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatScheduleKind(
+        _ heartbeat: AgentHeartbeat,
+        scheduleKind: HeartbeatScheduleKind
+    ) {
+        heartbeat.scheduleKindRawValue = scheduleKind.rawValue
+        rescheduleEnabledHeartbeat(heartbeat, after: .now)
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatWeekdayMask(_ heartbeat: AgentHeartbeat, weekdayMask: Int) {
+        let validMask = weekdayMask & HeartbeatWeekday.allMask
+        guard validMask != 0 else { return }
+        heartbeat.weekdayMask = validMask
+        rescheduleEnabledHeartbeat(heartbeat, after: .now)
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateHeartbeatScheduledTime(_ heartbeat: AgentHeartbeat, minutes: Int) {
+        heartbeat.scheduledTimeMinutes = min(max(minutes, 0), (24 * 60) - 1)
+        rescheduleEnabledHeartbeat(heartbeat, after: .now)
         saveChanges()
         objectWillChange.send()
     }
@@ -587,7 +658,7 @@ final class AgentStore: ObservableObject {
     func updateHeartbeatEnabled(_ heartbeat: AgentHeartbeat, isEnabled: Bool) {
         heartbeat.isEnabled = isEnabled
         heartbeat.nextRunAt = isEnabled
-            ? Date().addingTimeInterval(TimeInterval(heartbeat.normalizedIntervalMinutes * 60))
+            ? heartbeat.nextScheduledRun(after: .now)
             : nil
         saveChanges()
         objectWillChange.send()
@@ -640,12 +711,10 @@ final class AgentStore: ObservableObject {
         guard let claimedHeartbeat = dueHeartbeats.first else { return nil }
 
         claimedHeartbeat.lastRunAt = date
-        claimedHeartbeat.nextRunAt = date.addingTimeInterval(
-            TimeInterval(claimedHeartbeat.normalizedIntervalMinutes * 60)
-        )
+        claimedHeartbeat.nextRunAt = claimedHeartbeat.nextScheduledRun(after: date)
 
         for heartbeat in dueHeartbeats.dropFirst() {
-            deferHeartbeatByInterval(heartbeat, from: date)
+            deferHeartbeatToNextSchedule(heartbeat, from: date)
         }
         saveChanges()
         objectWillChange.send()
@@ -659,7 +728,7 @@ final class AgentStore: ObservableObject {
         guard !dueHeartbeats.isEmpty else { return }
 
         for heartbeat in dueHeartbeats {
-            deferHeartbeatByInterval(heartbeat, from: date)
+            deferHeartbeatToNextSchedule(heartbeat, from: date)
         }
         saveChanges()
         objectWillChange.send()
@@ -670,7 +739,7 @@ final class AgentStore: ObservableObject {
             return
         }
 
-        deferHeartbeatByInterval(heartbeat, from: date)
+        deferHeartbeatToNextSchedule(heartbeat, from: date)
         saveChanges()
         objectWillChange.send()
     }
@@ -681,9 +750,7 @@ final class AgentStore: ObservableObject {
         }
 
         let scheduledDate = max(heartbeat.nextRunAt ?? date, date)
-        heartbeat.nextRunAt = scheduledDate.addingTimeInterval(
-            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
-        )
+        heartbeat.nextRunAt = heartbeat.nextScheduledRun(after: scheduledDate)
         saveChanges()
         objectWillChange.send()
     }
@@ -692,14 +759,16 @@ final class AgentStore: ObservableObject {
         id: AgentHeartbeat.ID,
         at date: Date
     ) -> AgentHeartbeat? {
-        guard let heartbeat = heartbeats.first(where: { $0.id == id }), heartbeat.isEnabled else {
+        guard let heartbeat = heartbeats.first(where: { $0.id == id }) else {
             return nil
         }
 
         heartbeat.lastRunAt = date
-        heartbeat.nextRunAt = date.addingTimeInterval(
-            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
-        )
+        if heartbeat.isEnabled {
+            heartbeat.nextRunAt = heartbeat.nextScheduledRun(after: date)
+        } else {
+            heartbeat.nextRunAt = nil
+        }
         saveChanges()
         objectWillChange.send()
         return heartbeat
@@ -710,9 +779,7 @@ final class AgentStore: ObservableObject {
             return
         }
 
-        heartbeat.nextRunAt = date.addingTimeInterval(
-            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
-        )
+        heartbeat.nextRunAt = heartbeat.nextScheduledRun(after: date)
         saveChanges()
         objectWillChange.send()
     }
@@ -861,10 +928,13 @@ final class AgentStore: ObservableObject {
         objectWillChange.send()
     }
 
-    private func deferHeartbeatByInterval(_ heartbeat: AgentHeartbeat, from date: Date) {
-        heartbeat.nextRunAt = date.addingTimeInterval(
-            TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
-        )
+    private func deferHeartbeatToNextSchedule(_ heartbeat: AgentHeartbeat, from date: Date) {
+        heartbeat.nextRunAt = heartbeat.nextScheduledRun(after: date)
+    }
+
+    private func rescheduleEnabledHeartbeat(_ heartbeat: AgentHeartbeat, after date: Date) {
+        guard heartbeat.isEnabled else { return }
+        heartbeat.nextRunAt = heartbeat.nextScheduledRun(after: date)
     }
 
     private func loadAgents(selecting selection: Agent.ID? = nil) {
@@ -936,7 +1006,10 @@ final class AgentStore: ObservableObject {
         }
     }
 
-    private func uniqueMentionHandle(for agentName: String, excluding agentID: Agent.ID) -> String {
+    private func uniqueMentionHandle(
+        for agentName: String,
+        excluding agentID: Agent.ID? = nil
+    ) -> String {
         let usedHandles = Set(
             agents.compactMap { agent -> String? in
                 guard agent.id != agentID,
@@ -980,9 +1053,7 @@ final class AgentStore: ObservableObject {
 
         let now = Date()
         for heartbeat in heartbeats where heartbeat.isEnabled && heartbeat.nextRunAt == nil {
-            heartbeat.nextRunAt = now.addingTimeInterval(
-                TimeInterval(heartbeat.normalizedIntervalMinutes * 60)
-            )
+            heartbeat.nextRunAt = heartbeat.nextScheduledRun(after: now)
         }
         saveChanges()
     }
@@ -1306,6 +1377,7 @@ final class Agent: Identifiable {
     var enabledToolIDsJSON: String?
     var enabledSkillIDsJSON: String?
     var debugLogEnabled: Bool?
+    var hiddenFromSidebar: Bool?
     var calendarAccessAll: Bool?
     var allowedCalendarIDsJSON: String?
     var appleServiceGrantsJSON: String?
@@ -1330,6 +1402,7 @@ final class Agent: Identifiable {
         enabledToolIDsJSON: String? = nil,
         enabledSkillIDsJSON: String? = nil,
         debugLogEnabled: Bool? = nil,
+        hiddenFromSidebar: Bool? = nil,
         calendarAccessAll: Bool? = nil,
         allowedCalendarIDsJSON: String? = nil,
         avatarImageData: Data? = nil,
@@ -1352,6 +1425,7 @@ final class Agent: Identifiable {
         self.enabledToolIDsJSON = enabledToolIDsJSON
         self.enabledSkillIDsJSON = enabledSkillIDsJSON
         self.debugLogEnabled = debugLogEnabled
+        self.hiddenFromSidebar = hiddenFromSidebar
         self.calendarAccessAll = calendarAccessAll
         self.allowedCalendarIDsJSON = allowedCalendarIDsJSON
         self.avatarImageData = avatarImageData
@@ -1373,7 +1447,6 @@ final class Agent: Identifiable {
         grants[service.rawValue] = grant
         if let data = try? JSONEncoder().encode(grants) { appleServiceGrantsJSON = String(decoding: data, as: UTF8.self) }
         if grant.enabled {
-            UserDefaults.standard.set(true, forKey: "appleServicesManagedMode")
             UserDefaults.standard.set(true, forKey: "appleServicesContentUsed")
         }
     }
@@ -1396,6 +1469,10 @@ final class Agent: Identifiable {
 
     var isDebugLogEnabled: Bool {
         debugLogEnabled == true
+    }
+
+    var isVisibleInSidebar: Bool {
+        hiddenFromSidebar != true
     }
 
     var voiceTriggerPhrases: [String] {

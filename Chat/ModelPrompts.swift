@@ -7,7 +7,6 @@ enum ModelPrompts {
         let trimmedSoul = soul.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedSoul.isEmpty ? """
         You are a concise assistant inside a simple chat app.
-        Answer conversationally, and don't feel the need to ask a follow-up question unless it's natural.
         """ : trimmedSoul
     }
 
@@ -71,6 +70,35 @@ enum ModelPrompts {
         """
     }
 
+    static func heartbeatToolsPrompt(enabledIDs: Set<String>) -> String {
+        let names = AgentToolID.allCases
+            .filter { enabledIDs.contains($0.rawValue) }
+            .map(\.rawValue)
+            .joined(separator: ", ")
+        guard !names.isEmpty else { return "" }
+
+        var instructions = """
+
+        Enabled tools: \(names).
+        Call tools using their registered schemas and exact names.
+        """
+
+        if enabledIDs.contains(AgentToolID.readSkillFile.rawValue),
+           enabledIDs.contains(AgentToolID.executeSkillScript.rawValue) {
+            instructions += """
+
+            For a skill, call ReadSkillFileTool once with skill_name and file_name = "SKILL.md". Then call ExecuteSkillScript once with the same skill_name and the exact script_name from SKILL.md.
+            """
+        }
+
+        instructions += """
+
+        After tool calls finish, return only the final output requested by the heartbeat. Do not echo intermediate data or explain the decision.
+        """
+        return instructions
+    }
+//            After ExecuteSkillScript returns data, stop using skill tools. Parse strings, remove symbols, filter results, and compare numbers yourself; do not call another tool for those operations.
+
     static func skillsPrompt(for skills: [DiscoveredSkill]) -> String {
         guard !skills.isEmpty else { return "" }
 
@@ -85,7 +113,8 @@ enum ModelPrompts {
         \(lines)
 
         To use a skill, first read SKILL.md with ReadSkillFileTool using skill_name and file_name.
-        Then run scripts with ExecuteSkillScript using skill_name, script_name, and optional arguments.
+        Then run only scripts explicitly named by SKILL.md with ExecuteSkillScript using skill_name, script_name, and optional arguments.
+        Use returned script data directly; do not invent another script to parse or transform it.
         file_name and script_name are relative to the skill folder and cannot go above it.
         """
     }
@@ -161,6 +190,26 @@ enum ModelPrompts {
         wasDirectlyMentioned: Bool,
         isFollowUp: Bool = false
     ) -> String {
+        let opportunity = groupTurnInstruction(
+            agentName: agentName,
+            wasDirectlyMentioned: wasDirectlyMentioned,
+            isFollowUp: isFollowUp
+        )
+
+        return """
+        Here is the group conversation so far:
+
+        \(transcript)
+
+        \(opportunity)
+        """
+    }
+
+    static func groupTurnInstruction(
+        agentName: String,
+        wasDirectlyMentioned: Bool,
+        isFollowUp: Bool = false
+    ) -> String {
         let emphasis = wasDirectlyMentioned
             ? "The latest user message directly mentions you. Treat it with extra emphasis and usually respond."
             : "The latest user message does not directly mention you. You may still respond if it feels natural and useful."
@@ -170,10 +219,6 @@ enum ModelPrompts {
             : emphasis
 
         return """
-        Here is the group conversation so far:
-
-        \(transcript)
-
         \(opportunity)
         Continue the discussion as \(agentName), or return [[PASS]] if you would only repeat what has already been said.
         """
@@ -215,51 +260,28 @@ enum ModelPrompts {
     }
 
     static func heartbeatSystemInstructions(
-        agentName: String,
-        soul: String,
-        memory: String,
         isGroupChat: Bool,
         groupInstructions: String,
         skillsPrompt: String = ""
     ) -> String {
-        let agentInstructions = agentSystemInstructions(
-            agentName: agentName,
-            soul: soul,
-            memory: memory,
-            skillsPrompt: skillsPrompt
-        )
+        let heartbeatContext = """
+        \(currentDateTimeSection())
+        \(skillsPrompt)
+        """
 
         guard isGroupChat else {
-            return """
-            \(agentInstructions)
-
-            You are running a scheduled heartbeat for your private chat.
-            This run is standalone. You do not have the chat transcript or prior messages.
-            Follow the heartbeat instruction, including any tool calls it requires.
-            Tool calls are not chat messages.
-            If nothing should be posted to the chat, reply with exactly [[PASS]] after you finish any required tools.
-            You may still append memory even when you pass.
-            """
+            return heartbeatContext
         }
 
         return """
-        \(agentInstructions)
+        \(heartbeatContext)
 
         Group chat system instructions:
         \(resolvedGroupInstructions(groupInstructions))
-
-        You are running a scheduled heartbeat for this group discussion.
-        This run is standalone. You do not have the chat transcript or prior messages.
-        Follow the heartbeat instruction, including any tool calls it requires.
-        Tool calls are not chat messages.
-        Do not prefix your reply with your name; the interface adds it for you.
-        If nothing should be posted to the chat, reply with exactly [[PASS]] after you finish any required tools.
-        You may still append memory even when you pass.
         """
     }
 
     static func heartbeatConversationPrompt(
-        agentName: String,
         instruction: String,
         lastCompletedAt: Date?,
         referenceDate: Date
@@ -272,15 +294,12 @@ enum ModelPrompts {
         }
 
         return """
-        This is a standalone scheduled heartbeat. You do not have the chat transcript.
+        Time since last completion: \(lastCompletionDescription).
 
-        Time since this heartbeat last completed: \(lastCompletionDescription).
-
-        Scheduled heartbeat instruction:
+        Heartbeat instruction:
         \(instruction)
 
-        Follow that instruction completely, including any tools it names.
-        Then decide whether to post as \(agentName). Return [[PASS]] if no chat message should be posted.
+        If no chat message should be posted, return exactly [[PASS]].
         """
     }
 
@@ -298,7 +317,11 @@ enum ModelPrompts {
     }
 
     static func isPassResponse(_ response: String) -> Bool {
-        ["[[pass]]", "[pass]", "pass"].contains(response.lowercased())
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unwrapped = trimmed.trimmingCharacters(
+            in: CharacterSet(charactersIn: "[]").union(.whitespacesAndNewlines)
+        )
+        return unwrapped.caseInsensitiveCompare("pass") == .orderedSame
     }
 
     static func compactElapsedTime(from date: Date, to referenceDate: Date) -> String {

@@ -7,7 +7,7 @@ import AppKit
 /// Runs without accounts, service permissions, network, or the user's persistent chat store.
 @MainActor
 enum AppleServicesProbe {
-    static var isRequested: Bool { CommandLine.arguments.contains("--apple-services-self-test") || CommandLine.arguments.contains("--apple-services-ui-snapshot") || CommandLine.arguments.contains("--reminders-model-self-test") || CommandLine.arguments.contains("--tool-recovery-self-test") || CommandLine.arguments.contains("--agent-stash-self-test") || CommandLine.arguments.contains("--agent-stash-ui-snapshot") }
+    static var isRequested: Bool { CommandLine.arguments.contains("--apple-services-self-test") || CommandLine.arguments.contains("--apple-services-ui-snapshot") || CommandLine.arguments.contains("--reminders-model-self-test") || CommandLine.arguments.contains("--tool-recovery-self-test") || CommandLine.arguments.contains("--heartbeat-spiral-self-test") || CommandLine.arguments.contains("--conversation-transcript-model-self-test") || CommandLine.arguments.contains("--agent-stash-self-test") || CommandLine.arguments.contains("--agent-stash-ui-snapshot") }
     static func run(container: ModelContainer) {
         do {
             func check(_ value: Bool, _ message: String = "Self-test invariant failed") throws {
@@ -61,6 +61,10 @@ enum AppleServicesProbe {
                 .union(AgentStashTools.allNames)
             try check(Set(tools.foundationModelTools.map(\.name)) == expected)
             try check(Set(tools.openAITools.map { $0.function.name }) == expected)
+            try runConversationContextProbe(
+                foundationTools: tools.foundationModelTools,
+                check: check
+            )
             let consultationTools = AgentToolBox.make(
                 agent: fetched,
                 catalog: catalog,
@@ -99,7 +103,13 @@ enum AppleServicesProbe {
             Task {
                 do {
                     try await ReminderToolsProbe.run(testModel: CommandLine.arguments.contains("--reminders-model-self-test"))
-                    try await ToolRecoveryProbe.run(testModel: CommandLine.arguments.contains("--tool-recovery-self-test"))
+                    try await ToolRecoveryProbe.run(
+                        testModel: CommandLine.arguments.contains("--tool-recovery-self-test"),
+                        testHeartbeatSpiral: CommandLine.arguments.contains("--heartbeat-spiral-self-test")
+                    )
+                    if CommandLine.arguments.contains("--conversation-transcript-model-self-test") {
+                        try await runConversationModelProbe()
+                    }
                     try await AgentStashProbe.run(agent: fetched, container: container)
                     FileHandle.standardError.write(Data("PASS: SwiftData grants, Calendar preservation, service tools, provider schema parity, focused Reminders tools.\n".utf8))
                     exit(0)
@@ -112,5 +122,125 @@ enum AppleServicesProbe {
             FileHandle.standardError.write(Data("FAIL: \(error.localizedDescription)\n".utf8))
             exit(1)
         }
+    }
+
+    private static func runConversationContextProbe(
+        foundationTools: [any Tool],
+        check: (Bool, String) throws -> Void
+    ) throws {
+        let greeting = ChatMessage(role: .assistant, text: "Hello")
+        let earlierUser = ChatMessage(role: .user, text: "My project is Atlas.")
+        let earlierAssistant = ChatMessage(role: .assistant, text: "Understood.")
+        let latestUser = ChatMessage(role: .user, text: "What is my project called?")
+        let conversation = ModelConversationContext(
+            systemPrompt: "SYSTEM RULES",
+            digest: "The user prefers concise answers.",
+            messages: [greeting, earlierUser, earlierAssistant, latestUser],
+            labeledPrompt: "legacy fallback"
+        )
+
+        try check(
+            conversation.messagesIncludingDigest.map(\.role) == [.user, .assistant, .user, .assistant, .user],
+            "OpenAI conversation roles were flattened or reordered"
+        )
+        try check(
+            conversation.messagesIncludingDigest.first?.text.contains("summarized") == true,
+            "OpenAI conversation omitted the compacted-history message"
+        )
+
+        guard let seed = ModelClient.appleConversationSeed(
+            conversation: conversation,
+            tools: foundationTools
+        ) else {
+            throw AppleServiceError.invalid("Apple conversation seed was not created")
+        }
+        try check(seed.prompt == latestUser.text, "Apple seed duplicated or rewrote the latest user prompt")
+
+        var kinds: [String] = []
+        var transcriptText = ""
+        var toolNames: Set<String> = []
+        for entry in seed.transcript {
+            switch entry {
+            case .instructions(let instructions):
+                kinds.append("instructions")
+                transcriptText += text(from: instructions.segments)
+                toolNames.formUnion(instructions.toolDefinitions.map(\.name))
+            case .prompt(let prompt):
+                kinds.append("prompt")
+                transcriptText += text(from: prompt.segments)
+            case .response(let response):
+                kinds.append("response")
+                transcriptText += text(from: response.segments)
+            default:
+                kinds.append("other")
+            }
+        }
+        try check(kinds == ["instructions", "prompt", "response"], "Apple transcript roles were malformed")
+        try check(transcriptText.contains("SYSTEM RULES"), "Apple transcript omitted system instructions")
+        try check(transcriptText.contains(ToolExecutionLoop.instructions), "Apple transcript omitted tool-loop instructions")
+        try check(transcriptText.contains("The user prefers concise answers."), "Apple transcript omitted compacted history")
+        try check(transcriptText.contains(earlierUser.text) && transcriptText.contains(earlierAssistant.text), "Apple transcript omitted recent turns")
+        try check(!transcriptText.contains(greeting.text), "Apple transcript retained an invalid leading assistant greeting")
+        try check(!transcriptText.contains(latestUser.text), "Apple transcript duplicated the current user prompt")
+        try check(toolNames == Set(foundationTools.map(\.name)), "Apple transcript tool definitions diverged from callable tools")
+
+        let digestOnlyConversation = ModelConversationContext(
+            systemPrompt: "SYSTEM RULES",
+            digest: "The user's project is Atlas.",
+            messages: [greeting, latestUser],
+            labeledPrompt: "legacy fallback"
+        )
+        guard let digestOnlySeed = ModelClient.appleConversationSeed(
+            conversation: digestOnlyConversation,
+            tools: []
+        ) else {
+            throw AppleServiceError.invalid("Digest-only Apple conversation seed was not created")
+        }
+        try check(
+            digestOnlySeed.prompt.contains("The user's project is Atlas.")
+                && digestOnlySeed.prompt.contains(latestUser.text),
+            "Apple seed lost digest context when no alternating history remained"
+        )
+        try check(Array(digestOnlySeed.transcript).count == 1, "Apple seed retained a leading assistant greeting")
+    }
+
+    private static func text(from segments: [Transcript.Segment]) -> String {
+        segments.compactMap { segment in
+            guard case .text(let text) = segment else { return nil }
+            return text.content
+        }
+        .joined()
+    }
+
+    private static func runConversationModelProbe() async throws {
+        guard case .available = SystemLanguageModel.default.availability else {
+            throw AppleServiceError.unavailable("Foundation Model unavailable; conversation transcript model test did not run.")
+        }
+        let conversation = ModelConversationContext(
+            systemPrompt: "Answer the user's latest question using the supplied conversation history. Be concise.",
+            digest: "",
+            messages: [
+                ChatMessage(role: .user, text: "The verification code is ALBATROSS. Remember it for my next message."),
+                ChatMessage(role: .assistant, text: "I will remember it."),
+                ChatMessage(role: .user, text: "What is the verification code? Reply with only the code.")
+            ],
+            labeledPrompt: "legacy fallback must not be used"
+        )
+        let result = try await ModelClient.complete(
+            using: .appleFoundation,
+            conversation: conversation,
+            captureDebug: true,
+            missingLocalModelMessage: "Foundation Model unavailable."
+        )
+        guard result.finalText.localizedCaseInsensitiveContains("ALBATROSS") else {
+            throw AppleServiceError.invalid("Foundation Model did not use native transcript history: \(result.finalText)")
+        }
+        let debug = result.debug?.appleTranscriptSummary ?? ""
+        guard debug.contains("The verification code is ALBATROSS")
+                && debug.contains("I will remember it.")
+                && debug.contains("What is the verification code?") else {
+            throw AppleServiceError.invalid("Conversation debug omitted native transcript turns")
+        }
+        FileHandle.standardError.write(Data("PASS: Foundation Model answered from native transcript history and debug captured every turn.\n".utf8))
     }
 }

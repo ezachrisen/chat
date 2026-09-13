@@ -84,7 +84,7 @@ enum AgentToolID: String, CaseIterable, Identifiable {
         case .readSkillFile:
             return "Read a file from an installed skill. file_name is relative to the skill folder (for example SKILL.md). Paths may not escape the skill folder."
         case .executeSkillScript:
-            return "Execute a script from an installed skill. script_name is relative to the skill folder. Optional arguments is a whitespace-separated string. The working directory is the skill folder. Paths may not escape the skill folder."
+            return "Execute one script explicitly named by an installed skill's instructions. Use the exact script_name from SKILL.md; never invent helper scripts. After the script returns data, reason over that result directly instead of calling another script to parse or transform it. script_name is relative to the skill folder. Optional arguments is a whitespace-separated string. The working directory is the skill folder. Paths may not escape the skill folder."
         case .sendNotification:
             return "Send a macOS notification. You must call this tool to notify the user; writing the message in your chat reply does not send a notification. body is required. title is optional and defaults to the agent name."
         case .appleServices:
@@ -105,9 +105,11 @@ enum AgentToolID: String, CaseIterable, Identifiable {
 final class SkillCatalog: ObservableObject {
     @Published private(set) var skills: [DiscoveredSkill] = []
     @Published private(set) var enabledSkillIDs: Set<String> = []
+    @Published private(set) var globallyEnabledToolIDs: Set<String> = []
 
     private let defaults: UserDefaults
     private static let enabledIDsKey = "enabledSkillIDs"
+    private static let enabledToolIDsKey = "enabledAgentToolIDs"
 
     var enabledSkills: [DiscoveredSkill] {
         skills.filter { enabledSkillIDs.contains($0.name) }
@@ -116,6 +118,7 @@ final class SkillCatalog: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         enabledSkillIDs = Self.loadEnabledIDs(from: defaults)
+        globallyEnabledToolIDs = Self.loadEnabledToolIDs(from: defaults)
         reload()
     }
 
@@ -177,6 +180,19 @@ final class SkillCatalog: ObservableObject {
         saveEnabledIDs()
     }
 
+    func isToolEnabled(_ toolID: AgentToolID) -> Bool {
+        globallyEnabledToolIDs.contains(toolID.rawValue)
+    }
+
+    func setToolEnabled(_ toolID: AgentToolID, enabled: Bool) {
+        if enabled {
+            globallyEnabledToolIDs.insert(toolID.rawValue)
+        } else {
+            globallyEnabledToolIDs.remove(toolID.rawValue)
+        }
+        defaults.set(globallyEnabledToolIDs.sorted(), forKey: Self.enabledToolIDsKey)
+    }
+
     func runtime(for agent: Agent?) -> SkillRuntime {
         let available = enabledSkills.filter { skill in
             agent?.isSkillEnabled(skill.name) ?? false
@@ -185,7 +201,10 @@ final class SkillCatalog: ObservableObject {
     }
 
     func enabledToolIDs(for agent: Agent?) -> Set<String> {
-        Set(AgentToolID.allCases.filter { (agent?.isToolEnabled($0) ?? false) && !($0 == .executeSkillScript && AppleServiceSecurity.managedMode) }.map(\.rawValue))
+        Set(AgentToolID.allCases.filter {
+            globallyEnabledToolIDs.contains($0.rawValue)
+                && (agent?.isToolEnabled($0) ?? false)
+        }.map(\.rawValue))
     }
 
     private func saveEnabledIDs() {
@@ -195,6 +214,15 @@ final class SkillCatalog: ObservableObject {
 
     private static func loadEnabledIDs(from defaults: UserDefaults) -> Set<String> {
         Set(defaults.stringArray(forKey: enabledIDsKey) ?? [])
+    }
+
+    private static func loadEnabledToolIDs(from defaults: UserDefaults) -> Set<String> {
+        let knownIDs = Set(AgentToolID.allCases.map(\.rawValue))
+        guard defaults.object(forKey: enabledToolIDsKey) != nil else {
+            return knownIDs
+        }
+        return Set(defaults.stringArray(forKey: enabledToolIDsKey) ?? [])
+            .intersection(knownIDs)
     }
 
     private static func skillMarkdownURL(in directory: URL) -> URL? {
