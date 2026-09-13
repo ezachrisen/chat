@@ -45,6 +45,7 @@ nonisolated struct ChatGPTProviderConfiguration: Sendable, Equatable {
 }
 
 nonisolated enum ChatGPTProviderError: LocalizedError {
+    case subscriptionNotEnabled
     case executableNotFound
     case invalidExecutable(String)
     case processLaunchFailed(String)
@@ -64,6 +65,8 @@ nonisolated enum ChatGPTProviderError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .subscriptionNotEnabled:
+            return "Turn on ChatGPT subscription access in Settings → Models before using it."
         case .executableNotFound:
             return "Codex was not found. Install the ChatGPT app or Codex CLI, or set its executable path in Settings → Models."
         case .invalidExecutable(let path):

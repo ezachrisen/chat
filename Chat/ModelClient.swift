@@ -127,6 +127,8 @@ enum ModelClient {
                 tools: tools,
                 captureDebug: captureDebug
             )
+        case .disabledChatGPTProvider:
+            throw ChatGPTProviderError.subscriptionNotEnabled
         case .missingChatGPTProvider:
             throw ChatGPTProviderError.executableNotFound
         case .missingLocalModel:
@@ -162,6 +164,8 @@ enum ModelClient {
                 tools: tools,
                 captureDebug: captureDebug
             )
+        case .disabledChatGPTProvider:
+            throw ChatGPTProviderError.subscriptionNotEnabled
         case .missingChatGPTProvider:
             throw ChatGPTProviderError.executableNotFound
         case .missingLocalModel:
@@ -410,6 +414,8 @@ enum ModelClient {
             return (true, "\(configuration.name) is ready.")
         case .missingChatGPTProvider:
             return (false, "Install the ChatGPT app or Codex CLI, then connect ChatGPT in Settings → Models.")
+        case .disabledChatGPTProvider:
+            return (false, "Turn on ChatGPT subscription access in Settings → Models to use this model.")
         case .missingLocalModel:
             return (false, "This chat's local model is no longer configured.")
         case .appleFoundation:

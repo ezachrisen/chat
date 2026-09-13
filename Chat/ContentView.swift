@@ -67,7 +67,7 @@ struct ChatApp: App {
                 } || chatStore.chats.contains {
                     $0.usesChatGPTModel
                 }
-                if usesChatGPT {
+                if usesChatGPT && localModelStore.chatGPTSubscriptionEnabled {
                     Task { @MainActor in
                         await localModelStore.refreshChatGPT()
                     }
@@ -87,6 +87,7 @@ struct ChatApp: App {
             )
                 .modelContainer(modelContainer)
                 .shadTheme(ChatShadTheme.theme)
+                .background(MainWindowFramePersistenceView())
         }
         .commands {
 #if os(macOS)
@@ -833,6 +834,8 @@ struct ChatDetailView: View {
     @State private var voiceObservedMessageIDs: Set<ChatMessage.ID> = []
     @State private var responseEditIsPresented = false
     @State private var responseEditDraft = ""
+    @State private var groupInstructionsIsPresented = false
+    @State private var groupInstructionsDraft = ""
     @Environment(\.shadTheme) private var theme
     @Environment(\.scenePhase) private var scenePhase
 
@@ -844,10 +847,8 @@ struct ChatDetailView: View {
                 ShadMessageScroller {
                     ShadMessageScrollerViewport {
                         ShadMessageScrollerContent(ids: transcriptRowIDs, spacing: theme.spacing.lg) {
-                            modelStatus
-
-                            if chat.isGroupChat {
-                                GroupChatConfigurationView(chat: chat)
+                            if !chat.isGroupChat {
+                                modelStatus
                             }
 
                             if chat.isGroupChat, chat.messages.isEmpty {
@@ -1017,6 +1018,32 @@ struct ChatDetailView: View {
                 }
             }
         }
+        .shadDialog(isPresented: $groupInstructionsIsPresented) {
+            ShadDialogContent(maxWidth: 560, showsCloseButton: false) {
+                ShadDialogHeader {
+                    ShadDialogTitle("Group Instructions")
+                    ShadDialogDescription(
+                        "These instructions are sent with each participant's individual instructions."
+                    )
+                }
+
+                ShadTextarea(
+                    "Instructions for every participant",
+                    text: $groupInstructionsDraft,
+                    minHeight: 140,
+                    maxHeight: 320
+                )
+                .accessibilityLabel("Group instructions")
+
+                ShadDialogFooter {
+                    ShadDialogClose("Cancel")
+                    ShadButton("Save") {
+                        chat.updateGroupSystemInstructions(groupInstructionsDraft)
+                        groupInstructionsIsPresented = false
+                    }
+                }
+            }
+        }
         .onDisappear {
             chat.stopTrackingVisibleUnreadMessages()
             stopVoiceModes()
@@ -1056,6 +1083,13 @@ struct ChatDetailView: View {
             ShadDropdownMenuItem("Response Edit…", icon: .custom("text.badge.minus")) {
                 responseEditDraft = chat.responseEditPatternsText
                 responseEditIsPresented = true
+            }
+
+            if chat.isGroupChat {
+                ShadDropdownMenuItem("Group Instructions…", icon: .users) {
+                    groupInstructionsDraft = chat.groupSystemInstructions
+                    groupInstructionsIsPresented = true
+                }
             }
 
             ShadDropdownMenuSeparator()
@@ -1627,44 +1661,27 @@ struct MessageBubble: View {
             } else if message.role == .assistant {
                 ShadMessage(align: .start, spacing: theme.spacing.sm) {
                     ShadMessageContent {
-                        HStack(alignment: .top, spacing: theme.spacing.sm) {
-                            if isGroupChat {
-                                if let groupAuthorAgent {
-                                    AgentAvatar(agent: groupAuthorAgent, size: 28)
-                                } else {
-                                    ShadAvatar(fallback: authorInitials, customSize: 28)
-                                        .accessibilityHidden(true)
-                                }
+                        if isGroupChat {
+                            if let authorName = message.authorName {
+                                Text(authorName)
+                                    .font(theme.font(
+                                        theme.typography.xs,
+                                        theme.typography.regular
+                                    ))
+                                    .foregroundStyle(theme.colors.mutedForeground)
+                                    .padding(.leading, 28 + theme.spacing.sm + 12)
                             }
 
-                            VStack(alignment: .leading, spacing: theme.spacing.sm) {
-                                if let authorName = message.authorName {
-                                    if isGroupChat {
-                                        Text(authorName)
-                                            .font(theme.font(
-                                                theme.typography.xs,
-                                                theme.typography.regular
-                                            ))
-                                            .foregroundStyle(theme.colors.mutedForeground)
-                                    } else {
-                                        ShadMessageHeader(authorName)
-                                    }
-                                }
-
-                                HStack(alignment: .bottom, spacing: theme.spacing.sm) {
-                                    bubble
-                                    audioControls
-                                }
-
-                                if playingAudioChunkIndex != nil {
-                                    AudioPlaybackTimeline(
-                                        currentTime: playbackCurrentTime,
-                                        duration: playbackDuration,
-                                        onSeek: onSeekAudio
-                                    )
-                                    .frame(maxWidth: 340)
-                                }
+                            HStack(alignment: .top, spacing: theme.spacing.sm) {
+                                groupAuthorAvatar
+                                bubbleAndPlayback
                             }
+                        } else {
+                            if let authorName = message.authorName {
+                                ShadMessageHeader(authorName)
+                            }
+
+                            bubbleAndPlayback
                         }
                     }
                 }
@@ -1685,6 +1702,35 @@ struct MessageBubble: View {
         }
         .task(id: message.id) {
             loadGenerationTurn()
+        }
+    }
+
+    private var groupAuthorAvatar: some View {
+        Group {
+            if let groupAuthorAgent {
+                AgentAvatar(agent: groupAuthorAgent, size: 28)
+            } else {
+                ShadAvatar(fallback: authorInitials, customSize: 28)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private var bubbleAndPlayback: some View {
+        VStack(alignment: .leading, spacing: theme.spacing.sm) {
+            HStack(alignment: .bottom, spacing: theme.spacing.sm) {
+                bubble
+                audioControls
+            }
+
+            if playingAudioChunkIndex != nil {
+                AudioPlaybackTimeline(
+                    currentTime: playbackCurrentTime,
+                    duration: playbackDuration,
+                    onSeek: onSeekAudio
+                )
+                .frame(maxWidth: 340)
+            }
         }
     }
 
@@ -1853,92 +1899,6 @@ struct VoiceGenerationIndicator: View {
             .help("Cancel remaining audio generation")
             .accessibilityLabel("Cancel audio generation")
         }
-    }
-}
-
-struct GroupChatConfigurationView: View {
-    @ObservedObject var chat: ChatViewModel
-    @State private var instructionsAreExpanded = false
-    @Environment(\.shadTheme) private var theme
-
-    var body: some View {
-        ShadCard(size: .sm) {
-            ShadCardHeader {
-                HStack(spacing: theme.spacing.md) {
-                    ShadIconView(.users, size: theme.typography.sm)
-                        .foregroundStyle(theme.colors.primary)
-                    ShadCardTitle("Participants")
-
-                    if chat.groupParticipantMentions.isEmpty {
-                        ShadCardDescription("Add one with an @mention")
-                    } else {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: theme.spacing.sm) {
-                                ForEach(chat.groupParticipantMentions, id: \.self) { mention in
-                                    ShadBadge(
-                                        mention,
-                                        variant: .secondary,
-                                        color: .blue
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    Spacer(minLength: 0)
-                }
-            }
-
-            ShadCardContent {
-                VStack(alignment: .leading, spacing: theme.spacing.md) {
-                    ShadButton(
-                        variant: .ghost,
-                        size: .sm,
-                        fillsWidth: true
-                    ) {
-                        withAnimation(theme.interactionAnimation) {
-                            instructionsAreExpanded.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: theme.spacing.sm) {
-                            Text("Group instructions")
-                            Spacer(minLength: 0)
-                            ShadIconView(.chevronDown, size: theme.typography.xs)
-                                .rotationEffect(.degrees(instructionsAreExpanded ? 0 : -90))
-                        }
-                    }
-                    .accessibilityValue(instructionsAreExpanded ? "Expanded" : "Collapsed")
-                    .accessibilityHint(
-                        instructionsAreExpanded
-                            ? "Collapse group instructions"
-                            : "Expand group instructions"
-                    )
-
-                    if instructionsAreExpanded {
-                        ShadField {
-                            ShadTextarea(
-                                "Instructions for every participant",
-                                text: groupInstructions,
-                                minHeight: 72,
-                                maxHeight: 120
-                            )
-                            .accessibilityLabel("Group instructions")
-                            ShadFieldDescription(
-                                "These instructions are sent with each agent's individual instructions."
-                            )
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-                }
-            }
-        }
-    }
-
-    private var groupInstructions: Binding<String> {
-        Binding(
-            get: { chat.groupSystemInstructions },
-            set: { chat.updateGroupSystemInstructions($0) }
-        )
     }
 }
 

@@ -686,6 +686,17 @@ private struct ChatGPTSubscriptionModelEditor: View {
             ShadSeparator()
 
             ShadSettingsRow(
+                title: "Use ChatGPT subscription",
+                description: "Off by default. Turn this on to allow Chat to use models included with your ChatGPT plan."
+            ) {
+                ShadSwitch(isOn: chatGPTSubscriptionEnabled, size: .sm)
+                    .accessibilityLabel("Use ChatGPT subscription")
+                    .accessibilityValue(store.chatGPTSubscriptionEnabled ? "On" : "Off")
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
                 title: "Subscription access",
                 description: "Uses Codex-managed ChatGPT sign-in and your plan limits. Chat never reads or stores your account tokens."
             ) {
@@ -722,7 +733,7 @@ private struct ChatGPTSubscriptionModelEditor: View {
                     )
                     .frame(width: 270)
                     .accessibilityLabel("Codex executable path")
-                    .disabled(store.chatGPTConnectionState.isBusy)
+                    .disabled(!store.chatGPTSubscriptionEnabled || store.chatGPTConnectionState.isBusy)
 
                     ShadButton(
                         icon: .refresh,
@@ -733,7 +744,7 @@ private struct ChatGPTSubscriptionModelEditor: View {
                     ) {
                         refresh()
                     }
-                    .disabled(store.chatGPTConnectionState.isBusy)
+                    .disabled(!store.chatGPTSubscriptionEnabled || store.chatGPTConnectionState.isBusy)
                 }
             }
 
@@ -754,40 +765,58 @@ private struct ChatGPTSubscriptionModelEditor: View {
         }
         .shadSettingsCard()
         .task {
-            await store.refreshChatGPT()
+            if store.chatGPTSubscriptionEnabled {
+                await store.refreshChatGPT()
+            }
         }
         .accessibilityIdentifier("chatgpt-provider-card")
     }
 
     @ViewBuilder
     private var actionButton: some View {
-        switch store.chatGPTConnectionState {
-        case .connected:
-            ShadButton(
-                "Refresh",
-                variant: .outline,
-                size: .sm,
-                icon: .refresh,
-                isLoading: store.chatGPTConnectionState.isBusy
-            ) {
-                refresh()
+        if !store.chatGPTSubscriptionEnabled {
+            ShadBadge("Off", variant: .secondary)
+        } else {
+            switch store.chatGPTConnectionState {
+            case .connected:
+                ShadButton(
+                    "Refresh",
+                    variant: .outline,
+                    size: .sm,
+                    icon: .refresh,
+                    isLoading: store.chatGPTConnectionState.isBusy
+                ) {
+                    refresh()
+                }
+                .disabled(store.chatGPTConnectionState.isBusy)
+                .accessibilityIdentifier("chatgpt-provider-refresh")
+            case .checking:
+                ShadButton("Checking", variant: .outline, size: .sm, isLoading: true) {}
+                    .disabled(true)
+            case .connecting:
+                ShadButton("Connecting", variant: .outline, size: .sm, isLoading: true) {}
+                    .disabled(true)
+            default:
+                ShadButton("Connect ChatGPT", size: .sm) {
+                    Task {
+                        await store.connectChatGPT()
+                    }
+                }
+                .accessibilityIdentifier("chatgpt-provider-connect")
             }
-            .disabled(store.chatGPTConnectionState.isBusy)
-            .accessibilityIdentifier("chatgpt-provider-refresh")
-        case .checking:
-            ShadButton("Checking", variant: .outline, size: .sm, isLoading: true) {}
-                .disabled(true)
-        case .connecting:
-            ShadButton("Connecting", variant: .outline, size: .sm, isLoading: true) {}
-                .disabled(true)
-        default:
-            ShadButton("Connect ChatGPT", size: .sm) {
-                Task {
-                    await store.connectChatGPT()
+        }
+    }
+
+    private var chatGPTSubscriptionEnabled: Binding<Bool> {
+        Binding(
+            get: { store.chatGPTSubscriptionEnabled },
+            set: { enabled in
+                store.setChatGPTSubscriptionEnabled(enabled)
+                if enabled {
+                    refresh()
                 }
             }
-            .accessibilityIdentifier("chatgpt-provider-connect")
-        }
+        )
     }
 
     private var executablePath: Binding<String> {
@@ -798,6 +827,9 @@ private struct ChatGPTSubscriptionModelEditor: View {
     }
 
     private var statusText: String {
+        guard store.chatGPTSubscriptionEnabled else {
+            return "Off until you opt in"
+        }
         switch store.chatGPTConnectionState {
         case .idle:
             return "Ready to check your Codex sign-in"
@@ -817,6 +849,9 @@ private struct ChatGPTSubscriptionModelEditor: View {
     }
 
     private var statusColor: Color {
+        guard store.chatGPTSubscriptionEnabled else {
+            return theme.colors.mutedForeground
+        }
         switch store.chatGPTConnectionState {
         case .connected:
             return theme.colors.success
@@ -828,6 +863,9 @@ private struct ChatGPTSubscriptionModelEditor: View {
     }
 
     private var accountSummary: String {
+        guard store.chatGPTSubscriptionEnabled else {
+            return "Off"
+        }
         switch store.chatGPTConnectionState {
         case .connected(let account):
             return account.planType.map(prettyPlanName) ?? "ChatGPT"
@@ -839,6 +877,9 @@ private struct ChatGPTSubscriptionModelEditor: View {
     }
 
     private var modelSummary: String {
+        guard store.chatGPTSubscriptionEnabled else {
+            return "Off"
+        }
         guard !store.chatGPTModels.isEmpty else {
             return "Connect to load models"
         }

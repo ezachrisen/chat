@@ -151,6 +151,7 @@ nonisolated enum ChatBackend: Sendable, Equatable {
     case appleFoundation
     case chatGPT(ChatGPTProviderConfiguration)
     case openAICompatible(LocalModelConfiguration)
+    case disabledChatGPTProvider
     case missingChatGPTProvider
     case missingLocalModel
 
@@ -162,6 +163,8 @@ nonisolated enum ChatBackend: Sendable, Equatable {
             return configuration.displayName
         case .openAICompatible(let configuration):
             return configuration.name
+        case .disabledChatGPTProvider:
+            return "ChatGPT subscription (off)"
         case .missingChatGPTProvider:
             return "ChatGPT"
         case .missingLocalModel:
@@ -177,6 +180,8 @@ nonisolated enum ChatBackend: Sendable, Equatable {
             return "chatGPTSubscription"
         case .openAICompatible:
             return "openAICompatible"
+        case .disabledChatGPTProvider:
+            return "disabledChatGPTProvider"
         case .missingChatGPTProvider:
             return "missingChatGPTProvider"
         case .missingLocalModel:
@@ -243,16 +248,21 @@ final class LocalModelStore: ObservableObject {
     @Published private(set) var localModels: [LocalModel] = []
     @Published private(set) var chatGPTModels: [ChatGPTModelDescriptor]
     @Published private(set) var chatGPTConnectionState: ChatGPTConnectionState = .idle
+    @Published private(set) var chatGPTSubscriptionEnabled: Bool
     @Published private(set) var configuredCodexExecutablePath: String
     @Published private(set) var resolvedCodexExecutableURL: URL?
     let modelConfigurationWillChange = PassthroughSubject<ChatModelConfigurationScope, Never>()
 
     private let modelContext: ModelContext
+    private static let chatGPTSubscriptionEnabledDefaultsKey = "chatgptProvider.subscriptionEnabled"
     private static let codexExecutablePathDefaultsKey = "chatgptProvider.codexExecutablePath"
     private var chatGPTOperationID = UUID()
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
+        chatGPTSubscriptionEnabled = UserDefaults.standard.bool(
+            forKey: Self.chatGPTSubscriptionEnabledDefaultsKey
+        )
         configuredCodexExecutablePath = UserDefaults.standard.string(
             forKey: Self.codexExecutablePathDefaultsKey
         ) ?? ""
@@ -344,18 +354,22 @@ final class LocalModelStore: ObservableObject {
             ChatModelSelection(
                 identifier: ChatModelIdentifier.appleFoundation,
                 displayName: "Apple Foundation Model"
-            ),
-            ChatModelSelection(
-                identifier: ChatModelIdentifier.chatGPTDefault,
-                displayName: "ChatGPT (recommended model)"
             )
         ]
-        selections.append(contentsOf: chatGPTModels.map { model in
-            ChatModelSelection(
-                identifier: ChatModelIdentifier.chatGPTModelID(model.id),
-                displayName: "ChatGPT · \(model.displayName)"
+        if chatGPTSubscriptionEnabled {
+            selections.append(
+                ChatModelSelection(
+                    identifier: ChatModelIdentifier.chatGPTDefault,
+                    displayName: "ChatGPT (recommended model)"
+                )
             )
-        })
+            selections.append(contentsOf: chatGPTModels.map { model in
+                ChatModelSelection(
+                    identifier: ChatModelIdentifier.chatGPTModelID(model.id),
+                    displayName: "ChatGPT · \(model.displayName)"
+                )
+            })
+        }
         selections.append(contentsOf: localModels.map { model in
             ChatModelSelection(
                 identifier: ChatModelIdentifier.localModelID(model.id),
@@ -366,11 +380,25 @@ final class LocalModelStore: ObservableObject {
     }
 
     func isConfiguredModelIdentifier(_ identifier: String) -> Bool {
-        if identifier == ChatModelIdentifier.appleFoundation || ChatModelIdentifier.isChatGPT(identifier) {
+        if identifier == ChatModelIdentifier.appleFoundation {
             return true
+        }
+        if ChatModelIdentifier.isChatGPT(identifier) {
+            return chatGPTSubscriptionEnabled
         }
         return localModels.contains {
             ChatModelIdentifier.localModelID($0.id) == identifier
+        }
+    }
+
+    func setChatGPTSubscriptionEnabled(_ enabled: Bool) {
+        guard chatGPTSubscriptionEnabled != enabled else { return }
+        modelConfigurationWillChange.send(.chatGPT)
+        chatGPTOperationID = UUID()
+        chatGPTSubscriptionEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.chatGPTSubscriptionEnabledDefaultsKey)
+        if !enabled {
+            chatGPTConnectionState = .idle
         }
     }
 
@@ -391,6 +419,7 @@ final class LocalModelStore: ObservableObject {
     }
 
     func refreshChatGPT() async {
+        guard chatGPTSubscriptionEnabled else { return }
         guard !chatGPTConnectionState.isBusy else { return }
         modelConfigurationWillChange.send(.chatGPT)
         let operationID = UUID()
@@ -420,6 +449,7 @@ final class LocalModelStore: ObservableObject {
     }
 
     func connectChatGPT() async {
+        guard chatGPTSubscriptionEnabled else { return }
         guard !chatGPTConnectionState.isBusy else { return }
         modelConfigurationWillChange.send(.chatGPT)
         let operationID = UUID()
@@ -476,6 +506,9 @@ final class LocalModelStore: ObservableObject {
         }
 
         if ChatModelIdentifier.isChatGPT(selectedIdentifier) {
+            guard chatGPTSubscriptionEnabled else {
+                return .disabledChatGPTProvider
+            }
             guard let executableURL = resolvedCodexExecutableURL
                 ?? CodexExecutableResolver.resolve(configuredPath: configuredCodexExecutablePath) else {
                 return .missingChatGPTProvider

@@ -64,7 +64,7 @@ enum ConversationCompaction {
             return configuration.contextTokenLimit
         case .openAICompatible(let configuration):
             return configuration.contextTokenLimit
-        case .missingChatGPTProvider:
+        case .disabledChatGPTProvider, .missingChatGPTProvider:
             return chatGPTDefaultContextTokens
         case .missingLocalModel:
             return localModelDefaultContextTokens
