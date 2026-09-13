@@ -1627,16 +1627,6 @@ struct MessageBubble: View {
             } else if message.role == .assistant {
                 ShadMessage(align: .start, spacing: theme.spacing.sm) {
                     ShadMessageContent {
-                        if let authorName = message.authorName {
-                            if isGroupChat {
-                                Text(authorName)
-                                    .font(theme.font(theme.typography.sm, theme.typography.regular))
-                                    .foregroundStyle(theme.colors.mutedForeground)
-                            } else {
-                                ShadMessageHeader(authorName)
-                            }
-                        }
-
                         HStack(alignment: .top, spacing: theme.spacing.sm) {
                             if isGroupChat {
                                 if let groupAuthorAgent {
@@ -1648,6 +1638,19 @@ struct MessageBubble: View {
                             }
 
                             VStack(alignment: .leading, spacing: theme.spacing.sm) {
+                                if let authorName = message.authorName {
+                                    if isGroupChat {
+                                        Text(authorName)
+                                            .font(theme.font(
+                                                theme.typography.xs,
+                                                theme.typography.regular
+                                            ))
+                                            .foregroundStyle(theme.colors.mutedForeground)
+                                    } else {
+                                        ShadMessageHeader(authorName)
+                                    }
+                                }
+
                                 HStack(alignment: .bottom, spacing: theme.spacing.sm) {
                                     bubble
                                     audioControls
