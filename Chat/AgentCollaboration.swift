@@ -1156,6 +1156,7 @@ final class AgentCollaborationCoordinator {
                 delegationRuntime: childRuntime,
                 allowedToolIDs: allowedToolIDs,
                 authorization: authorization,
+                agentStore: agentStore,
                 serviceOrigin: childContext.isBackground
                     ? (mode == .consult ? .backgroundConsultation : .backgroundDelegated)
                     : (mode == .consult ? .consultation : .delegated)
@@ -1586,6 +1587,7 @@ final class AgentCollaborationCoordinator {
             delegationRuntime: childRuntime,
             allowedToolIDs: allowedToolIDs,
             authorization: authorization,
+            agentStore: agentStore,
             serviceOrigin: accepted.context.isBackground
                 ? (accepted.mode == .consult ? .backgroundConsultation : .backgroundDelegated)
                 : (accepted.mode == .consult ? .consultation : .delegated)

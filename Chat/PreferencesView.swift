@@ -123,8 +123,13 @@ struct PreferencesView: View {
 
 struct ToolPreferencesView: View {
     @ObservedObject var catalog: SkillCatalog
-    @State private var copiedToolID: AgentToolID?
+    @State private var copiedTarget: CopyTarget?
     @Environment(\.shadTheme) private var theme
+
+    private enum CopyTarget: Equatable {
+        case name(String)
+        case instruction(AgentToolID)
+    }
 
     var body: some View {
         ScrollView {
@@ -155,28 +160,38 @@ struct ToolPreferencesView: View {
     private func toolRow(_ toolID: AgentToolID) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text(toolID.title)
                         .font(theme.font(theme.typography.sm, theme.typography.semibold))
                         .foregroundStyle(theme.colors.foreground)
 
-                    Text(toolID.rawValue)
-                        .font(theme.monoFont(theme.typography.xs))
-                        .foregroundStyle(theme.colors.mutedForeground)
-                        .textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(toolID.agentFacingToolNames.count == 1 ? "Tool name" : "Tool names")
+                            .font(theme.font(theme.typography.xs, theme.typography.medium))
+                            .foregroundStyle(theme.colors.mutedForeground)
+
+                        ForEach(toolID.agentFacingToolNames, id: \.self) { toolName in
+                            HStack(spacing: 4) {
+                                Text(toolName)
+                                    .font(theme.monoFont(theme.typography.xs))
+                                    .foregroundStyle(theme.colors.foreground)
+                                    .textSelection(.enabled)
+
+                                ShadButton(
+                                    icon: copiedTarget == .name(toolName) ? .check : .copy,
+                                    variant: .ghost,
+                                    size: .iconSM,
+                                    accessibilityLabel: "Copy tool name \(toolName)"
+                                ) {
+                                    copy(toolName, target: .name(toolName))
+                                }
+                                .help(copiedTarget == .name(toolName) ? "Copied" : "Copy tool name")
+                            }
+                        }
+                    }
                 }
 
                 Spacer(minLength: 12)
-
-                ShadButton(
-                    icon: copiedToolID == toolID ? .check : .copy,
-                    variant: .ghost,
-                    size: .icon,
-                    accessibilityLabel: "Copy agent instruction for \(toolID.title)"
-                ) {
-                    copyInstruction(for: toolID)
-                }
-                .help(copiedToolID == toolID ? "Copied" : "Copy agent instruction")
 
                 ShadSwitch(
                     isOn: Binding(
@@ -190,9 +205,21 @@ struct ToolPreferencesView: View {
             }
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("Agent instruction")
-                    .font(theme.font(theme.typography.xs, theme.typography.medium))
-                    .foregroundStyle(theme.colors.mutedForeground)
+                HStack(spacing: 4) {
+                    Text("Agent instruction")
+                        .font(theme.font(theme.typography.xs, theme.typography.medium))
+                        .foregroundStyle(theme.colors.mutedForeground)
+
+                    ShadButton(
+                        icon: copiedTarget == .instruction(toolID) ? .check : .copy,
+                        variant: .ghost,
+                        size: .iconSM,
+                        accessibilityLabel: "Copy agent instruction for \(toolID.title)"
+                    ) {
+                        copy(toolID.toolDescription, target: .instruction(toolID))
+                    }
+                    .help(copiedTarget == .instruction(toolID) ? "Copied" : "Copy agent instruction")
+                }
 
                 Text(toolID.toolDescription)
                     .font(theme.font(theme.typography.sm))
@@ -204,16 +231,16 @@ struct ToolPreferencesView: View {
         .padding(16)
     }
 
-    private func copyInstruction(for toolID: AgentToolID) {
+    private func copy(_ text: String, target: CopyTarget) {
 #if os(macOS)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(toolID.toolDescription, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
 #endif
-        copiedToolID = toolID
+        copiedTarget = target
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.5))
-            if copiedToolID == toolID {
-                copiedToolID = nil
+            if copiedTarget == target {
+                copiedTarget = nil
             }
         }
     }
@@ -223,9 +250,30 @@ enum ChatAppearancePreferences {
     static let sidebarAvatarSizeKey = "sidebarAvatarSize"
     static let defaultSidebarAvatarSize = 20.0
     static let sidebarAvatarSizeRange = 16.0...48.0
+    static let chatHeaderAvatarSizeKey = "chatHeaderAvatarSize"
+    static let defaultChatHeaderAvatarSize = 48.0
+    static let chatHeaderAvatarSizeRange = 32.0...80.0
+    static let groupHeaderAvatarSizeKey = "groupHeaderAvatarSize"
+    static let defaultGroupHeaderAvatarSize = 48.0
+    static let groupHeaderAvatarSizeRange = 32.0...80.0
+    static let groupMessageAvatarSizeKey = "groupMessageAvatarSize"
+    static let defaultGroupMessageAvatarSize = 28.0
+    static let groupMessageAvatarSizeRange = 20.0...48.0
 
     static func sidebarAvatarSize(_ value: Double) -> CGFloat {
         CGFloat(min(max(value, sidebarAvatarSizeRange.lowerBound), sidebarAvatarSizeRange.upperBound))
+    }
+
+    static func chatHeaderAvatarSize(_ value: Double) -> CGFloat {
+        CGFloat(min(max(value, chatHeaderAvatarSizeRange.lowerBound), chatHeaderAvatarSizeRange.upperBound))
+    }
+
+    static func groupHeaderAvatarSize(_ value: Double) -> CGFloat {
+        CGFloat(min(max(value, groupHeaderAvatarSizeRange.lowerBound), groupHeaderAvatarSizeRange.upperBound))
+    }
+
+    static func groupMessageAvatarSize(_ value: Double) -> CGFloat {
+        CGFloat(min(max(value, groupMessageAvatarSizeRange.lowerBound), groupMessageAvatarSizeRange.upperBound))
     }
 }
 
@@ -414,6 +462,12 @@ extension View {
 struct AppearancePreferencesView: View {
     @AppStorage(ChatAppearancePreferences.sidebarAvatarSizeKey)
     private var sidebarAvatarSize = ChatAppearancePreferences.defaultSidebarAvatarSize
+    @AppStorage(ChatAppearancePreferences.chatHeaderAvatarSizeKey)
+    private var chatHeaderAvatarSize = ChatAppearancePreferences.defaultChatHeaderAvatarSize
+    @AppStorage(ChatAppearancePreferences.groupHeaderAvatarSizeKey)
+    private var groupHeaderAvatarSize = ChatAppearancePreferences.defaultGroupHeaderAvatarSize
+    @AppStorage(ChatAppearancePreferences.groupMessageAvatarSizeKey)
+    private var groupMessageAvatarSize = ChatAppearancePreferences.defaultGroupMessageAvatarSize
     @Environment(\.shadTheme) private var theme
 
     var body: some View {
@@ -444,6 +498,99 @@ struct AppearancePreferencesView: View {
                             AgentAvatarSizePreview(size: 48)
 
                             Text("\(Int(sidebarAvatarSize.rounded())) pt")
+                                .font(theme.monoFont(theme.typography.xs).monospacedDigit())
+                                .foregroundStyle(theme.colors.mutedForeground)
+                                .frame(width: 42, alignment: .trailing)
+                        }
+                    }
+
+                    ShadSeparator()
+
+                    ShadSettingsRow(
+                        title: "Chat header avatar size",
+                        description: "Change the size of the avatar at the top of direct chats."
+                    ) {
+                        HStack(spacing: theme.spacing.md) {
+                            AgentAvatarSizePreview(
+                                size: ChatAppearancePreferences.chatHeaderAvatarSizeRange.lowerBound
+                            )
+
+                            ShadSlider(
+                                value: $chatHeaderAvatarSize,
+                                in: ChatAppearancePreferences.chatHeaderAvatarSizeRange,
+                                step: 1
+                            )
+                            .frame(width: 220)
+                            .accessibilityLabel("Chat header avatar size")
+                            .accessibilityValue("\(Int(chatHeaderAvatarSize.rounded())) points")
+
+                            AgentAvatarSizePreview(
+                                size: ChatAppearancePreferences.chatHeaderAvatarSizeRange.upperBound
+                            )
+
+                            Text("\(Int(chatHeaderAvatarSize.rounded())) pt")
+                                .font(theme.monoFont(theme.typography.xs).monospacedDigit())
+                                .foregroundStyle(theme.colors.mutedForeground)
+                                .frame(width: 42, alignment: .trailing)
+                        }
+                    }
+
+                    ShadSeparator()
+
+                    ShadSettingsRow(
+                        title: "Group header avatar size",
+                        description: "Change the size of the avatar display at the top of group chats."
+                    ) {
+                        HStack(spacing: theme.spacing.md) {
+                            AgentAvatarSizePreview(
+                                size: ChatAppearancePreferences.groupHeaderAvatarSizeRange.lowerBound
+                            )
+
+                            ShadSlider(
+                                value: $groupHeaderAvatarSize,
+                                in: ChatAppearancePreferences.groupHeaderAvatarSizeRange,
+                                step: 1
+                            )
+                            .frame(width: 220)
+                            .accessibilityLabel("Group header avatar size")
+                            .accessibilityValue("\(Int(groupHeaderAvatarSize.rounded())) points")
+
+                            AgentAvatarSizePreview(
+                                size: ChatAppearancePreferences.groupHeaderAvatarSizeRange.upperBound
+                            )
+
+                            Text("\(Int(groupHeaderAvatarSize.rounded())) pt")
+                                .font(theme.monoFont(theme.typography.xs).monospacedDigit())
+                                .foregroundStyle(theme.colors.mutedForeground)
+                                .frame(width: 42, alignment: .trailing)
+                        }
+                    }
+
+                    ShadSeparator()
+
+                    ShadSettingsRow(
+                        title: "Group message avatar size",
+                        description: "Change the size of agent avatars beside messages in group chats."
+                    ) {
+                        HStack(spacing: theme.spacing.md) {
+                            AgentAvatarSizePreview(
+                                size: ChatAppearancePreferences.groupMessageAvatarSizeRange.lowerBound
+                            )
+
+                            ShadSlider(
+                                value: $groupMessageAvatarSize,
+                                in: ChatAppearancePreferences.groupMessageAvatarSizeRange,
+                                step: 1
+                            )
+                            .frame(width: 220)
+                            .accessibilityLabel("Group message avatar size")
+                            .accessibilityValue("\(Int(groupMessageAvatarSize.rounded())) points")
+
+                            AgentAvatarSizePreview(
+                                size: ChatAppearancePreferences.groupMessageAvatarSizeRange.upperBound
+                            )
+
+                            Text("\(Int(groupMessageAvatarSize.rounded())) pt")
                                 .font(theme.monoFont(theme.typography.xs).monospacedDigit())
                                 .foregroundStyle(theme.colors.mutedForeground)
                                 .frame(width: 42, alignment: .trailing)

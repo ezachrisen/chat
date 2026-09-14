@@ -807,6 +807,14 @@ private struct ChatUnreadBadge: View {
     }
 }
 
+private struct ComposerOverlayHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ChatDetailView: View {
     private static let voiceGenerationIndicatorID = UUID()
 
@@ -836,10 +844,35 @@ struct ChatDetailView: View {
     @State private var responseEditDraft = ""
     @State private var groupInstructionsIsPresented = false
     @State private var groupInstructionsDraft = ""
+    @State private var composerOverlayHeight: CGFloat = 0
+    @AppStorage(ChatAppearancePreferences.chatHeaderAvatarSizeKey)
+    private var storedChatHeaderAvatarSize = ChatAppearancePreferences.defaultChatHeaderAvatarSize
+    @AppStorage(ChatAppearancePreferences.groupHeaderAvatarSizeKey)
+    private var storedGroupHeaderAvatarSize = ChatAppearancePreferences.defaultGroupHeaderAvatarSize
+    @AppStorage(ChatAppearancePreferences.groupMessageAvatarSizeKey)
+    private var storedGroupMessageAvatarSize = ChatAppearancePreferences.defaultGroupMessageAvatarSize
     @Environment(\.shadTheme) private var theme
     @Environment(\.scenePhase) private var scenePhase
 
-    private let chatShelfHeight: CGFloat = 92
+    private var chatHeaderAvatarSize: CGFloat {
+        ChatAppearancePreferences.chatHeaderAvatarSize(storedChatHeaderAvatarSize)
+    }
+
+    private var groupMessageAvatarSize: CGFloat {
+        ChatAppearancePreferences.groupMessageAvatarSize(storedGroupMessageAvatarSize)
+    }
+
+    private var groupHeaderAvatarSize: CGFloat {
+        ChatAppearancePreferences.groupHeaderAvatarSize(storedGroupHeaderAvatarSize)
+    }
+
+    private var displayedHeaderAvatarSize: CGFloat {
+        chat.isGroupChat ? groupHeaderAvatarSize : chatHeaderAvatarSize
+    }
+
+    private var chatShelfHeight: CGFloat {
+        max(92, displayedHeaderAvatarSize + 32)
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -847,10 +880,6 @@ struct ChatDetailView: View {
                 ShadMessageScroller {
                     ShadMessageScrollerViewport {
                         ShadMessageScrollerContent(ids: transcriptRowIDs, spacing: theme.spacing.lg) {
-                            if !chat.isGroupChat {
-                                modelStatus
-                            }
-
                             if chat.isGroupChat, chat.messages.isEmpty {
                                 GroupChatEmptyState(mentions: chat.availableAgentMentions)
                             }
@@ -863,6 +892,7 @@ struct ChatDetailView: View {
                                             ? message.authorAgentID.flatMap(agentStore.agent(for:))
                                             : nil,
                                         isGroupChat: chat.isGroupChat,
+                                        groupAvatarSize: groupMessageAvatarSize,
                                         rendersMarkdown: chat.rendersMarkdown,
                                         responseEditPatterns: chat.responseEditPatterns,
                                         audioChunkIndexes: voicePlayback
@@ -901,10 +931,12 @@ struct ChatDetailView: View {
                             }
                         }
                         .padding(.top, chatShelfHeight)
+                        .padding(.bottom, composerOverlayHeight + theme.spacing.lg)
                     }
 
                     if shouldShowMoreMessagesButton {
                         ShadMessageScrollerButton(edge: .end, title: moreMessagesButtonTitle)
+                            .padding(.bottom, max(0, composerOverlayHeight - theme.spacing.lg))
                             .simultaneousGesture(TapGesture().onEnded {
                                 hasUnreadNewMessages = false
                             })
@@ -976,17 +1008,13 @@ struct ChatDetailView: View {
                 .padding(.trailing, theme.spacing.xl)
                 .frame(maxWidth: .infinity, alignment: .trailing)
                 .zIndex(2)
+
+            composerOverlay
+                .zIndex(3)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 8) {
-                AppleServiceActionBanner(agents: chat.isGroupChat
-                    ? agentStore.agents.filter { candidate in chat.groupParticipants.contains { $0.agentID == candidate.id } }
-                    : agentStore.agents.filter { $0.id == chat.agentID })
-                composer
-            }
-                .padding(theme.spacing.xl)
-                .background(theme.colors.background)
+        .onPreferenceChange(ComposerOverlayHeightKey.self) { height in
+            composerOverlayHeight = height
         }
         .navigationTitle(chat.displayTitle)
         .shadDialog(isPresented: $responseEditIsPresented) {
@@ -1075,9 +1103,23 @@ struct ChatDetailView: View {
     }
 
     private var chatActionsMenu: some View {
-        ShadDropdownMenu(alignment: .bottomTrailing) { _ in
+        ShadDropdownMenu(alignment: .bottomTrailing, minWidth: 260) { _ in
             ChatActionsMenuTrigger(isLoading: chat.isCompacting)
         } content: {
+            ShadDropdownMenuLabel(chat.isGroupChat ? "Agent models" : "Model")
+
+            if chat.isGroupChat {
+                ForEach(chat.groupParticipants) { participant in
+                    modelInfoRow(
+                        "\(participant.agentName): \(modelMenuName(for: participant.agentModelIdentifier))"
+                    )
+                }
+            } else {
+                modelInfoRow(modelMenuName(for: chat.selectedModelIdentifier))
+            }
+
+            ShadDropdownMenuSeparator()
+
             ShadDropdownMenuCheckboxItem("Render Markdown", isOn: rendersMarkdown)
 
             ShadDropdownMenuItem("Response Edit…", icon: .custom("text.badge.minus")) {
@@ -1132,6 +1174,28 @@ struct ChatDetailView: View {
         .accessibilityLabel("Chat actions")
     }
 
+    private func modelInfoRow(_ text: String) -> some View {
+        Text(text)
+            .font(theme.font(theme.typography.sm))
+            .foregroundStyle(theme.colors.foreground)
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, theme.spacing.sm)
+            .padding(.vertical, theme.spacing.xs)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func modelMenuName(for identifier: String?) -> String {
+        let displayName = chat.displayName(forModelIdentifier: identifier)
+        let prefix = "ChatGPT · GPT-"
+        guard displayName.hasPrefix(prefix) else { return displayName }
+
+        let modelName = displayName.dropFirst(prefix.count)
+        let parts = modelName.split(separator: "-", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return displayName }
+        return "ChatGPT \(parts[1].replacingOccurrences(of: "-", with: " ")) \(parts[0])"
+    }
+
     private var chatAgents: [Agent] {
         if chat.isGroupChat {
             return chat.groupParticipants.compactMap { agentStore.agent(for: $0.agentID) }
@@ -1142,11 +1206,11 @@ struct ChatDetailView: View {
     private var chatIdentityShelf: some View {
         VStack(spacing: theme.spacing.xs) {
             if chat.isGroupChat {
-                AgentAvatarGroup(agents: chatAgents, size: 44, maximumVisible: 5)
+                AgentAvatarGroup(agents: chatAgents, size: groupHeaderAvatarSize, maximumVisible: 5)
             } else if let agent = chatAgents.first {
-                AgentAvatar(agent: agent, size: 48)
+                AgentAvatar(agent: agent, size: chatHeaderAvatarSize)
             } else {
-                ShadAvatar(fallback: "?", customSize: 48)
+                ShadAvatar(fallback: "?", customSize: chatHeaderAvatarSize)
             }
 
             Text(chatParticipantNames)
@@ -1173,28 +1237,6 @@ struct ChatDetailView: View {
             return names.isEmpty ? "No agents" : names.formatted(.list(type: .and))
         }
         return chatAgents.first?.displayName ?? chat.agentName
-    }
-
-    private var modelStatus: some View {
-        ShadItem(variant: .muted, size: .sm) {
-            ShadItemMedia(variant: .default, size: theme.spacing.xxl) {
-                ShadIconView(modelStatusIcon, size: theme.typography.base)
-                    .foregroundStyle(modelStatusColor)
-            }
-            ShadItemContent {
-                ShadItemDescription(chat.availabilityMessage)
-            }
-        }
-    }
-
-    private var modelStatusIcon: ShadIcon {
-        if chat.isGroupChat { return .users }
-        return chat.canSend ? .circleCheck : .triangleAlert
-    }
-
-    private var modelStatusColor: Color {
-        if chat.isGroupChat { return theme.colors.primary }
-        return chat.canSend ? theme.colors.success : theme.colors.warning
     }
 
     private var transcriptRowIDs: [AnyHashable] {
@@ -1247,49 +1289,81 @@ struct ChatDetailView: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: theme.spacing.lg) {
-            HStack(alignment: .bottom, spacing: theme.spacing.xs) {
-                TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(theme.font(theme.typography.sm))
-                    .foregroundStyle(theme.colors.foreground)
-                    .lineLimit(1...5)
-                    .padding(.leading, theme.spacing.lg)
-                    .padding(.vertical, theme.spacing.lg)
-                    .focused($composerIsFocused)
-                    .submitLabel(.send)
-                    .onSubmit {
-                        submitDraft()
-                    }
-                    .disabled(!chat.canSend || chat.isResponding || voiceInput.isActive)
-
-                HStack(spacing: theme.spacing(0.5)) {
-                    replyReadingModeButton
-                    voiceModeButton
+        VStack(alignment: .leading, spacing: theme.spacing.md) {
+            TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(theme.font(theme.typography.sm))
+                .foregroundStyle(Color.black.opacity(0.88))
+                .lineLimit(1...6)
+                .frame(minHeight: 46, alignment: .topLeading)
+                .padding(.horizontal, theme.spacing.xxl)
+                .padding(.top, theme.spacing.xl)
+                .focused($composerIsFocused)
+                .submitLabel(.send)
+                .onSubmit {
+                    submitDraft()
                 }
-                .padding(.trailing, theme.spacing.sm)
-                .padding(.bottom, theme.spacing.xs)
-            }
-            .background(
-                ShadRoundedRectangle(cornerRadius: theme.radius.lg)
-                    .fill(theme.colors.muted.opacity(0.65))
-            )
-            .overlay {
-                ShadRoundedRectangle(cornerRadius: theme.radius.lg)
-                    .strokeBorder(theme.colors.input, lineWidth: theme.borderWidth)
-            }
-            .modifier(VoiceDictationGlow(isActive: voiceInput.isTranscribing))
+                .disabled(!chat.canSend || chat.isResponding || voiceInput.isActive)
 
-            ShadButton(
-                icon: .custom("paperplane.fill"),
-                size: .iconLG,
-                accessibilityLabel: "Send message"
-            ) {
-                submitDraft()
+            HStack(spacing: theme.spacing.xs) {
+                Spacer(minLength: 0)
+                replyReadingModeButton
+                voiceModeButton
+
+                ShadButton(
+                    icon: .custom("arrow.up"),
+                    size: .iconLG,
+                    shape: .pill,
+                    accessibilityLabel: "Send message"
+                ) {
+                    submitDraft()
+                }
+                .disabled(!chat.canSubmitDraft || voiceInput.isActive)
+                .help("Send message")
             }
-            .disabled(!chat.canSubmitDraft || voiceInput.isActive)
-            .help("Send message")
+            .padding(.horizontal, theme.spacing.lg)
+            .padding(.bottom, theme.spacing.lg)
         }
+        .background(Color.white, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(Color.black.opacity(0.07), lineWidth: theme.borderWidth)
+        }
+        .shadow(color: .black.opacity(0.09), radius: 16, y: 5)
+        .modifier(VoiceDictationGlow(isActive: voiceInput.isTranscribing))
+        .shadTheme { composerTheme in
+            composerTheme.colors.foreground = Color.black.opacity(0.88)
+            composerTheme.colors.mutedForeground = Color.black.opacity(0.52)
+            composerTheme.colors.primary = .black
+            composerTheme.colors.primaryForeground = .white
+        }
+    }
+
+    private var composerOverlay: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+
+            VStack(spacing: theme.spacing.sm) {
+                AppleServiceActionBanner(agents: chat.isGroupChat
+                    ? agentStore.agents.filter { candidate in
+                        chat.groupParticipants.contains { $0.agentID == candidate.id }
+                    }
+                    : agentStore.agents.filter { $0.id == chat.agentID })
+                composer
+            }
+            .padding(.horizontal, theme.spacing.xl)
+            .padding(.bottom, theme.spacing.xl)
+            .frame(maxWidth: 900)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ComposerOverlayHeightKey.self,
+                        value: proxy.size.height
+                    )
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var voiceModeButton: some View {
@@ -1640,6 +1714,7 @@ struct MessageBubble: View {
     let message: ChatMessage
     var groupAuthorAgent: Agent?
     var isGroupChat = false
+    var groupAvatarSize: CGFloat = 28
     var rendersMarkdown = false
     var responseEditPatterns: [String] = []
     let audioChunkIndexes: [Int]
@@ -1669,7 +1744,7 @@ struct MessageBubble: View {
                                         theme.typography.regular
                                     ))
                                     .foregroundStyle(theme.colors.mutedForeground)
-                                    .padding(.leading, 28 + theme.spacing.sm + 12)
+                                    .padding(.leading, groupAvatarSize + theme.spacing.sm + 12)
                             }
 
                             HStack(alignment: .top, spacing: theme.spacing.sm) {
@@ -1708,9 +1783,9 @@ struct MessageBubble: View {
     private var groupAuthorAvatar: some View {
         Group {
             if let groupAuthorAgent {
-                AgentAvatar(agent: groupAuthorAgent, size: 28)
+                AgentAvatar(agent: groupAuthorAgent, size: groupAvatarSize)
             } else {
-                ShadAvatar(fallback: authorInitials, customSize: 28)
+                ShadAvatar(fallback: authorInitials, customSize: groupAvatarSize)
                     .accessibilityHidden(true)
             }
         }
@@ -1782,6 +1857,7 @@ struct MessageBubble: View {
         ) {
             ShadBubbleContent {
                 messageText
+                    .font(theme.font(theme.typography.sm))
                     .textSelection(.enabled)
             }
         }

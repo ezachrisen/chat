@@ -14,6 +14,7 @@ final class AgentStore: ObservableObject {
     @Published private(set) var hasOlderHeartbeatRuns = false
     @Published var selectedAgentID: Agent.ID?
     let agentConfigurationDidChange = PassthroughSubject<Agent.ID, Never>()
+    let agentSoulDidChange = PassthroughSubject<Agent.ID, Never>()
 
     private static let heartbeatRunBatchSize = 200
 
@@ -307,13 +308,32 @@ final class AgentStore: ObservableObject {
         agentConfigurationDidChange.send(id)
     }
 
-    func updateAgentSoul(id: Agent.ID, soul: String) {
-        guard let agent = agents.first(where: { $0.id == id }) else { return }
+    @discardableResult
+    func updateAgentSoul(id: Agent.ID, soul: String) -> Bool {
+        guard persistAgentSoul(id: id, soul: soul) else { return false }
+        agentConfigurationDidChange.send(id)
+        return true
+    }
+
+    @discardableResult
+    func updateAgentSoulFromTool(id: Agent.ID, soul: String) -> Bool {
+        guard persistAgentSoul(id: id, soul: soul) else { return false }
+        agentSoulDidChange.send(id)
+        return true
+    }
+
+    private func persistAgentSoul(id: Agent.ID, soul: String) -> Bool {
+        guard let agent = agents.first(where: { $0.id == id }) else { return false }
 
         agent.soul = soul
-        saveChanges()
+        let previousSelection = selectedAgentID
+        guard saveChanges() else {
+            modelContext.rollback()
+            loadAgents(selecting: previousSelection)
+            return false
+        }
         objectWillChange.send()
-        agentConfigurationDidChange.send(id)
+        return true
     }
 
     func updateAgentAvatar(

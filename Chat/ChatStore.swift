@@ -187,7 +187,10 @@ final class ChatStore: ObservableObject {
             .sink { [weak self] agents in
                 self?.ensureDefaultChats(for: agents)
             }
-        agentConfigurationCancellable = agentStore.agentConfigurationDidChange
+        agentConfigurationCancellable = Publishers.Merge(
+            agentStore.agentConfigurationDidChange,
+            agentStore.agentSoulDidChange
+        )
             .sink { [weak self] agentID in
                 guard let self,
                       let agent = self.agentStore.agent(for: agentID) else { return }

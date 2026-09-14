@@ -828,6 +828,7 @@ struct AgentToolBox: Sendable {
     var reminderDeletionAllowed = false
     let stashRuntime: AgentStashRuntime?
     var stashWriteAllowed = true
+    let soulRuntime: AgentSoulRuntime?
     let delegationRuntime: AgentDelegationRuntime?
     let authorization: AgentToolAuthorization?
 
@@ -855,6 +856,10 @@ struct AgentToolBox: Sendable {
         }
         if enabledToolIDs.contains(AgentToolID.readCalendarEvents.rawValue) {
             tools.append(ReadCalendarEventsTool(policy: calendarPolicy, livePolicy: liveCalendarPolicy, recorder: recorder, authorization: authorization))
+        }
+        if enabledToolIDs.contains(AgentToolID.updateAgentSoul.rawValue),
+           let soulRuntime {
+            tools.append(UpdateAgentSoulTool(runtime: soulRuntime, recorder: recorder, authorization: authorization))
         }
         tools += stashTools.map(\.tool)
         if enabledToolIDs.contains(AgentToolID.askAgents.rawValue),
@@ -943,6 +948,18 @@ struct AgentToolBox: Sendable {
                     ],
                     required: ["start", "end"]
                 )
+            case AgentToolID.updateAgentSoul.rawValue:
+                return OpenAITool.function(
+                    name: tool.name,
+                    description: tool.description,
+                    properties: [
+                        "soul": OpenAIJSONProperty(
+                            type: "string",
+                            description: "The complete replacement Soul instructions. Include all existing instructions that should remain."
+                        )
+                    ],
+                    required: ["soul"]
+                )
             case AgentToolID.askAgents.rawValue, AgentToolID.sendToAgents.rawValue:
                 return OpenAITool.function(
                     name: tool.name,
@@ -1027,9 +1044,15 @@ struct AgentToolBox: Sendable {
             || name == AgentToolID.sendToAgents.rawValue
         let capturesFullDelegationTrace = isDelegationTool
             && delegationRuntime?.capturesFullTrace == true
-        var recordedArgumentsJSON = isDelegationTool && !capturesFullDelegationTrace
-            ? DelegationToolTrace.undecodedArguments
-            : argumentsJSON
+        let isSoulTool = name == AgentToolID.updateAgentSoul.rawValue
+        var recordedArgumentsJSON: String
+        if isDelegationTool && !capturesFullDelegationTrace {
+            recordedArgumentsJSON = DelegationToolTrace.undecodedArguments
+        } else if isSoulTool && recorder?.capturesFullContent != true {
+            recordedArgumentsJSON = "{\"content\":\"redacted\"}"
+        } else {
+            recordedArgumentsJSON = argumentsJSON
+        }
         var capturedResult: Result<String, Error> = .failure(
             SkillAccessError.startFailed("Tool did not return a result.")
         )
@@ -1088,6 +1111,12 @@ struct AgentToolBox: Sendable {
                     policy: currentPolicy
                 )
                 guard try liveCalendarPolicy() == currentPolicy else { throw AppleServiceError.forbidden }
+            case AgentToolID.updateAgentSoul.rawValue:
+                let arguments = try JSONDecoder().decode(UpdateAgentSoulCall.self, from: data)
+                guard let soulRuntime else {
+                    throw AgentSoulToolError.unavailable
+                }
+                output = try soulRuntime.update(soul: arguments.soul)
             case AgentToolID.askAgents.rawValue:
                 let arguments = try JSONDecoder().decode(AgentDelegationCall.self, from: data)
                 recordedArgumentsJSON = DelegationToolTrace.arguments(
@@ -1163,6 +1192,7 @@ struct AgentToolBox: Sendable {
         delegationRuntime: AgentDelegationRuntime? = nil,
         allowedToolIDs: Set<String>? = nil,
         authorization: AgentToolAuthorization? = nil,
+        agentStore: AgentStore? = nil,
         serviceOrigin: AppleServiceOrigin = .interactive
     ) -> AgentToolBox {
         var enabledToolIDs = catalog.enabledToolIDs(for: agent)
@@ -1174,6 +1204,9 @@ struct AgentToolBox: Sendable {
         }
         if delegationRuntime?.canDispatch != true {
             enabledToolIDs.remove(AgentToolID.sendToAgents.rawValue)
+        }
+        if agentStore == nil {
+            enabledToolIDs.remove(AgentToolID.updateAgentSoul.rawValue)
         }
 
         return AgentToolBox(
@@ -1195,6 +1228,11 @@ struct AgentToolBox: Sendable {
             reminderDeletionAllowed: agent?.appleServiceGrants[AppleServiceID.reminders.rawValue]?.allowsDeletion == true,
             stashRuntime: agent.flatMap(AgentStashRuntime.init(agent:)),
             stashWriteAllowed: !serviceOrigin.isConsultation,
+            soulRuntime: agent.flatMap { agent in
+                agentStore.map {
+                    AgentSoulRuntime(agentID: agent.id, agentStore: $0, catalog: catalog)
+                }
+            },
             delegationRuntime: delegationRuntime,
             authorization: authorization
         )
@@ -1221,6 +1259,10 @@ private struct ReadCalendarEventsCall: Decodable {
     var start: String
     var end: String
     var calendar_ids: String?
+}
+
+private struct UpdateAgentSoulCall: Decodable {
+    var soul: String
 }
 
 private struct AgentDelegationCall: Decodable {

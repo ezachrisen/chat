@@ -7,7 +7,7 @@ import AppKit
 /// Runs without accounts, service permissions, network, or the user's persistent chat store.
 @MainActor
 enum AppleServicesProbe {
-    static var isRequested: Bool { CommandLine.arguments.contains("--apple-services-self-test") || CommandLine.arguments.contains("--apple-services-ui-snapshot") || CommandLine.arguments.contains("--reminders-model-self-test") || CommandLine.arguments.contains("--tool-recovery-self-test") || CommandLine.arguments.contains("--heartbeat-spiral-self-test") || CommandLine.arguments.contains("--conversation-transcript-model-self-test") || CommandLine.arguments.contains("--agent-stash-self-test") || CommandLine.arguments.contains("--agent-stash-ui-snapshot") }
+    static var isRequested: Bool { CommandLine.arguments.contains("--apple-services-self-test") || CommandLine.arguments.contains("--apple-services-ui-snapshot") || CommandLine.arguments.contains("--reminders-model-self-test") || CommandLine.arguments.contains("--tool-recovery-self-test") || CommandLine.arguments.contains("--heartbeat-spiral-self-test") || CommandLine.arguments.contains("--conversation-transcript-model-self-test") || CommandLine.arguments.contains("--agent-stash-self-test") || CommandLine.arguments.contains("--agent-stash-ui-snapshot") || CommandLine.arguments.contains("--agent-soul-tool-self-test") }
     static func run(container: ModelContainer) {
         do {
             func check(_ value: Bool, _ message: String = "Self-test invariant failed") throws {
@@ -55,6 +55,7 @@ enum AppleServicesProbe {
             try check(fetched.isDebugLogEnabled, "Apple Services must not disable an agent's Debug log")
             try check(!fetched.allowsAllCalendars && fetched.allowedCalendarIDs == ["fixture-calendar"])
             let catalog = SkillCatalog(defaults: UserDefaults(suiteName: "ChatAppleServiceProbe")!)
+            let probeAgentStore = AgentStore(modelContext: context)
             let tools = AgentToolBox.make(agent: fetched, catalog: catalog)
             let expected = Set(AppleServiceID.allCases.filter { $0 != .reminders }.map(\.toolName) + [AgentToolID.readCalendarEvents.rawValue])
                 .union(ReminderTools.readNames)
@@ -109,6 +110,13 @@ enum AppleServicesProbe {
                     )
                     if CommandLine.arguments.contains("--conversation-transcript-model-self-test") {
                         try await runConversationModelProbe()
+                    }
+                    if CommandLine.arguments.contains("--agent-soul-tool-self-test") {
+                        try await AgentSoulToolProbe.run(
+                            agentID: fetched.id,
+                            agentStore: probeAgentStore,
+                            catalog: catalog
+                        )
                     }
                     try await AgentStashProbe.run(agent: fetched, container: container)
                     FileHandle.standardError.write(Data("PASS: SwiftData grants, Calendar preservation, service tools, provider schema parity, focused Reminders tools.\n".utf8))

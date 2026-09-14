@@ -90,6 +90,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
         canSend && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var selectedModelIdentifier: String? {
+        isGroupChat ? nil : directModelIdentifier
+    }
+
+    func displayName(forModelIdentifier modelIdentifier: String?) -> String {
+        localModelStore.displayName(for: modelIdentifier)
+    }
+
     var rendersMarkdown: Bool {
         storedChat.rendersMarkdown ?? true
     }
@@ -1163,6 +1171,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             catalog: skillCatalog,
             recorder: recorder,
             delegationRuntime: delegationRuntime,
+            agentStore: agentStore,
             serviceOrigin: collaborationDeadline == nil ? .interactive : .heartbeat
         )
         let skillDiscoveryPrompt = ModelPrompts.skillsPrompt(for: tools.runtime.skills)

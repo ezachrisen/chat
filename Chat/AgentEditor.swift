@@ -565,6 +565,11 @@ struct AgentEditor: View {
             loadSelectedAgent()
             prepareCalendarsIfNeeded()
         }
+        .onReceive(store.agentSoulDidChange) { agentID in
+            guard selectedAgent?.id == agentID,
+                  let agent = store.agent(for: agentID) else { return }
+            draftSoul = agent.soul
+        }
     }
 
     private func editor(for agent: Agent) -> some View {
