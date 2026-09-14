@@ -87,11 +87,11 @@ nonisolated final class NativeAppleServices: @unchecked Sendable {
             let reminders = fetched.take()
             guard reminders.count <= 10_000 else { throw AppleServiceError.invalid("List exceeds search budget. Select a smaller list.") }
             let records = reminders.filter { item in
-                if dueRange.start != nil || dueRange.end != nil {
-                    guard let due = item.dueDateComponents?.date,
-                          dueRange.start.map({ due >= $0 }) ?? true,
-                          dueRange.end.map({ due < $0 }) ?? true else { return false }
-                }
+                guard Self.reminderMatchesDueRange(
+                    isCompleted: item.isCompleted,
+                    due: item.dueDateComponents,
+                    range: dueRange
+                ) else { return false }
                 return Self.reminderMatchesSearch(
                     title: item.title,
                     notes: item.notes,
@@ -210,6 +210,23 @@ nonisolated final class NativeAppleServices: @unchecked Sendable {
         default:
             return !isCompleted
         }
+    }
+
+    static func reminderMatchesDueRange(
+        isCompleted: Bool,
+        due: DateComponents?,
+        range: (start: Date?, end: Date?),
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Bool {
+        guard range.start != nil || range.end != nil else { return true }
+        guard let components = due, let date = components.date else { return false }
+
+        let isInRange = (range.start.map { date >= $0 } ?? true)
+            && (range.end.map { date < $0 } ?? true)
+        let overdueCutoff = components.hour == nil ? calendar.startOfDay(for: now) : now
+        let isOverdue = !isCompleted && date < overdueCutoff
+        return isInRange || isOverdue
     }
 
     static func reminderSearchState(_ value: String?) -> String {

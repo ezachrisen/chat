@@ -133,6 +133,27 @@ final class ReminderSearchTests: XCTestCase {
         XCTAssertNil(try NativeAppleServices.reminderDueRange(from: nil, through: nil).start)
     }
 
+    func testDueRangeAlsoIncludesOverdueIncompleteReminders() {
+        let range = (start: due(2026, 9, 11).date, end: due(2026, 9, 15).date)
+        func matches(_ due: DateComponents?, completed: Bool = false) -> Bool {
+            NativeAppleServices.reminderMatchesDueRange(
+                isCompleted: completed,
+                due: due,
+                range: range,
+                now: now,
+                calendar: calendar
+            )
+        }
+
+        XCTAssertTrue(matches(due(2026, 9, 8)), "An overdue incomplete reminder should be included")
+        XCTAssertFalse(matches(due(2026, 9, 8), completed: true), "A completed historical reminder is not overdue")
+        XCTAssertFalse(matches(due(2026, 9, 10)), "An upcoming reminder outside the requested range should stay excluded")
+        XCTAssertTrue(matches(due(2026, 9, 11)), "The first day of the requested range should be included")
+        XCTAssertTrue(matches(due(2026, 9, 14)), "The last day of the requested range should be included")
+        XCTAssertFalse(matches(due(2026, 9, 15)), "A reminder after the requested range should stay excluded")
+        XCTAssertFalse(matches(nil), "Undated reminders should stay excluded from date searches")
+    }
+
     func testListScopeNeverFallsBackToAllForUnknownOrAmbiguousNames() throws {
         let lists = [(id: "work", name: "Work"), (id: "home", name: "Shopping List"), (id: "other", name: "Work")]
         XCTAssertEqual(try NativeAppleServices.reminderListIDs(lists: lists, container: nil, name: nil), ["work", "home", "other"])

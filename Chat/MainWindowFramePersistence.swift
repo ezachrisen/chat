@@ -29,10 +29,10 @@ struct MainWindowFramePersistenceView: NSViewRepresentable {
 final class WindowReaderView: NSView {
     var onWindowChange: ((NSWindow) -> Void)?
 
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        super.viewWillMove(toWindow: newWindow)
-        guard let newWindow else { return }
-        onWindowChange?(newWindow)
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        onWindowChange?(window)
     }
 }
 
@@ -51,6 +51,19 @@ final class MainWindowFramePersistence: NSObject {
 
         NotificationCenter.default.removeObserver(self)
         self.window = window
+
+        // Let the app's ShadSwift split layout occupy the title-bar region.
+        // The sidebar view provides its own inset beneath the traffic lights.
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+
+        if CommandLine.arguments.contains("--window-layout-preview") {
+            window.setContentSize(NSSize(width: 1000, height: 700))
+            window.center()
+            return
+        }
 
         let frame = restoredFrame(for: window)
         window.setFrame(frame, display: true)

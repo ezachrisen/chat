@@ -7,19 +7,19 @@ struct AppleServicesPreferencesView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("Apple Services").font(.title2.bold())
+                Text("Apple Services").chatSystemFont(.title2, weight: .bold)
                 Text("Connect this Mac, then choose what each agent can access in its Tools settings. Retrieved content may be sent to that agent's selected model and included in saved replies.").foregroundStyle(.secondary)
                 ForEach(AppleServiceID.allCases) { service in
                     HStack {
                         VStack(alignment: .leading) {
-                            Text(service.title).font(.headline)
-                            Text(connections.statuses[service] ?? "Not connected").font(.caption).foregroundStyle(.secondary)
+                            Text(service.title).chatSystemFont(.headline, weight: .semibold)
+                            Text(connections.statuses[service] ?? "Not connected").chatSystemFont(.caption1).foregroundStyle(.secondary)
                         }
                         Spacer()
                         if connections.busy.contains(service) { ProgressView().controlSize(.small) }
                         if connections.connectedServices.contains(service) {
                             Label("Connected", systemImage: "checkmark.circle.fill")
-                                .font(.caption.weight(.semibold))
+                                .chatSystemFont(.caption1, weight: .semibold)
                                 .foregroundStyle(.green)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
@@ -30,11 +30,11 @@ struct AppleServicesPreferencesView: View {
                     }
                     Divider()
                 }
-                Text("Messages history is separate from sending. To read local history, enable Full Disk Access for Chat, restart Chat, and enable History for the agent. Rich message content may be unavailable.").font(.callout).foregroundStyle(.secondary)
+                Text("Messages history is separate from sending. To read local history, enable Full Disk Access for Chat, restart Chat, and enable History for the agent. Rich message content may be unavailable.").chatSystemFont(.callout).foregroundStyle(.secondary)
                 Button("Open Full Disk Access settings") { openPrivacy("Privacy_AllFiles") }
                 Button("Open Automation settings") { openPrivacy("Privacy_Automation") }
-                Text("Debug logging remains available per agent when Apple Services are enabled. When it is on, saved diagnostics include Apple service requests and the bounded results returned to that agent. When it is off, native-service tool rows omit request and result content.").font(.caption).foregroundStyle(.secondary)
-                Text("Phone opens the system calling app. Call history, call control and agent voice calls are unavailable. Notes with rich formatting are protected from replacement; Mail and Messages accept files deliberately imported for the agent; other attachments remain in the Apple apps.").font(.caption).foregroundStyle(.secondary)
+                Text("Debug logging remains available per agent when Apple Services are enabled. When it is on, saved diagnostics include Apple service requests and the bounded results returned to that agent. When it is off, native-service tool rows omit request and result content.").chatSystemFont(.caption1).foregroundStyle(.secondary)
+                Text("Phone opens the system calling app. Call history, call control and agent voice calls are unavailable. Notes with rich formatting are protected from replacement; Mail and Messages accept files deliberately imported for the agent; other attachments remain in the Apple apps.").chatSystemFont(.caption1).foregroundStyle(.secondary)
             }.padding(28).frame(maxWidth: 850, alignment: .leading)
         }.onAppear { connections.refresh() }
     }
@@ -66,7 +66,7 @@ struct AgentAppleServicesView: View {
                 if selected != .phone {
                     Toggle("Read all \(selected.scopeLabel.lowercased())", isOn: binding(\.allowsAll))
                     HStack {
-                        Text(grant.allowsAll ? "Includes newly added resources." : "Choose the resources this agent may use.").font(.caption).foregroundStyle(.secondary)
+                        Text(grant.allowsAll ? "Includes newly added resources." : "Choose the resources this agent may use.").chatSystemFont(.caption1).foregroundStyle(.secondary)
                         Spacer()
                         Button(loading ? "Loading…" : "Choose \(selected.scopeLabel.lowercased())") { Task { await loadResources(append: false) } }.disabled(loading)
                     }
@@ -74,7 +74,7 @@ struct AgentAppleServicesView: View {
                         HStack {
                             VStack(alignment: .leading) {
                                 Toggle(item.title.isEmpty ? (item.fields["participants"] ?? "Untitled") : item.title, isOn: resourceBinding(item.id)).disabled(grant.allowsAll)
-                                if let source = item.fields["account_name"] ?? item.fields["parent"] { Text(source).font(.caption).foregroundStyle(.secondary) }
+                                if let source = item.fields["account_name"] ?? item.fields["parent"] { Text(source).chatSystemFont(.caption1).foregroundStyle(.secondary) }
                             }
                             if selected == .messages {
                                 Toggle("Allow sending", isOn: destinationBinding(item.id)).toggleStyle(.checkbox)
@@ -82,7 +82,7 @@ struct AgentAppleServicesView: View {
                         }
                     }
                     if nextOffset != nil { Button("Load more") { Task { await loadResources(append: true) } }.disabled(loading) }
-                    if !grant.allowsAll, resources.isEmpty { Text("\(grant.resourceIDs.count) selected resources.").font(.caption) }
+                    if !grant.allowsAll, resources.isEmpty { Text("\(grant.resourceIDs.count) selected resources.").chatSystemFont(.caption1) }
                 }
                 if [.reminders, .contacts, .notes, .mail].contains(selected) {
                     Toggle("Allow changes", isOn: binding(\.allowsChanges))
@@ -92,22 +92,22 @@ struct AgentAppleServicesView: View {
                 Toggle("Allow use when another agent asks", isOn: binding(\.allowsDelegation))
                 if selected == .messages { Toggle("Read local message history (requires Full Disk Access)", isOn: binding(\.allowsHistory)) }
                 if selected == .phone || selected == .mail || selected == .messages {
-                    Text(selected == .phone ? "Numbers this agent may call without another approval" : "Addresses or numbers this agent may message without another approval").font(.caption)
+                    Text(selected == .phone ? "Numbers this agent may call without another approval" : "Addresses or numbers this agent may message without another approval").chatSystemFont(.caption1)
                     TextField(selected == .phone ? "+14155550123, one per line" : "person@example.com, one per line", text: $sendingText, axis: .vertical)
                         .lineLimit(2...5).textFieldStyle(.roundedBorder)
                     Button("Save destinations") { saveDestinations() }
                 }
                 if selected == .mail {
-                    Text("Allowed sending addresses (one per line)").font(.caption)
+                    Text("Allowed sending addresses (one per line)").chatSystemFont(.caption1)
                     TextField("Your address as configured in Mail", text: $identitiesText, axis: .vertical).lineLimit(2...4).textFieldStyle(.roundedBorder)
                     Button("Save sending addresses") { saveIdentities() }
                 }
                 if selected == .mail || selected == .messages {
-                    Text("Files available to this agent (24 hours)").font(.caption)
+                    Text("Files available to this agent (24 hours)").chatSystemFont(.caption1)
                     Button("Choose a file…") { importAttachment() }
                     ForEach(importedFiles) { file in
                         HStack {
-                            Text(file.name).font(.caption)
+                            Text(file.name).chatSystemFont(.caption1)
                             Spacer()
                             Button("Remove") {
                                 do { try AppleAttachmentStore.shared.remove(file.id, agentID: agent.id); refreshFiles() }
@@ -116,22 +116,22 @@ struct AgentAppleServicesView: View {
                         }
                     }
                 }
-                Text("Sending or calling outside a saved destination grant produces an action for review below. Edits require the Changes grant; deleting requires its own grant.").font(.caption).foregroundStyle(.secondary)
+                Text("Sending or calling outside a saved destination grant produces an action for review below. Edits require the Changes grant; deleting requires its own grant.").chatSystemFont(.caption1).foregroundStyle(.secondary)
             }
-            if let status { Text(status).font(.caption).textSelection(.enabled) }
+            if let status { Text(status).chatSystemFont(.caption1).textSelection(.enabled) }
             Divider()
-            Text("Prepared actions and recent receipts").font(.headline)
+            Text("Prepared actions and recent receipts").chatSystemFont(.headline, weight: .semibold)
             ForEach(actions.actions.filter { $0.agentID == agent.id }.suffix(20).reversed()) { action in
                 VStack(alignment: .leading, spacing: 8) {
                     Text("\(action.service.title) · \(action.state)").font(.subheadline.bold())
-                    Text(action.summary).font(.callout).textSelection(.enabled)
+                    Text(action.summary).chatSystemFont(.callout).textSelection(.enabled)
                     if action.state == "prepared" {
                         HStack {
                             Button(action.service == .phone ? "Open call" : "Send this exact message") { Task { await approve(action) } }
                             Button("Cancel") { do { try actions.cancel(action.id, agentID: agent.id) } catch { status = error.localizedDescription } }
                         }
                     }
-                    if action.state == "uncertain" { Text("Check the Apple app before trying again. This action will not be repeated automatically.").font(.caption) }
+                    if action.state == "uncertain" { Text("Check the Apple app before trying again. This action will not be repeated automatically.").chatSystemFont(.caption1) }
                 }.padding(10).frame(maxWidth: .infinity, alignment: .leading).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
             }
         }.padding(16)
@@ -233,16 +233,16 @@ struct AppleServiceActionBanner: View {
         Group {
             if let action = pending.first {
                 HStack {
-                    Text("\(action.service.title) action ready to review").font(.callout)
+                    Text("\(action.service.title) action ready to review").chatSystemFont(.callout)
                     Spacer()
                     Button("Review") { reviewing = action }
                 }.padding(10).background(.quaternary).clipShape(RoundedRectangle(cornerRadius: 8))
             }
-            if let resultMessage { Text(resultMessage).font(.caption).textSelection(.enabled) }
+            if let resultMessage { Text(resultMessage).chatSystemFont(.caption1).textSelection(.enabled) }
         }.sheet(item: $reviewing) { action in
             VStack(alignment: .leading, spacing: 16) {
-                Text(action.service == .phone ? "Review call" : "Review message").font(.title2.bold())
-                Text("Prepared by " + (agents.first { $0.id == action.agentID }?.displayName ?? "Agent")).font(.caption).foregroundStyle(.secondary)
+                Text(action.service == .phone ? "Review call" : "Review message").chatSystemFont(.title2, weight: .bold)
+                Text("Prepared by " + (agents.first { $0.id == action.agentID }?.displayName ?? "Agent")).chatSystemFont(.caption1).foregroundStyle(.secondary)
                 ScrollView { Text(action.summary).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
                 HStack {
                     Button("Cancel action") { try? store.cancel(action.id, agentID: action.agentID); reviewing = nil }

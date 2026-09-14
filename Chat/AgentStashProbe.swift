@@ -117,7 +117,7 @@ enum AgentStashProbe {
                         .padding(24)
                 }
                 .modelContainer(container)
-                .shadTheme(ChatShadTheme.theme)
+                .chatTheme()
                 .frame(width: 760, height: 920)
                 .background(Color(nsColor: .windowBackgroundColor))
             )

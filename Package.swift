@@ -12,6 +12,10 @@ let package = Package(
                 swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "AppleServicesTests", dependencies: ["ChatAppleServices"], path: "Tests/AppleServices"),
         .target(name: "AgentLoopCore", path: "Chat/AgentLoop", exclude: ["RecoveringFoundationTool.swift", "ToolRecoveryPolicy.swift"], swiftSettings: [.swiftLanguageMode(.v6)]),
-        .testTarget(name: "AgentLoopTests", dependencies: ["AgentLoopCore"], path: "Tests/AgentLoop")
+        .testTarget(name: "AgentLoopTests", dependencies: ["AgentLoopCore"], path: "Tests/AgentLoop"),
+        .target(name: "SidebarCore", path: "Chat/SidebarCore"),
+        .testTarget(name: "SidebarTests", dependencies: ["SidebarCore"], path: "Tests/Sidebar"),
+        .target(name: "AppearanceCore", path: "Chat/AppearanceCore"),
+        .testTarget(name: "AppearanceTests", dependencies: ["AppearanceCore"], path: "Tests/Appearance")
     ]
 )

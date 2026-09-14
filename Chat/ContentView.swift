@@ -22,7 +22,8 @@ struct ChatApp: App {
 
     init() {
         do {
-            let container = try AppleServicesProbe.isRequested || SessionStorageProbe.usesInMemoryStore
+            let isWindowPreview = CommandLine.arguments.contains("--window-layout-preview")
+            let container = try isWindowPreview || AppleServicesProbe.isRequested || SessionStorageProbe.usesInMemoryStore
                 ? ChatModelContainer.make(configuration: ModelConfiguration(isStoredInMemoryOnly: true))
                 : ChatModelContainer.make()
             let agentStore = AgentStore(modelContext: container.mainContext)
@@ -66,7 +67,13 @@ struct ChatApp: App {
             _dreamScheduler = StateObject(wrappedValue: dreamScheduler)
             _preferencesNavigation = StateObject(wrappedValue: preferencesNavigation)
             DockBadgeController.shared.observe(chatStore)
-            if AppleServicesProbe.isRequested {
+            if isWindowPreview {
+                chatStore.startGroupChat()
+                chatStore.selectedChat?.rename(to: "Project discussion")
+                if let agent = agentStore.defaultAgent {
+                    chatStore.selectDefaultChat(for: agent)
+                }
+            } else if AppleServicesProbe.isRequested {
                 AppleServicesProbe.run(container: container)
             } else if SessionStorageProbe.isRequested {
                 Task { @MainActor in
@@ -113,9 +120,14 @@ struct ChatApp: App {
                 chatStore: chatStore
             )
                 .modelContainer(modelContainer)
-                .shadTheme(ChatShadTheme.theme)
+                .chatTheme()
+                .toolbarBackground(.hidden, for: .windowToolbar)
                 .background(MainWindowFramePersistenceView())
+                // Apply outside dialog presenters: their clipping otherwise
+                // cuts off content that extends into the title-bar safe area.
+                .ignoresSafeArea(.container, edges: .top)
         }
+        .windowStyle(.hiddenTitleBar)
         .commands {
 #if os(macOS)
             AgentCommands(navigation: preferencesNavigation)
@@ -129,7 +141,7 @@ struct ChatApp: App {
             if let turnID {
                 GenerationDebugWindow(turnID: turnID)
                     .modelContainer(modelContainer)
-                    .shadTheme(ChatShadTheme.theme)
+                    .chatTheme()
             }
         }
         .defaultSize(width: 900, height: 750)
@@ -142,19 +154,19 @@ struct ChatApp: App {
                 heartbeatScheduler: heartbeatScheduler
             )
                 .modelContainer(modelContainer)
-                .shadTheme(ChatShadTheme.theme)
+                .chatTheme()
         }
 
         Window("Background Tasks", id: "background-tasks") {
             BackgroundTasksView(tracker: backgroundTaskTracker)
                 .modelContainer(modelContainer)
-                .shadTheme(ChatShadTheme.theme)
+                .chatTheme()
         }
         .defaultSize(width: 860, height: 620)
         .windowResizability(.contentMinSize)
 
 #if os(macOS)
-        Settings {
+        Window("Settings", id: "preferences") {
             PreferencesView(
                 agentStore: agentStore,
                 localModelStore: localModelStore,
@@ -167,8 +179,14 @@ struct ChatApp: App {
                 navigation: preferencesNavigation
             )
             .modelContainer(modelContainer)
-            .shadTheme(ChatShadTheme.theme)
+            .chatTheme()
+            .toolbarBackground(.hidden, for: .windowToolbar)
+            // Keep the full-height adjustment outside any nested dialog clipping.
+            .ignoresSafeArea(.container, edges: .top)
         }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
 #endif
     }
 }
@@ -217,6 +235,7 @@ struct ContentView: View {
         iconWidth: 48
     )
     @StateObject private var sidebarPresentation = ChatSidebarPresentation()
+    @AppStorage("chatSidebarWidth") private var savedSidebarWidth = 280.0
     @State private var compactionStatusIsPresented = false
     @State private var voiceErrorMessage: String?
     @Environment(\.shadTheme) private var theme
@@ -239,10 +258,19 @@ struct ContentView: View {
                     chatStore: chatStore,
                     presentation: sidebarPresentation
                 )
+                .shadTheme { theme in
+                    theme.typography.medium = .regular
+                    theme.typography.semibold = .regular
+                }
+            }
+            .overlay(alignment: .trailing) {
+                if sidebarState.isOpen {
+                    SidebarResizeHandle(sidebar: sidebarState, savedWidth: $savedSidebarWidth)
+                }
             }
 
             ShadSidebarInset(variant: .sidebar) {
-                NavigationStack {
+                ZStack(alignment: .topLeading) {
                     if let chat = chatStore.selectedChat {
                         ChatDetailView(
                             chat: chat,
@@ -266,15 +294,22 @@ struct ContentView: View {
                             .foregroundStyle(theme.colors.mutedForeground)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                }
-                .toolbar {
-                    ToolbarItem(placement: .navigation) {
-                        ShadSidebarTrigger()
-                    }
+
+                    ShadSidebarTrigger()
+                        .padding(.top, theme.spacing.md)
+                        .padding(
+                            .leading,
+                            sidebarState.isOpen ? theme.spacing.lg : theme.spacing(20)
+                        )
+                        .zIndex(10)
                 }
             }
         }
         .frame(minWidth: 820, minHeight: 560)
+        .onAppear {
+            sidebarState.objectWillChange.send()
+            sidebarState.width = min(480, max(220, savedSidebarWidth))
+        }
         .shadDialog(isPresented: $sidebarPresentation.renameDialogIsPresented) {
             ShadDialogContent(maxWidth: 420) {
                 ShadDialogHeader {
@@ -376,9 +411,11 @@ struct ChatSidebar: View {
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var presentation: ChatSidebarPresentation
     @State private var collapsedAgentIDs: Set<Agent.ID> = []
-    @State private var groupChatsAreCollapsed = false
+    @StateObject private var sidebarDrag = SidebarDragState()
+    @AppStorage("chatSidebarOrder") private var savedOrder = "[]"
     @AppStorage(ChatAppearancePreferences.sidebarAvatarSizeKey)
     private var storedSidebarAvatarSize = ChatAppearancePreferences.defaultSidebarAvatarSize
+    @Environment(\.shadTheme) private var theme
 
     private var sidebarAvatarSize: CGFloat {
         ChatAppearancePreferences.sidebarAvatarSize(storedSidebarAvatarSize)
@@ -388,63 +425,73 @@ struct ChatSidebar: View {
         agentStore.agents.filter(\.isVisibleInSidebar)
     }
 
+    private var sidebarKeys: [String] {
+        SidebarOrder.sorted(
+            chatStore.groupChats.map { "group:\($0.id)" }
+                + visibleAgents.map { "agent:\($0.id)" },
+            saved: savedOrder
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ShadSidebarHeader {
                 newChatControl
             }
+            .padding(.top, theme.spacing(7))
 
             ShadSidebarContent {
                 ShadSidebarGroup("Chats") {
                     ShadSidebarMenu {
-                        if !chatStore.groupChats.isEmpty {
-                            GroupChatSection(
-                                chats: chatStore.groupChats,
-                                agentStore: agentStore,
-                                avatarSize: sidebarAvatarSize,
-                                selectedChatID: $chatStore.selectedChatID,
-                                isCollapsed: groupChatsAreCollapsed,
-                                onRenameChat: presentation.beginRenaming,
-                                onResetChat: presentation.beginReset,
-                                onDeleteChat: presentation.beginDelete,
-                                onSelectChat: chatStore.selectChat
-                            ) {
-                                groupChatsAreCollapsed.toggle()
-                            }
-                        }
-
-                        ForEach(visibleAgents) { agent in
-                            AgentSidebarSection(
-                                agent: agent,
-                                avatarSize: sidebarAvatarSize,
-                                defaultChat: chatStore.defaultChat(for: agent.id),
-                                extraChats: chatStore.extraChats(for: agent.id),
-                                selectedChatID: $chatStore.selectedChatID,
-                                isCollapsed: collapsedAgentIDs.contains(agent.id),
-                                onRenameChat: presentation.beginRenaming,
-                                onResetChat: presentation.beginReset,
-                                onDeleteChat: presentation.beginDelete,
-                                onSelectChat: chatStore.selectChat,
-                                onHideAgent: {
-                                    agentStore.updateAgentSidebarVisibility(
-                                        id: agent.id,
-                                        isVisible: false
-                                    )
-                                },
-                                onNewChat: {
-                                    startChat(with: agent)
-                                },
-                                onSelectDefault: {
-                                    chatStore.selectDefaultChat(for: agent)
+                        ForEach(sidebarKeys, id: \.self) { key in
+                            if let chat = chatStore.groupChats.first(where: { "group:\($0.id)" == key }) {
+                                ChatRow(
+                                    chat: chat,
+                                    participantAgentStore: agentStore,
+                                    avatarSize: sidebarAvatarSize,
+                                    isSelected: chatStore.selectedChatID == chat.id,
+                                    onRename: { presentation.beginRenaming(chat) },
+                                    onReset: { presentation.beginReset(chat) },
+                                    onDelete: { presentation.beginDelete(chat) },
+                                    onSelect: { chatStore.selectChat(chat) }
+                                )
+                                .modifier(SidebarReorderModifier(key: key, siblings: sidebarKeys, savedOrder: $savedOrder))
+                            } else if let agent = visibleAgents.first(where: { "agent:\($0.id)" == key }) {
+                                AgentSidebarSection(
+                                    agent: agent,
+                                    avatarSize: sidebarAvatarSize,
+                                    defaultChat: chatStore.defaultChat(for: agent.id),
+                                    extraChats: chatStore.extraChats(for: agent.id),
+                                    sidebarKeys: sidebarKeys,
+                                    savedOrder: $savedOrder,
+                                    selectedChatID: $chatStore.selectedChatID,
+                                    isCollapsed: collapsedAgentIDs.contains(agent.id),
+                                    onRenameChat: presentation.beginRenaming,
+                                    onResetChat: presentation.beginReset,
+                                    onDeleteChat: presentation.beginDelete,
+                                    onSelectChat: chatStore.selectChat,
+                                    onHideAgent: {
+                                        agentStore.updateAgentSidebarVisibility(
+                                            id: agent.id,
+                                            isVisible: false
+                                        )
+                                    },
+                                    onNewChat: {
+                                        startChat(with: agent)
+                                    },
+                                    onSelectDefault: {
+                                        chatStore.selectDefaultChat(for: agent)
+                                    }
+                                ) {
+                                    toggleAgent(agent.id)
                                 }
-                            ) {
-                                toggleAgent(agent.id)
                             }
                         }
                     }
                 }
             }
         }
+        .environmentObject(sidebarDrag)
     }
 
     private func toggleAgent(_ agentID: Agent.ID) {
@@ -617,6 +664,8 @@ struct AgentSidebarSection: View {
     let avatarSize: CGFloat
     let defaultChat: ChatViewModel?
     let extraChats: [ChatViewModel]
+    let sidebarKeys: [String]
+    @Binding var savedOrder: String
     @Binding var selectedChatID: ChatViewModel.ID?
     let isCollapsed: Bool
     let onRenameChat: (ChatViewModel) -> Void
@@ -632,6 +681,10 @@ struct AgentSidebarSection: View {
 
     private var isDefaultSelected: Bool {
         defaultChat.map { selectedChatID == $0.id } ?? false
+    }
+
+    private var extraChatKeys: [String] {
+        SidebarOrder.sorted(extraChats.map { "chat:\($0.id)" }, saved: savedOrder)
     }
 
     var body: some View {
@@ -696,74 +749,24 @@ struct AgentSidebarSection: View {
                     onHideAgent()
                 }
             }
+            .modifier(SidebarReorderModifier(
+                key: "agent:\(agent.id)", siblings: sidebarKeys, savedOrder: $savedOrder
+            ))
 
             if !isCollapsed, !extraChats.isEmpty {
                 ShadSidebarMenuSub {
-                    ForEach(extraChats) { chat in
-                        ChatRow(
-                            chat: chat,
-                            isSelected: selectedChatID == chat.id,
-                            onRename: {
-                                onRenameChat(chat)
-                            },
-                            onReset: {
-                                onResetChat(chat)
-                            },
-                            onDelete: {
-                                onDeleteChat(chat)
+                    ForEach(extraChatKeys, id: \.self) { key in
+                        if let chat = extraChats.first(where: { "chat:\($0.id)" == key }) {
+                            ChatRow(
+                                chat: chat,
+                                isSelected: selectedChatID == chat.id,
+                                onRename: { onRenameChat(chat) },
+                                onReset: { onResetChat(chat) },
+                                onDelete: { onDeleteChat(chat) }
+                            ) {
+                                onSelectChat(chat)
                             }
-                        ) {
-                            onSelectChat(chat)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-struct GroupChatSection: View {
-    let chats: [ChatViewModel]
-    @ObservedObject var agentStore: AgentStore
-    let avatarSize: CGFloat
-    @Binding var selectedChatID: ChatViewModel.ID?
-    let isCollapsed: Bool
-    let onRenameChat: (ChatViewModel) -> Void
-    let onResetChat: (ChatViewModel) -> Void
-    let onDeleteChat: (ChatViewModel) -> Void
-    let onSelectChat: (ChatViewModel) -> Void
-    let onToggle: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ShadSidebarMenuButton(
-                "Group chats",
-                icon: .users,
-                action: onToggle
-            ) {
-                ShadIconView(.chevronDown, size: 12)
-                        .rotationEffect(.degrees(isCollapsed ? -90 : 0))
-            }
-
-            if !isCollapsed {
-                ShadSidebarMenuSub {
-                    ForEach(chats) { chat in
-                        ChatRow(
-                            chat: chat,
-                            participantAgentStore: agentStore,
-                            avatarSize: avatarSize,
-                            isSelected: selectedChatID == chat.id,
-                            onRename: {
-                                onRenameChat(chat)
-                            },
-                            onReset: {
-                                onResetChat(chat)
-                            },
-                            onDelete: {
-                                onDeleteChat(chat)
-                            }
-                        ) {
-                            onSelectChat(chat)
+                            .modifier(SidebarReorderModifier(key: key, siblings: extraChatKeys, savedOrder: $savedOrder))
                         }
                     }
                 }
@@ -855,11 +858,12 @@ struct ChatRow: View {
 
 private struct UnreadBadge: View {
     let count: Int
+    @Environment(\.shadTheme) private var theme
 
     var body: some View {
         if count > 0 {
             Text(String(count))
-                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .font(theme.font(theme.typography.xs * (10.0 / 12.0), .bold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.45)
@@ -1088,7 +1092,6 @@ struct ChatDetailView: View {
         .onPreferenceChange(ComposerOverlayHeightKey.self) { height in
             composerOverlayHeight = height
         }
-        .navigationTitle(chat.displayTitle)
         .shadDialog(isPresented: $responseEditIsPresented) {
             ShadDialogContent(maxWidth: 620, showsCloseButton: false) {
                 ShadDialogHeader {
@@ -1375,15 +1378,13 @@ struct ChatDetailView: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: theme.spacing.md) {
+        HStack(alignment: .bottom, spacing: theme.spacing.md) {
             TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(theme.font(theme.typography.sm))
                 .foregroundStyle(theme.colors.cardForeground)
                 .lineLimit(1...6)
-                .frame(minHeight: 46, alignment: .topLeading)
-                .padding(.horizontal, theme.spacing.xxl)
-                .padding(.top, theme.spacing.xl)
+                .frame(minHeight: 28, alignment: .leading)
                 .focused($composerIsFocused)
                 .submitLabel(.send)
                 .onSubmit {
@@ -1392,27 +1393,40 @@ struct ChatDetailView: View {
                 .disabled(!chat.canSend || chat.isResponding || voiceInput.isActive)
 
             HStack(spacing: theme.spacing.xs) {
-                Spacer(minLength: 0)
                 replyReadingModeButton
                 voiceModeButton
 
-                ShadButton(
-                    icon: .custom("arrow.up"),
-                    size: .iconLG,
-                    shape: .pill,
-                    accessibilityLabel: "Send message"
-                ) {
-                    submitDraft()
+                if chat.isResponding {
+                    ShadButton(
+                        icon: .custom("stop.fill"),
+                        variant: .secondary,
+                        size: .iconSM,
+                        shape: .pill,
+                        accessibilityLabel: "Stop generating"
+                    ) {
+                        chat.abortResponse()
+                    }
+                    .help("Stop generating")
+                } else {
+                    ShadButton(
+                        icon: .custom("arrow.up"),
+                        size: .iconSM,
+                        shape: .pill,
+                        accessibilityLabel: "Send message"
+                    ) {
+                        submitDraft()
+                    }
+                    .disabled(!chat.canSubmitDraft || voiceInput.isActive)
+                    .help("Send message")
                 }
-                .disabled(!chat.canSubmitDraft || voiceInput.isActive)
-                .help("Send message")
             }
-            .padding(.horizontal, theme.spacing.lg)
-            .padding(.bottom, theme.spacing.lg)
         }
-        .background(theme.colors.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .padding(.leading, theme.spacing.xl)
+        .padding(.trailing, theme.spacing.md)
+        .padding(.vertical, theme.spacing.md)
+        .background(theme.colors.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .strokeBorder(theme.colors.border, lineWidth: theme.borderWidth)
         }
         .shadow(color: .black.opacity(0.09), radius: 16, y: 5)
@@ -1431,7 +1445,10 @@ struct ChatDetailView: View {
                     : agentStore.agents.filter { $0.id == chat.agentID })
                 composer
             }
-            .padding(.horizontal, theme.spacing.xl)
+            .padding(.leading, theme.spacing.xl)
+            // Reserve a scrollbar gutter so the composer's rounded edge and
+            // trailing controls do not sit beneath the overlay scrollbar.
+            .padding(.trailing, theme.spacing(8))
             .padding(.bottom, theme.spacing.xl)
             .frame(maxWidth: 900)
             .background {
@@ -1451,7 +1468,7 @@ struct ChatDetailView: View {
         return ShadButton(
             icon: .custom("mic.fill"),
             variant: voiceInput.isActive ? .secondary : .ghost,
-            size: .icon,
+            size: .iconSM,
             shape: .pill,
             accessibilityLabel: voiceModeAccessibilityLabel,
             isLoading: isLoading
@@ -1477,7 +1494,7 @@ struct ChatDetailView: View {
                 readRepliesOnlyIsEnabled ? "speaker.wave.2.fill" : "speaker.wave.2"
             ),
             variant: readRepliesOnlyIsEnabled ? .secondary : .ghost,
-            size: .icon,
+            size: .iconSM,
             shape: .pill,
             accessibilityLabel: readRepliesOnlyIsEnabled
                 ? "Turn off reading replies"
@@ -2091,13 +2108,20 @@ struct GroupChatEmptyState: View {
 #if os(macOS)
 struct AgentCommands: Commands {
     @ObservedObject var navigation: PreferencesNavigation
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") {
+                openWindow(id: "preferences")
+            }
+            .keyboardShortcut(",", modifiers: .command)
+        }
+
         CommandGroup(after: .pasteboard) {
             Button("Agents") {
                 navigation.selection = .agents
-                openSettings()
+                openWindow(id: "preferences")
             }
         }
     }
@@ -2264,6 +2288,6 @@ struct ContentViewPreview: View {
             chatStore: chatStore
         )
             .modelContainer(modelContainer)
-            .shadTheme(ChatShadTheme.theme)
+            .chatTheme()
     }
 }

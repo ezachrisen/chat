@@ -343,7 +343,7 @@ private struct DreamScheduleEditor: View {
 
             if let nextRunAt {
                 Text("Next start: \(nextRunAt.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption)
+                    .chatSystemFont(.caption1)
                     .foregroundStyle(.secondary)
             }
         }

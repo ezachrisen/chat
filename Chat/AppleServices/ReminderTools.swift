@@ -28,17 +28,17 @@ nonisolated struct ListReminderListsArguments: ReminderOperation {
 nonisolated struct FindRemindersArguments: ReminderOperation {
     @Guide(description: "List name or list ID. Omit to search every allowed list.") var listName: String?
     @Guide(description: "Words to match in reminder titles or notes. Omit to list items; never put the list name here.") var textContains: String?
-    @Guide(description: "Inclusive start date YYYY-MM-DD in local time; omit for no lower bound.") var dueFrom: String?
-    @Guide(description: "Inclusive end date YYYY-MM-DD in local time. For today through today + 3, supply both dates.") var dueThrough: String?
+    @Guide(description: "Inclusive start date YYYY-MM-DD in local time; omit for no lower bound. Date-range results also include overdue incomplete reminders.") var dueFrom: String?
+    @Guide(description: "Inclusive end date YYYY-MM-DD in local time. For today through today + 3, supply both dates. Date-range results also include overdue incomplete reminders.") var dueThrough: String?
     @Guide(description: "incomplete (default), completed, or all. Include completed only if requested.", .anyOf(["incomplete", "completed", "all"])) var status: String?
     @Guide(description: "nextOffset from the previous result; otherwise omit. Keep all filters unchanged.") var offset: Int?
     static let toolName = "FindReminders"
-    static let toolDescription = "Find reminders. For \"anything on my Shopping List\", set listName=\"Shopping List\" and omit textContains. Omitting listName searches ALL allowed lists. Returns five id/title/due summaries plus nextOffset. Stop when you can answer; do not fetch every page unnecessarily."
+    static let toolDescription = "Find reminders. Date-range searches always include overdue incomplete reminders in addition to reminders within the range. For \"anything on my Shopping List\", set listName=\"Shopping List\" and omit textContains. Omitting listName searches ALL allowed lists. Returns five id/title/due summaries plus nextOffset. Stop when you can answer; do not fetch every page unnecessarily."
     static var properties: [String: OpenAIJSONProperty] { [
         "listName": OpenAIJSONProperty(type: "string", description: "List name or list ID. Omit to search every allowed list."),
         "textContains": OpenAIJSONProperty(type: "string", description: "Words to match in reminder titles or notes. Omit to list items; never put the list name here."),
-        "dueFrom": OpenAIJSONProperty(type: "string", description: "Inclusive start date YYYY-MM-DD in local time; omit for no lower bound."),
-        "dueThrough": OpenAIJSONProperty(type: "string", description: "Inclusive end date YYYY-MM-DD in local time. For today through today + 3, supply both dates."),
+        "dueFrom": OpenAIJSONProperty(type: "string", description: "Inclusive start date YYYY-MM-DD in local time; omit for no lower bound. Date-range results also include overdue incomplete reminders."),
+        "dueThrough": OpenAIJSONProperty(type: "string", description: "Inclusive end date YYYY-MM-DD in local time. For today through today + 3, supply both dates. Date-range results also include overdue incomplete reminders."),
         "status": OpenAIJSONProperty(type: "string", description: "incomplete (default), completed, or all. Include completed only if requested.", enumValues: ["incomplete", "completed", "all"]),
         "offset": OpenAIJSONProperty(type: "integer", description: "nextOffset from the previous result; otherwise omit. Keep all filters unchanged."),
     ] }

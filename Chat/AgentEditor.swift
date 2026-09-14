@@ -2854,7 +2854,7 @@ private struct AgentsPreferencesViewPreview: View {
             dreamScheduler: dreamScheduler
         )
         .modelContainer(modelContainer)
-        .shadTheme(ChatShadTheme.theme)
+        .chatTheme()
         .frame(width: 900, height: 680)
     }
 }

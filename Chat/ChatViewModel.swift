@@ -72,6 +72,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private let replyFilterStore: ReplyFilterStore
     private let collaborationCoordinator: AgentCollaborationCoordinator
     private var modelStoreCancellable: AnyCancellable?
+    private var responseTask: Task<Void, Never>?
     private var visibleUnreadMessageIDs: Set<ChatMessage.ID> = []
     private var pendingReadTasks: [ChatMessage.ID: Task<Void, Never>] = [:]
 
@@ -565,12 +566,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
             let userMessage = appendMessage(role: .user, text: prompt)
             isResponding = true
 
-            Task {
+            responseTask = Task { [weak self] in
+                guard let self else { return }
                 await respondAsGroup(
                     userMessageID: userMessage.id,
                     directlyMentionedAgentIDs: directlyMentionedAgentIDs,
                     prioritizedAgentIDs: prioritizedAgentIDs
                 )
+                responseTask = nil
             }
             return
         }
@@ -583,9 +586,16 @@ final class ChatViewModel: ObservableObject, Identifiable {
         let userMessage = appendMessage(role: .user, text: prompt)
         isResponding = true
 
-        Task {
+        responseTask = Task { [weak self] in
+            guard let self else { return }
             await respond(userMessageID: userMessage.id)
+            responseTask = nil
         }
+    }
+
+    func abortResponse() {
+        guard isResponding else { return }
+        responseTask?.cancel()
     }
 
     func executeHeartbeat(
