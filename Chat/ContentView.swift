@@ -577,7 +577,7 @@ struct AgentSidebarSection: View {
 
                         Spacer(minLength: 0)
 
-                        if let defaultChat {
+                        if let defaultChat, !isDefaultSelected {
                             ChatUnreadBadge(chat: defaultChat)
                         }
                     }
@@ -739,7 +739,9 @@ struct ChatRow: View {
 
                 Spacer(minLength: 0)
 
-                UnreadBadge(count: chat.unreadCount)
+                if !isSelected {
+                    UnreadBadge(count: chat.unreadCount)
+                }
             }
             .foregroundStyle(
                 isSelected
@@ -1293,7 +1295,7 @@ struct ChatDetailView: View {
             TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(theme.font(theme.typography.sm))
-                .foregroundStyle(Color.black.opacity(0.88))
+                .foregroundStyle(theme.colors.cardForeground)
                 .lineLimit(1...6)
                 .frame(minHeight: 46, alignment: .topLeading)
                 .padding(.horizontal, theme.spacing.xxl)
@@ -1324,19 +1326,13 @@ struct ChatDetailView: View {
             .padding(.horizontal, theme.spacing.lg)
             .padding(.bottom, theme.spacing.lg)
         }
-        .background(Color.white, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background(theme.colors.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(Color.black.opacity(0.07), lineWidth: theme.borderWidth)
+                .strokeBorder(theme.colors.border, lineWidth: theme.borderWidth)
         }
         .shadow(color: .black.opacity(0.09), radius: 16, y: 5)
         .modifier(VoiceDictationGlow(isActive: voiceInput.isTranscribing))
-        .shadTheme { composerTheme in
-            composerTheme.colors.foreground = Color.black.opacity(0.88)
-            composerTheme.colors.mutedForeground = Color.black.opacity(0.52)
-            composerTheme.colors.primary = .black
-            composerTheme.colors.primaryForeground = .white
-        }
     }
 
     private var composerOverlay: some View {
