@@ -924,8 +924,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             participants: responseOrder,
             userMessageID: userMessageID,
             directlyMentionedAgentIDs: directlyMentionedAgentIDs,
-            isFollowUp: false,
-            transcriptSnapshot: nil
+            isFollowUp: false
         )
 
         guard allowsMultipleAgentTurns,
@@ -933,13 +932,11 @@ final class ChatViewModel: ObservableObject, Identifiable {
               groupParticipants.count > 1,
               !Task.isCancelled else { return }
 
-        let firstPassTranscript = allStoredMessages()
         _ = await runGroupResponsePass(
             participants: responseOrder,
             userMessageID: userMessageID,
             directlyMentionedAgentIDs: directlyMentionedAgentIDs,
-            isFollowUp: true,
-            transcriptSnapshot: firstPassTranscript
+            isFollowUp: true
         )
     }
 
@@ -947,8 +944,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
         participants: [StoredGroupChatParticipant],
         userMessageID: UUID,
         directlyMentionedAgentIDs: Set<UUID>,
-        isFollowUp: Bool,
-        transcriptSnapshot: [StoredChatMessage]?
+        isFollowUp: Bool
     ) async -> Bool {
         var postedReply = false
 
@@ -966,7 +962,6 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     from: participant,
                     wasDirectlyMentioned: directlyMentionedAgentIDs.contains(participant.agentID),
                     isFollowUp: isFollowUp,
-                    transcriptSnapshot: transcriptSnapshot,
                     recorder: recorder,
                     captureDebug: debugCaptureEnabled
                 )
@@ -1036,11 +1031,12 @@ final class ChatViewModel: ObservableObject, Identifiable {
         from participant: StoredGroupChatParticipant,
         wasDirectlyMentioned: Bool,
         isFollowUp: Bool,
-        transcriptSnapshot: [StoredChatMessage]?,
         recorder: ToolCallRecorder,
         captureDebug: Bool
     ) async throws -> GroupGeneration {
-        let storedMessages = transcriptSnapshot ?? allStoredMessages()
+        // Re-read the transcript for every speaker. The pass is sequential, so
+        // this includes replies already posted by earlier agents in this turn.
+        let storedMessages = allStoredMessages()
         let backend = localModelStore.backend(for: participant.agentModelIdentifier)
         let generation = generationSupport(
             for: agentStore.agent(for: participant.agentID),
