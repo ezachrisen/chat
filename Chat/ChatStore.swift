@@ -605,7 +605,7 @@ final class ChatStore: ObservableObject {
                 startedAt: startedAt,
                 completedAt: .now,
                 modelInput: "",
-                modelOutput: nil,
+                modelOutput: exchange.modelOutput,
                 actionSummary: exchange.actionSummary,
                 errorMessage: nil,
                 retryDelay: nil,
@@ -697,7 +697,8 @@ final class ChatStore: ObservableObject {
         debug: GenerationDebugPayloadDraft? = nil,
         error: Error
     ) -> HeartbeatExecutionReport {
-        let wasAborted = (error as? HeartbeatModelFailure)?.wasAborted == true
+        let heartbeatFailure = error as? HeartbeatModelFailure
+        let wasAborted = heartbeatFailure?.wasAborted == true
         let actionSummary: String
         if wasAborted {
             actionSummary = "Run was aborted. No chat message was posted."
@@ -712,7 +713,7 @@ final class ChatStore: ObservableObject {
             startedAt: startedAt,
             completedAt: Date(),
             modelInput: "",
-            modelOutput: nil,
+            modelOutput: heartbeatFailure?.modelOutput,
             actionSummary: actionSummary,
             errorMessage: wasAborted ? "Aborted by user." : error.localizedDescription,
             retryDelay: nil,
@@ -727,7 +728,7 @@ final class ChatStore: ObservableObject {
             modelIdentifier: modelIdentifier,
             backendRawValue: backendRawValue,
             toolInvocations: toolInvocations,
-            debug: debugCaptureEnabled ? debug : nil,
+            debug: debug,
             promptTokenCount: storedTokenUsage(from: error)?.promptTokens,
             completionTokenCount: storedTokenUsage(from: error)?.completionTokens
         )

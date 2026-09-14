@@ -15,6 +15,7 @@ struct ChatApp: App {
     @StateObject private var skillCatalog: SkillCatalog
     @StateObject private var replyFilterStore: ReplyFilterStore
     @StateObject private var chatStore: ChatStore
+    @StateObject private var backgroundTaskTracker: BackgroundTaskTracker
     @StateObject private var heartbeatScheduler: HeartbeatScheduler
     @StateObject private var dreamScheduler: DreamScheduler
     @StateObject private var preferencesNavigation: PreferencesNavigation
@@ -36,12 +37,18 @@ struct ChatApp: App {
                 replyFilterStore: replyFilterStore,
                 modelContext: container.mainContext
             )
-            let heartbeatScheduler = HeartbeatScheduler(agentStore: agentStore, chatStore: chatStore)
+            let backgroundTaskTracker = BackgroundTaskTracker(modelContext: container.mainContext)
+            let heartbeatScheduler = HeartbeatScheduler(
+                agentStore: agentStore,
+                chatStore: chatStore,
+                backgroundTaskTracker: backgroundTaskTracker
+            )
             let dreamScheduler = DreamScheduler(
                 agentStore: agentStore,
                 localModelStore: localModelStore,
                 chatStore: chatStore,
-                heartbeatScheduler: heartbeatScheduler
+                heartbeatScheduler: heartbeatScheduler,
+                backgroundTaskTracker: backgroundTaskTracker
             )
             heartbeatScheduler.otherBackgroundModelWorkIsRunning = { [weak dreamScheduler] in
                 dreamScheduler?.runningDream != nil
@@ -54,6 +61,7 @@ struct ChatApp: App {
             _skillCatalog = StateObject(wrappedValue: skillCatalog)
             _replyFilterStore = StateObject(wrappedValue: replyFilterStore)
             _chatStore = StateObject(wrappedValue: chatStore)
+            _backgroundTaskTracker = StateObject(wrappedValue: backgroundTaskTracker)
             _heartbeatScheduler = StateObject(wrappedValue: heartbeatScheduler)
             _dreamScheduler = StateObject(wrappedValue: dreamScheduler)
             _preferencesNavigation = StateObject(wrappedValue: preferencesNavigation)
@@ -113,6 +121,7 @@ struct ChatApp: App {
             AgentCommands(navigation: preferencesNavigation)
 #endif
             HeartbeatCommands()
+            BackgroundTaskCommands()
             DeveloperCommands(chatStore: chatStore)
         }
 
@@ -135,6 +144,14 @@ struct ChatApp: App {
                 .modelContainer(modelContainer)
                 .shadTheme(ChatShadTheme.theme)
         }
+
+        Window("Background Tasks", id: "background-tasks") {
+            BackgroundTasksView(tracker: backgroundTaskTracker)
+                .modelContainer(modelContainer)
+                .shadTheme(ChatShadTheme.theme)
+        }
+        .defaultSize(width: 860, height: 620)
+        .windowResizability(.contentMinSize)
 
 #if os(macOS)
         Settings {

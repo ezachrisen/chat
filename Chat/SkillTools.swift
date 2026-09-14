@@ -1245,11 +1245,11 @@ struct AgentToolBox: Sendable {
         )
     }
 
-    static func dream(reader: DreamMessageReader) -> AgentToolBox {
+    static func dream(reader: DreamMessageReader, recorder: ToolCallRecorder? = nil) -> AgentToolBox {
         AgentToolBox(
             runtime: SkillRuntime(skills: []),
             enabledToolIDs: [],
-            recorder: nil,
+            recorder: recorder,
             agentName: "Dream",
             calendarPolicy: .none,
             liveCalendarPolicy: { .none },
@@ -1259,7 +1259,9 @@ struct AgentToolBox: Sendable {
             soulRuntime: nil,
             delegationRuntime: nil,
             authorization: nil,
-            dreamMessageTool: DreamMessageToolEntry(tool: ReadDreamMessagesTool(reader: reader))
+            dreamMessageTool: DreamMessageToolEntry(
+                tool: ReadDreamMessagesTool(reader: reader, recorder: recorder)
+            )
         )
     }
 }

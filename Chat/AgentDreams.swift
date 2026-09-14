@@ -364,12 +364,34 @@ nonisolated struct ReadDreamMessagesArguments: Codable, Sendable {
 
 struct ReadDreamMessagesTool: Tool {
     let reader: DreamMessageReader
+    let recorder: ToolCallRecorder?
 
     let name = "ReadDreamMessages"
     let description = "Read one bounded, chronological chunk of full-text messages from the current dream window. Continue with nextCursor until it is absent."
 
     func call(arguments: ReadDreamMessagesArguments) async throws -> String {
-        try Self.output(reader.read(cursor: max(0, arguments.cursor ?? 0)))
+        let startedAt = Date()
+        let argumentsJSON = "{\"cursor\":\(max(0, arguments.cursor ?? 0))}"
+        do {
+            let result = try Self.output(reader.read(cursor: max(0, arguments.cursor ?? 0)))
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: nil,
+                result: .success(result)
+            )
+            return result
+        } catch {
+            recorder?.record(
+                startedAt: startedAt,
+                toolName: name,
+                argumentsJSON: argumentsJSON,
+                skillName: nil,
+                result: .failure(error)
+            )
+            throw error
+        }
     }
 
     func executeJSON(_ json: String) async throws -> String {
@@ -391,7 +413,7 @@ struct ReadDreamMessagesTool: Tool {
         )
     }
 
-    private static func output(_ chunk: DreamTranscriptChunk) throws -> String {
+    static func output(_ chunk: DreamTranscriptChunk) throws -> String {
         let object: [String: Any] = [
             "messages": chunk.text,
             "messageCount": chunk.messageCount,
@@ -425,6 +447,7 @@ final class DreamScheduler: ObservableObject {
     private let localModelStore: LocalModelStore
     private let chatStore: ChatStore
     private weak var heartbeatScheduler: HeartbeatScheduler?
+    private let backgroundTaskTracker: BackgroundTaskTracker?
     private var schedulerTask: Task<Void, Never>?
     private var executionTask: Task<Void, Never>?
 
@@ -432,12 +455,14 @@ final class DreamScheduler: ObservableObject {
         agentStore: AgentStore,
         localModelStore: LocalModelStore,
         chatStore: ChatStore,
-        heartbeatScheduler: HeartbeatScheduler
+        heartbeatScheduler: HeartbeatScheduler,
+        backgroundTaskTracker: BackgroundTaskTracker? = nil
     ) {
         self.agentStore = agentStore
         self.localModelStore = localModelStore
         self.chatStore = chatStore
         self.heartbeatScheduler = heartbeatScheduler
+        self.backgroundTaskTracker = backgroundTaskTracker
     }
 
     func start() {
@@ -484,11 +509,21 @@ final class DreamScheduler: ObservableObject {
     private func run(agentID: Agent.ID) async {
         guard let agent = agentStore.agent(for: agentID) else { return }
         let startedAt = Date()
+        let taskID = UUID()
         runningDream = RunningDream(
             agentID: agent.id,
             agentName: agent.displayName,
             startedAt: startedAt,
             stage: "Light Sleep"
+        )
+        backgroundTaskTracker?.start(
+            id: taskID,
+            kind: .dream,
+            title: "Dream",
+            agentID: agent.id,
+            agentName: agent.displayName,
+            detail: "Light Sleep",
+            at: startedAt
         )
 
         let since = agent.lastDreamCompletedAt ?? startedAt.addingTimeInterval(-86_400)
@@ -499,6 +534,13 @@ final class DreamScheduler: ObservableObject {
             agentDefault: agent.selectedModelIdentifier
         )
         let lightBackend = localModelStore.backend(for: lightModel)
+        backgroundTaskTracker?.append(
+            taskID,
+            stage: "Setup",
+            label: "Dream Window",
+            content: "From: \(since.formatted(date: .complete, time: .standard))\nThrough: \(startedAt.formatted(date: .complete, time: .standard))\nMessages: \(messages.count)\nLight model: \(lightModel)",
+            at: startedAt
+        )
         let contextCharacters = max(
             2_000,
             min(48_000, ConversationCompaction.contextWindow(for: lightBackend) * 3 / 2)
@@ -506,22 +548,47 @@ final class DreamScheduler: ObservableObject {
         let reader = DreamMessageReader(messages: messages, maximumCharacters: contextCharacters)
         var cursor = 0
         var candidates: [String] = []
+        var chunkNumber = 0
+        var activeRecorder: ToolCallRecorder?
+        var activeStage = "Light Sleep"
 
         do {
             repeat {
                 let chunk = reader.read(cursor: cursor)
                 guard chunk.messageCount > 0 else { break }
+                chunkNumber += 1
+                let systemPrompt = lightSystemPrompt(agent: agent)
+                let conversationPrompt = """
+                \(resolvedLightPrompt(for: agent))
+
+                Call ReadDreamMessages once with cursor \(cursor), review every returned message, and return candidate memories only. Do not request another cursor in this model call; the dream scheduler will start a fresh context for it.
+                """
+                let recorder = ToolCallRecorder(capturesFullContent: true)
+                activeRecorder = recorder
+                activeStage = "Light Sleep · Chunk \(chunkNumber)"
+                backgroundTaskTracker?.append(
+                    taskID,
+                    stage: "Light Sleep · Chunk \(chunkNumber)",
+                    label: "System Prompt",
+                    content: systemPrompt
+                )
+                backgroundTaskTracker?.append(
+                    taskID,
+                    stage: "Light Sleep · Chunk \(chunkNumber)",
+                    label: "Conversation Prompt",
+                    content: conversationPrompt
+                )
                 let result = try await ModelClient.complete(
                     using: lightBackend,
-                    systemPrompt: lightSystemPrompt(agent: agent),
-                    prompt: """
-                    \(resolvedLightPrompt(for: agent))
-
-                    Call ReadDreamMessages once with cursor \(cursor), review every returned message, and return candidate memories only. Do not request another cursor in this model call; the dream scheduler will start a fresh context for it.
-                    """,
-                    tools: AgentToolBox.dream(reader: reader),
+                    systemPrompt: systemPrompt,
+                    prompt: conversationPrompt,
+                    tools: AgentToolBox.dream(reader: reader, recorder: recorder),
+                    captureDebug: true,
                     missingLocalModelMessage: "The Light Sleep model is no longer configured."
                 )
+                recordDreamTools(recorder.snapshot(), taskID: taskID, stage: "Light Sleep · Chunk \(chunkNumber)")
+                activeRecorder = nil
+                recordDreamResult(result, taskID: taskID, stage: "Light Sleep · Chunk \(chunkNumber)")
                 let trimmed = result.finalText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty, !ModelPrompts.isPassResponse(trimmed) { candidates.append(trimmed) }
                 guard let next = chunk.nextCursor else { break }
@@ -538,30 +605,85 @@ final class DreamScheduler: ObservableObject {
                 in: agentStore.modelContext,
                 now: startedAt
             )
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: "Light Sleep",
+                label: "Stash · Light Dream",
+                content: lightDream
+            )
 
             runningDream?.stage = "REM Sleep"
+            backgroundTaskTracker?.update(taskID, detail: "REM Sleep")
             let remModel = resolvedModel(
                 agentOverride: agent.dreamREMModelIdentifierOverride,
                 appChoice: agentStore.dreamSettings.remModelIdentifier,
                 agentDefault: agent.selectedModelIdentifier
             )
+            let remSystem = remSystemPrompt(agent: agent)
+            let remConversation = """
+            \(resolvedREMPrompt(for: agent))
+
+            --- BEGIN LIGHT DREAM STASH ---
+            \(lightDream)
+            --- END LIGHT DREAM STASH ---
+            """
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: "REM Sleep",
+                label: "Run Context",
+                content: "Model: \(remModel)"
+            )
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: "REM Sleep",
+                label: "System Prompt",
+                content: remSystem
+            )
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: "REM Sleep",
+                label: "Conversation Prompt",
+                content: remConversation
+            )
             let result = try await ModelClient.complete(
                 using: localModelStore.backend(for: remModel),
-                systemPrompt: remSystemPrompt(agent: agent),
-                prompt: """
-                \(resolvedREMPrompt(for: agent))
-
-                --- BEGIN LIGHT DREAM STASH ---
-                \(lightDream)
-                --- END LIGHT DREAM STASH ---
-                """,
+                systemPrompt: remSystem,
+                prompt: remConversation,
+                captureDebug: true,
                 missingLocalModelMessage: "The REM Sleep model is no longer configured."
             )
+            recordDreamResult(result, taskID: taskID, stage: "REM Sleep")
             let parsed = AgentMemoryHarness.parse(result.finalText)
             agentStore.appendAgentMemoryEntries(id: agent.id, entries: parsed.memoryEntries)
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: "REM Sleep",
+                label: "Permanent Memory Changes",
+                content: parsed.memoryEntries.isEmpty
+                    ? "No permanent memories were added."
+                    : parsed.memoryEntries.joined(separator: "\n\n")
+            )
             agentStore.recordDreamCompletion(agentID: agent.id, through: startedAt, error: nil)
+            backgroundTaskTracker?.finish(taskID, status: .succeeded)
         } catch {
+            if let activeRecorder {
+                recordDreamTools(activeRecorder.snapshot(), taskID: taskID, stage: activeStage)
+            }
+            if let partial = (error as? ModelGenerationError)?.partial {
+                recordDreamResult(partial, taskID: taskID, stage: runningDream?.stage ?? "Dream")
+            }
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: runningDream?.stage ?? "Dream",
+                label: "Error",
+                content: error.localizedDescription
+            )
             agentStore.recordDreamCompletion(agentID: agent.id, through: nil, error: error.localizedDescription)
+            backgroundTaskTracker?.finish(
+                taskID,
+                status: error is CancellationError ? .cancelled : .failed,
+                errorMessage: error.localizedDescription
+            )
         }
     }
 
@@ -608,6 +730,53 @@ final class DreamScheduler: ObservableObject {
             text.removeLast(max(1, text.count / 20))
         }
         return text
+    }
+
+    private func recordDreamResult(_ result: ModelGenerationResult, taskID: UUID, stage: String) {
+        backgroundTaskTracker?.append(
+            taskID,
+            stage: stage,
+            label: "Model Output",
+            content: result.finalText
+        )
+        if !result.reasoningTexts.isEmpty {
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: stage,
+                label: "Reasoning",
+                content: result.reasoningTexts.joined(separator: "\n\n")
+            )
+        }
+        if !result.intermediateAssistantTexts.isEmpty {
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: stage,
+                label: "Intermediate Output",
+                content: result.intermediateAssistantTexts.joined(separator: "\n\n")
+            )
+        }
+        if let transcript = result.debug?.appleTranscriptSummary {
+            backgroundTaskTracker?.append(taskID, stage: stage, label: "Provider Transcript", content: transcript)
+        }
+        if let messages = result.debug?.openAIMessagesJSON {
+            backgroundTaskTracker?.append(taskID, stage: stage, label: "Provider Messages", content: messages)
+        }
+    }
+
+    private func recordDreamTools(
+        _ invocations: [CapturedToolInvocation],
+        taskID: UUID,
+        stage: String
+    ) {
+        for invocation in invocations {
+            backgroundTaskTracker?.append(
+                taskID,
+                stage: stage,
+                label: "Tool · \(invocation.toolName)",
+                content: "Arguments:\n\(invocation.argumentsJSON)\n\nResult:\n\(invocation.resultText)",
+                at: invocation.completedAt
+            )
+        }
     }
 }
 

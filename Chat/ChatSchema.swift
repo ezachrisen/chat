@@ -49,6 +49,7 @@ enum ChatModelContainer {
             AgentInvocationRecord.self,
             AgentHeartbeat.self,
             HeartbeatRun.self,
+            BackgroundTaskRun.self,
             DreamConfiguration.self,
             LocalModel.self,
             ReplyFilterSet.self,

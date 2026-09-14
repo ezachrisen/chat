@@ -500,13 +500,19 @@ final class HeartbeatScheduler: ObservableObject {
 
     private let agentStore: AgentStore
     private let chatStore: ChatStore
+    private let backgroundTaskTracker: BackgroundTaskTracker?
     private var schedulerTask: Task<Void, Never>?
     private var executionTasks: [AgentHeartbeat.ID: HeartbeatExecutionSlot] = [:]
     private var timeoutTasks: [AgentHeartbeat.ID: (token: UUID, task: Task<Void, Never>)] = [:]
 
-    init(agentStore: AgentStore, chatStore: ChatStore) {
+    init(
+        agentStore: AgentStore,
+        chatStore: ChatStore,
+        backgroundTaskTracker: BackgroundTaskTracker? = nil
+    ) {
         self.agentStore = agentStore
         self.chatStore = chatStore
+        self.backgroundTaskTracker = backgroundTaskTracker
     }
 
     func start() {
@@ -584,7 +590,10 @@ final class HeartbeatScheduler: ObservableObject {
         let runID = UUID()
         let turnID = UUID()
         let debugCaptureEnabled = agentStore.agent(for: heartbeat.agentID)?.isDebugLogEnabled == true
-        let recorder = ToolCallRecorder(capturesFullContent: debugCaptureEnabled)
+        let backgroundModelIdentifier = heartbeat.modelIdentifier
+            ?? agentStore.agent(for: heartbeat.agentID)?.selectedModelIdentifier
+            ?? "Unavailable"
+        let recorder = ToolCallRecorder(capturesFullContent: true)
         let runningHeartbeat = RunningHeartbeat(
             id: heartbeat.id,
             agentID: heartbeat.agentID,
@@ -596,6 +605,29 @@ final class HeartbeatScheduler: ObservableObject {
             debugCaptureEnabled: debugCaptureEnabled
         )
         runningHeartbeats.append(runningHeartbeat)
+        backgroundTaskTracker?.start(
+            id: runID,
+            kind: .heartbeat,
+            title: heartbeat.displayTitle,
+            agentID: heartbeat.agentID,
+            agentName: runningHeartbeat.agentName,
+            detail: runningHeartbeat.destination,
+            at: runningHeartbeat.startedAt
+        )
+        backgroundTaskTracker?.append(
+            runID,
+            stage: "Setup",
+            label: "Instruction",
+            content: runningHeartbeat.instruction,
+            at: runningHeartbeat.startedAt
+        )
+        backgroundTaskTracker?.append(
+            runID,
+            stage: "Setup",
+            label: "Run Context",
+            content: "Agent: \(runningHeartbeat.agentName)\nDestination: \(runningHeartbeat.destination)\nModel: \(backgroundModelIdentifier)",
+            at: runningHeartbeat.startedAt
+        )
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -620,6 +652,18 @@ final class HeartbeatScheduler: ObservableObject {
                     slot.debugSystemPrompt = systemPrompt
                     slot.debugConversationPrompt = conversationPrompt
                     self.executionTasks[heartbeat.id] = slot
+                    self.backgroundTaskTracker?.append(
+                        runID,
+                        stage: "Execution",
+                        label: "System Prompt",
+                        content: systemPrompt
+                    )
+                    self.backgroundTaskTracker?.append(
+                        runID,
+                        stage: "Execution",
+                        label: "Conversation Prompt",
+                        content: conversationPrompt
+                    )
                 },
                 onModelResponseAccepted: {
                     guard self.executionTasks[heartbeat.id]?.token == executionToken else { return }
@@ -639,6 +683,13 @@ final class HeartbeatScheduler: ObservableObject {
                 heartbeatID: heartbeat.id,
                 agentID: heartbeat.agentID,
                 report: report
+            )
+            recordBackgroundDetails(report)
+            backgroundTaskTracker?.finish(
+                runID,
+                status: Self.backgroundStatus(for: report.generationStatus),
+                errorMessage: report.errorMessage,
+                at: report.completedAt
             )
             executionTasks[heartbeat.id] = nil
             runningHeartbeats.removeAll { $0.id == heartbeat.id }
@@ -735,6 +786,108 @@ final class HeartbeatScheduler: ObservableObject {
                 promptTokenCount: nil,
                 completionTokenCount: nil
             )
+        )
+        for invocation in invocations {
+            recordBackgroundTool(invocation, runID: slot.runID)
+        }
+        backgroundTaskTracker?.append(
+            slot.runID,
+            stage: "Result",
+            label: "Error",
+            content: "Timed out after 5 minutes.",
+            at: completionDate
+        )
+        backgroundTaskTracker?.finish(
+            slot.runID,
+            status: .timedOut,
+            errorMessage: "Timed out after 5 minutes.",
+            at: completionDate
+        )
+    }
+
+    private static func backgroundStatus(for status: GenerationStatus) -> BackgroundTaskStatus {
+        switch status {
+        case .posted, .passed, .emptyVisible: .succeeded
+        case .failed: .failed
+        case .aborted: .cancelled
+        case .timedOut: .timedOut
+        }
+    }
+
+    private func recordBackgroundDetails(_ report: HeartbeatExecutionReport) {
+        if let output = report.modelOutput {
+            backgroundTaskTracker?.append(
+                report.runID,
+                stage: "Execution",
+                label: "Model Output",
+                content: output,
+                at: report.completedAt
+            )
+        }
+        if let reasoning = report.debug?.reasoningText {
+            backgroundTaskTracker?.append(
+                report.runID,
+                stage: "Execution",
+                label: "Reasoning",
+                content: reasoning,
+                at: report.completedAt
+            )
+        }
+        if let intermediate = report.debug?.intermediateAssistantJSON {
+            backgroundTaskTracker?.append(
+                report.runID,
+                stage: "Execution",
+                label: "Intermediate Output",
+                content: intermediate,
+                at: report.completedAt
+            )
+        }
+        if let transcript = report.debug?.appleTranscriptSummary {
+            backgroundTaskTracker?.append(
+                report.runID,
+                stage: "Execution",
+                label: "Provider Transcript",
+                content: transcript,
+                at: report.completedAt
+            )
+        }
+        if let messages = report.debug?.openAIMessagesJSON {
+            backgroundTaskTracker?.append(
+                report.runID,
+                stage: "Execution",
+                label: "Provider Messages",
+                content: messages,
+                at: report.completedAt
+            )
+        }
+        for invocation in report.toolInvocations {
+            recordBackgroundTool(invocation, runID: report.runID)
+        }
+        backgroundTaskTracker?.append(
+            report.runID,
+            stage: "Result",
+            label: "Action",
+            content: report.actionSummary,
+            at: report.completedAt
+        )
+        if let error = report.errorMessage {
+            backgroundTaskTracker?.append(
+                report.runID,
+                stage: "Result",
+                label: "Error",
+                content: error,
+                at: report.completedAt
+            )
+        }
+    }
+
+    private func recordBackgroundTool(_ invocation: CapturedToolInvocation, runID: UUID) {
+        backgroundTaskTracker?.append(
+            runID,
+            stage: "Execution",
+            label: "Tool · \(invocation.toolName)",
+            content: "Arguments:\n\(invocation.argumentsJSON)\n\nResult:\n\(invocation.resultText)",
+            at: invocation.completedAt
         )
     }
 }

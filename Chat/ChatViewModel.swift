@@ -599,19 +599,17 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 chatID: id,
                 debugCaptureEnabled: debugCaptureEnabled,
                 toolInvocations: recorder.snapshot(),
-                debug: debugCaptureEnabled
-                    ? GenerationDebugPayloadDraft(
-                        systemPrompt: systemPrompt,
-                        conversationPrompt: conversationPrompt,
-                        result: partial ?? ModelGenerationResult(
-                            finalText: "",
-                            reasoningTexts: [],
-                            intermediateAssistantTexts: [],
-                            openAIRoundCount: 0,
-                            debug: nil
-                        )
+                debug: GenerationDebugPayloadDraft(
+                    systemPrompt: systemPrompt,
+                    conversationPrompt: conversationPrompt,
+                    result: partial ?? ModelGenerationResult(
+                        finalText: "",
+                        reasoningTexts: [],
+                        intermediateAssistantTexts: [],
+                        openAIRoundCount: 0,
+                        debug: nil
                     )
-                    : nil,
+                ),
                 backendRawValue: backend.persistenceName,
                 tokenUsage: partial?.tokenUsage ?? .zero
             )
@@ -631,7 +629,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             backend: backend,
             collaborationDeadline: referenceDate.addingTimeInterval(4 * 60),
             collaborationRootInvocationID: turnID,
-            captureCollaborationDebug: debugCaptureEnabled
+            captureCollaborationDebug: true
         )
         let systemInstructions = ModelPrompts.heartbeatSystemInstructions(
             isGroupChat: isGroupChat,
@@ -643,9 +641,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             lastCompletedAt: lastCompletedAt,
             referenceDate: referenceDate
         )
-        if debugCaptureEnabled {
-            onDebugPrompt?(systemInstructions, conversationPrompt)
-        }
+        onDebugPrompt?(systemInstructions, conversationPrompt)
 
         let result: ModelGenerationResult
         do {
@@ -654,7 +650,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
                 systemPrompt: systemInstructions,
                 prompt: conversationPrompt,
                 tools: generation.tools,
-                captureDebug: debugCaptureEnabled,
+                captureDebug: true,
                 appleGreedySampling: true,
                 missingLocalModelMessage: "The selected local model is no longer configured."
             )
@@ -737,13 +733,11 @@ final class ChatViewModel: ObservableObject, Identifiable {
             memoryEntryCount: memoryCount,
             backendRawValue: backend.persistenceName,
             toolInvocations: recorder.snapshot(),
-            debug: debugCaptureEnabled
-                ? GenerationDebugPayloadDraft(
-                    systemPrompt: systemInstructions,
-                    conversationPrompt: conversationPrompt,
-                    result: result
-                )
-                : nil,
+            debug: GenerationDebugPayloadDraft(
+                systemPrompt: systemInstructions,
+                conversationPrompt: conversationPrompt,
+                result: result
+            ),
             tokenUsage: result.tokenUsage
         )
     }
@@ -896,8 +890,11 @@ final class ChatViewModel: ObservableObject, Identifiable {
             updateAvailability()
         }
 
+        // Shuffle once per user turn, then preserve that speaking order across
+        // both passes so the follow-up conversation reads naturally.
+        let responseOrder = groupParticipants.shuffled()
         let firstPassPostedReply = await runGroupResponsePass(
-            participants: groupParticipants.shuffled(),
+            participants: responseOrder,
             userMessageID: userMessageID,
             directlyMentionedAgentIDs: directlyMentionedAgentIDs,
             isFollowUp: false,
@@ -908,7 +905,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
         let firstPassTranscript = allStoredMessages()
         _ = await runGroupResponsePass(
-            participants: groupParticipants.shuffled(),
+            participants: responseOrder,
             userMessageID: userMessageID,
             directlyMentionedAgentIDs: directlyMentionedAgentIDs,
             isFollowUp: true,
