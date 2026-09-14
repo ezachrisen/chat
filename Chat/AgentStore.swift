@@ -11,6 +11,7 @@ final class AgentStore: ObservableObject {
     @Published private(set) var collaborationGrants: [AgentCollaborationGrant] = []
     @Published private(set) var heartbeats: [AgentHeartbeat] = []
     @Published private(set) var heartbeatRuns: [HeartbeatRun] = []
+    @Published private(set) var dreamSettings: DreamConfiguration
     @Published private(set) var hasOlderHeartbeatRuns = false
     @Published var selectedAgentID: Agent.ID?
     let agentConfigurationDidChange = PassthroughSubject<Agent.ID, Never>()
@@ -18,7 +19,7 @@ final class AgentStore: ObservableObject {
 
     private static let heartbeatRunBatchSize = 200
 
-    private let modelContext: ModelContext
+    let modelContext: ModelContext
     private var isLoadingOlderHeartbeatRuns = false
 
     var selectedAgent: Agent? {
@@ -32,6 +33,7 @@ final class AgentStore: ObservableObject {
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
+        dreamSettings = Self.loadOrCreateDreamSettings(in: modelContext)
         loadAgents()
         loadCollaborationGrants()
         loadHeartbeats()
@@ -77,7 +79,18 @@ final class AgentStore: ObservableObject {
             avatarImageData: source.avatarImageData,
             avatarCropZoom: source.avatarCropZoom,
             avatarCropOffsetX: source.avatarCropOffsetX,
-            avatarCropOffsetY: source.avatarCropOffsetY
+            avatarCropOffsetY: source.avatarCropOffsetY,
+            avatarPlaceholderColorHex: source.avatarPlaceholderColorHex,
+            dreamOverrideRawValue: source.dreamOverrideRawValue,
+            dreamLightPromptOverride: source.dreamLightPromptOverride,
+            dreamREMPromptOverride: source.dreamREMPromptOverride,
+            dreamUsesScheduleOverride: source.dreamUsesScheduleOverride,
+            dreamScheduleKindRawValue: source.dreamScheduleKindRawValue,
+            dreamIntervalMinutes: source.dreamIntervalMinutes,
+            dreamWeekdayMask: source.dreamWeekdayMask,
+            dreamScheduledTimeMinutes: source.dreamScheduledTimeMinutes,
+            dreamLightModelIdentifierOverride: source.dreamLightModelIdentifierOverride,
+            dreamREMModelIdentifierOverride: source.dreamREMModelIdentifierOverride
         )
         duplicate.appleServiceGrantsJSON = source.appleServiceGrantsJSON
         modelContext.insert(duplicate)
@@ -349,6 +362,14 @@ final class AgentStore: ObservableObject {
         agent.avatarCropZoom = imageData == nil ? nil : max(1, cropZoom)
         agent.avatarCropOffsetX = imageData == nil ? nil : cropOffsetX
         agent.avatarCropOffsetY = imageData == nil ? nil : cropOffsetY
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func updateAgentAvatarPlaceholderColor(id: Agent.ID, colorHex: String) {
+        guard let agent = agents.first(where: { $0.id == id }) else { return }
+
+        agent.avatarPlaceholderColorHex = colorHex
         saveChanges()
         objectWillChange.send()
     }
@@ -1405,6 +1426,20 @@ final class Agent: Identifiable {
     var avatarCropZoom: Double?
     var avatarCropOffsetX: Double?
     var avatarCropOffsetY: Double?
+    var avatarPlaceholderColorHex: String?
+    var dreamOverrideRawValue: String?
+    var dreamLightPromptOverride: String?
+    var dreamREMPromptOverride: String?
+    var dreamUsesScheduleOverride: Bool?
+    var dreamScheduleKindRawValue: String?
+    var dreamIntervalMinutes: Int?
+    var dreamWeekdayMask: Int?
+    var dreamScheduledTimeMinutes: Int?
+    var dreamLightModelIdentifierOverride: String?
+    var dreamREMModelIdentifierOverride: String?
+    var lastDreamCompletedAt: Date?
+    var nextDreamRunAt: Date?
+    var lastDreamError: String?
     var createdAt: Date
 
     init(
@@ -1429,6 +1464,20 @@ final class Agent: Identifiable {
         avatarCropZoom: Double? = nil,
         avatarCropOffsetX: Double? = nil,
         avatarCropOffsetY: Double? = nil,
+        avatarPlaceholderColorHex: String? = nil,
+        dreamOverrideRawValue: String? = nil,
+        dreamLightPromptOverride: String? = nil,
+        dreamREMPromptOverride: String? = nil,
+        dreamUsesScheduleOverride: Bool? = nil,
+        dreamScheduleKindRawValue: String? = nil,
+        dreamIntervalMinutes: Int? = nil,
+        dreamWeekdayMask: Int? = nil,
+        dreamScheduledTimeMinutes: Int? = nil,
+        dreamLightModelIdentifierOverride: String? = nil,
+        dreamREMModelIdentifierOverride: String? = nil,
+        lastDreamCompletedAt: Date? = nil,
+        nextDreamRunAt: Date? = nil,
+        lastDreamError: String? = nil,
         createdAt: Date = .now
     ) {
         self.id = id
@@ -1452,6 +1501,20 @@ final class Agent: Identifiable {
         self.avatarCropZoom = avatarCropZoom
         self.avatarCropOffsetX = avatarCropOffsetX
         self.avatarCropOffsetY = avatarCropOffsetY
+        self.avatarPlaceholderColorHex = avatarPlaceholderColorHex
+        self.dreamOverrideRawValue = dreamOverrideRawValue
+        self.dreamLightPromptOverride = dreamLightPromptOverride
+        self.dreamREMPromptOverride = dreamREMPromptOverride
+        self.dreamUsesScheduleOverride = dreamUsesScheduleOverride
+        self.dreamScheduleKindRawValue = dreamScheduleKindRawValue
+        self.dreamIntervalMinutes = dreamIntervalMinutes
+        self.dreamWeekdayMask = dreamWeekdayMask
+        self.dreamScheduledTimeMinutes = dreamScheduledTimeMinutes
+        self.dreamLightModelIdentifierOverride = dreamLightModelIdentifierOverride
+        self.dreamREMModelIdentifierOverride = dreamREMModelIdentifierOverride
+        self.lastDreamCompletedAt = lastDreamCompletedAt
+        self.nextDreamRunAt = nextDreamRunAt
+        self.lastDreamError = lastDreamError
         self.createdAt = createdAt
     }
 

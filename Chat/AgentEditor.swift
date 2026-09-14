@@ -11,6 +11,7 @@ struct AgentsPreferencesView: View {
     @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+    @ObservedObject var dreamScheduler: DreamScheduler
     @State private var isPresentingEditor = false
     @State private var avatarEditorState = ShadAvatarEditorState()
     @State private var editingHeartbeatID: AgentHeartbeat.ID?
@@ -173,6 +174,7 @@ struct AgentsPreferencesView: View {
                     skillCatalog: skillCatalog,
                     chatStore: chatStore,
                     heartbeatScheduler: heartbeatScheduler,
+                    dreamScheduler: dreamScheduler,
                     avatarEditorState: $avatarEditorState,
                     onEditHeartbeat: { heartbeatID in
                         editingHeartbeatID = heartbeatID
@@ -377,6 +379,7 @@ private enum AgentEditorTab: String, CaseIterable, Hashable {
     case skills = "Skills"
     case collaboration = "Collaboration"
     case heartbeats = "Heartbeats"
+    case dreams = "Dream"
     case advanced = "Advanced"
 }
 
@@ -387,6 +390,7 @@ struct AgentEditor: View {
     @ObservedObject var skillCatalog: SkillCatalog
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+    @ObservedObject var dreamScheduler: DreamScheduler
     @Binding var avatarEditorState: ShadAvatarEditorState
     @Query(sort: \AgentInvocationRecord.startedAt, order: .reverse)
     private var collaborationInvocations: [AgentInvocationRecord]
@@ -589,20 +593,33 @@ struct AgentEditor: View {
                     VStack(spacing: 0) {
                         ShadSettingsRow(
                             title: "Avatar",
-                            description: "Click the image to open the ShadSwift crop and zoom editor, or drop an image onto it."
+                            description: "Add and crop an image, or choose the background color used by the placeholder avatar."
                         ) {
                             HStack(spacing: 10) {
+                                let paletteEntry = AgentAvatarPalette.entry(for: agent, theme: theme)
                                 ShadEditableAvatar(
                                     $avatarEditorState,
                                     fallback: agent.avatarInitials,
                                     customSize: 72
                                 )
+                                .shadTheme { localTheme in
+                                    localTheme.colors.muted = paletteEntry.background
+                                    localTheme.colors.mutedForeground = paletteEntry.foreground
+                                }
 
                                 if !avatarEditorState.photo.isEmpty {
                                     ShadButton("Remove", variant: .outline, size: .sm, icon: .trash) {
                                         removeAvatar(from: agent)
                                     }
                                     .accessibilityLabel("Remove avatar image")
+                                } else {
+                                    ColorPicker(
+                                        "Placeholder color",
+                                        selection: placeholderAvatarColor(for: agent),
+                                        supportsOpacity: false
+                                    )
+                                    .labelsHidden()
+                                    .accessibilityLabel("Placeholder avatar color")
                                 }
                             }
                         }
@@ -1035,6 +1052,15 @@ struct AgentEditor: View {
                 .id(agent.id)
             }
 
+            ShadTabsContent(value: AgentEditorTab.dreams) {
+                AgentDreamTab(
+                    agent: agent,
+                    store: store,
+                    localModelStore: localModelStore,
+                    scheduler: dreamScheduler
+                )
+            }
+
             ShadTabsContent(value: AgentEditorTab.advanced) {
                 VStack(alignment: .leading, spacing: 10) {
                     ShadSettingsSectionHeader(
@@ -1106,6 +1132,19 @@ struct AgentEditor: View {
         draftSoul = agent.soul
         draftMemory = agent.memoryText
         avatarEditorState = ShadAvatarEditorState(photo: agent.avatarPhoto)
+    }
+
+    private func placeholderAvatarColor(for agent: Agent) -> Binding<Color> {
+        Binding(
+            get: {
+                agent.avatarPlaceholderColor
+                    ?? AgentAvatarPalette.automaticEntry(for: agent, theme: theme).background
+            },
+            set: { color in
+                guard let colorHex = AgentAvatarPlaceholderColor.encode(color) else { return }
+                store.updateAgentAvatarPlaceholderColor(id: agent.id, colorHex: colorHex)
+            }
+        )
     }
 
     private func removeAvatar(from agent: Agent) {
@@ -2744,6 +2783,7 @@ private struct AgentsPreferencesViewPreview: View {
     private let skillCatalog: SkillCatalog
     private let chatStore: ChatStore
     private let heartbeatScheduler: HeartbeatScheduler
+    private let dreamScheduler: DreamScheduler
 
     init() {
         do {
@@ -2792,6 +2832,12 @@ private struct AgentsPreferencesViewPreview: View {
                 modelContext: context
             )
             heartbeatScheduler = HeartbeatScheduler(agentStore: agentStore, chatStore: chatStore)
+            dreamScheduler = DreamScheduler(
+                agentStore: agentStore,
+                localModelStore: localModelStore,
+                chatStore: chatStore,
+                heartbeatScheduler: heartbeatScheduler
+            )
         } catch {
             fatalError("Failed to create Agents preferences preview: \(error.localizedDescription)")
         }
@@ -2804,7 +2850,8 @@ private struct AgentsPreferencesViewPreview: View {
             textToSpeechToolStore: textToSpeechToolStore,
             skillCatalog: skillCatalog,
             chatStore: chatStore,
-            heartbeatScheduler: heartbeatScheduler
+            heartbeatScheduler: heartbeatScheduler,
+            dreamScheduler: dreamScheduler
         )
         .modelContainer(modelContainer)
         .shadTheme(ChatShadTheme.theme)

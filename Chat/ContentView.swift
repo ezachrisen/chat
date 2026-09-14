@@ -16,6 +16,7 @@ struct ChatApp: App {
     @StateObject private var replyFilterStore: ReplyFilterStore
     @StateObject private var chatStore: ChatStore
     @StateObject private var heartbeatScheduler: HeartbeatScheduler
+    @StateObject private var dreamScheduler: DreamScheduler
     @StateObject private var preferencesNavigation: PreferencesNavigation
 
     init() {
@@ -36,6 +37,15 @@ struct ChatApp: App {
                 modelContext: container.mainContext
             )
             let heartbeatScheduler = HeartbeatScheduler(agentStore: agentStore, chatStore: chatStore)
+            let dreamScheduler = DreamScheduler(
+                agentStore: agentStore,
+                localModelStore: localModelStore,
+                chatStore: chatStore,
+                heartbeatScheduler: heartbeatScheduler
+            )
+            heartbeatScheduler.otherBackgroundModelWorkIsRunning = { [weak dreamScheduler] in
+                dreamScheduler?.runningDream != nil
+            }
             let preferencesNavigation = PreferencesNavigation()
             modelContainer = container
             _agentStore = StateObject(wrappedValue: agentStore)
@@ -45,6 +55,7 @@ struct ChatApp: App {
             _replyFilterStore = StateObject(wrappedValue: replyFilterStore)
             _chatStore = StateObject(wrappedValue: chatStore)
             _heartbeatScheduler = StateObject(wrappedValue: heartbeatScheduler)
+            _dreamScheduler = StateObject(wrappedValue: dreamScheduler)
             _preferencesNavigation = StateObject(wrappedValue: preferencesNavigation)
             DockBadgeController.shared.observe(chatStore)
             if AppleServicesProbe.isRequested {
@@ -60,10 +71,18 @@ struct ChatApp: App {
                 }
             } else {
                 heartbeatScheduler.start()
+                dreamScheduler.start()
                 let usesChatGPT = agentStore.agents.contains {
                     ChatModelIdentifier.isChatGPT($0.selectedModelIdentifier)
                 } || agentStore.heartbeats.contains {
                     $0.modelIdentifier.map(ChatModelIdentifier.isChatGPT) == true
+                } || [
+                    agentStore.dreamSettings.lightModelIdentifier,
+                    agentStore.dreamSettings.remModelIdentifier
+                ].contains { $0.map(ChatModelIdentifier.isChatGPT) == true }
+                || agentStore.agents.contains { agent in
+                    [agent.dreamLightModelIdentifierOverride, agent.dreamREMModelIdentifierOverride]
+                        .contains { $0.map(ChatModelIdentifier.isChatGPT) == true }
                 } || chatStore.chats.contains {
                     $0.usesChatGPTModel
                 }
@@ -127,6 +146,7 @@ struct ChatApp: App {
                 replyFilterStore: replyFilterStore,
                 chatStore: chatStore,
                 heartbeatScheduler: heartbeatScheduler,
+                dreamScheduler: dreamScheduler,
                 navigation: preferencesNavigation
             )
             .modelContainer(modelContainer)
@@ -471,6 +491,22 @@ struct AgentAvatar: View {
     }
 
     private var paletteEntry: (background: Color, foreground: Color) {
+        AgentAvatarPalette.entry(for: agent, theme: theme)
+    }
+}
+
+enum AgentAvatarPalette {
+    static func entry(for agent: Agent, theme: ShadTheme) -> (background: Color, foreground: Color) {
+        if let background = agent.avatarPlaceholderColor {
+            return (background, contrastingForeground(for: background, theme: theme))
+        }
+        return automaticEntry(for: agent, theme: theme)
+    }
+
+    static func automaticEntry(
+        for agent: Agent,
+        theme: ShadTheme
+    ) -> (background: Color, foreground: Color) {
         let colors: [(background: Color, foreground: Color)] = [
             (theme.colors.primary, theme.colors.primaryForeground),
             (theme.colors.success, theme.colors.successForeground),
@@ -488,6 +524,23 @@ struct AgentAvatar: View {
         ]
         let index = agent.id.uuidString.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
         return colors[Int(UInt(bitPattern: index) % UInt(colors.count))]
+    }
+
+    private static func contrastingForeground(for color: Color, theme: ShadTheme) -> Color {
+        guard let color = NSColor(color).usingColorSpace(.sRGB) else {
+            return theme.colors.foreground
+        }
+
+        func linearized(_ component: CGFloat) -> CGFloat {
+            component <= 0.04045
+                ? component / 12.92
+                : pow((component + 0.055) / 1.055, 2.4)
+        }
+
+        let luminance = 0.2126 * linearized(color.redComponent)
+            + 0.7152 * linearized(color.greenComponent)
+            + 0.0722 * linearized(color.blueComponent)
+        return luminance > 0.45 ? Color.black.opacity(0.85) : .white
     }
 }
 

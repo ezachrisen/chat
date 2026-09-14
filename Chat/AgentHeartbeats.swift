@@ -496,6 +496,7 @@ final class HeartbeatScheduler: ObservableObject {
     private static let executionTimeout: Duration = .seconds(300)
 
     @Published private(set) var runningHeartbeats: [RunningHeartbeat] = []
+    var otherBackgroundModelWorkIsRunning: @MainActor () -> Bool = { false }
 
     private let agentStore: AgentStore
     private let chatStore: ChatStore
@@ -542,7 +543,7 @@ final class HeartbeatScheduler: ObservableObject {
         guard executionTasks[heartbeatID] == nil else { return }
 
         let requestDate = Date()
-        guard executionTasks.isEmpty else {
+        guard executionTasks.isEmpty, !otherBackgroundModelWorkIsRunning() else {
             agentStore.deferHeartbeatForOverlap(id: heartbeatID, at: requestDate)
             return
         }
@@ -563,7 +564,7 @@ final class HeartbeatScheduler: ObservableObject {
 
     private func runDueHeartbeats() {
         let checkDate = Date()
-        guard executionTasks.isEmpty else {
+        guard executionTasks.isEmpty, !otherBackgroundModelWorkIsRunning() else {
             agentStore.deferDueHeartbeatsForOverlap(at: checkDate)
             return
         }

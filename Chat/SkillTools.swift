@@ -831,6 +831,7 @@ struct AgentToolBox: Sendable {
     let soulRuntime: AgentSoulRuntime?
     let delegationRuntime: AgentDelegationRuntime?
     let authorization: AgentToolAuthorization?
+    let dreamMessageTool: DreamMessageToolEntry?
 
     var collaborationPrompt: String {
         ModelPrompts.collaborationPrompt(
@@ -876,6 +877,7 @@ struct AgentToolBox: Sendable {
             for service in services where service != .reminders { tools.append(AppleServiceTool(service: service, context: appleServiceContext, recorder: recorder, authorization: authorization)) }
         }
         tools += reminderTools.map(\.tool)
+        if let dreamMessageTool { tools.append(dreamMessageTool.tool) }
         return tools
     }
 
@@ -898,6 +900,7 @@ struct AgentToolBox: Sendable {
 
     var openAITools: [OpenAITool] {
         foundationModelTools.map { tool in
+            if let dreamMessageTool, tool.name == dreamMessageTool.tool.name { return dreamMessageTool.schema }
             if let reminder = reminderTools.first(where: { $0.tool.name == tool.name }) { return reminder.schema }
             if let stash = stashTools.first(where: { $0.tool.name == tool.name }) { return stash.schema }
             if let service = AppleServiceID.allCases.first(where: { $0.toolName == tool.name }) {
@@ -997,6 +1000,9 @@ struct AgentToolBox: Sendable {
     }
 
     func execute(name: String, argumentsJSON: String) async throws -> String {
+        if let dreamMessageTool, name == dreamMessageTool.tool.name {
+            return try await dreamMessageTool.execute(argumentsJSON)
+        }
         if AgentStashTools.allNames.contains(name) {
             guard let tool = stashTools.first(where: { $0.tool.name == name }) else {
                 let error = AgentStashError.unavailable
@@ -1234,7 +1240,26 @@ struct AgentToolBox: Sendable {
                 }
             },
             delegationRuntime: delegationRuntime,
-            authorization: authorization
+            authorization: authorization,
+            dreamMessageTool: nil
+        )
+    }
+
+    static func dream(reader: DreamMessageReader) -> AgentToolBox {
+        AgentToolBox(
+            runtime: SkillRuntime(skills: []),
+            enabledToolIDs: [],
+            recorder: nil,
+            agentName: "Dream",
+            calendarPolicy: .none,
+            liveCalendarPolicy: { .none },
+            appleServiceContext: nil,
+            services: [],
+            stashRuntime: nil,
+            soulRuntime: nil,
+            delegationRuntime: nil,
+            authorization: nil,
+            dreamMessageTool: DreamMessageToolEntry(tool: ReadDreamMessagesTool(reader: reader))
         )
     }
 }

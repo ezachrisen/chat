@@ -15,6 +15,7 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
     case skills
     case textToSpeech
     case appleServices
+    case dreams
 
     var id: Self { self }
 
@@ -32,6 +33,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return "Skills"
         case .appleServices:
             return "Apple Services"
+        case .dreams:
+            return "Dream"
         case .textToSpeech:
             return "Text to Speech"
         }
@@ -51,6 +54,8 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
             return .custom("book")
         case .appleServices:
             return .custom("app.connected.to.app.below.fill")
+        case .dreams:
+            return .custom("moon.stars")
         case .textToSpeech:
             return .custom("waveform")
         }
@@ -70,6 +75,7 @@ struct PreferencesView: View {
     @ObservedObject var replyFilterStore: ReplyFilterStore
     @ObservedObject var chatStore: ChatStore
     @ObservedObject var heartbeatScheduler: HeartbeatScheduler
+    @ObservedObject var dreamScheduler: DreamScheduler
     @ObservedObject var navigation: PreferencesNavigation
     @StateObject private var sidebar = ShadSidebarState(isOpen: true, width: 224, iconWidth: 48)
 
@@ -88,7 +94,8 @@ struct PreferencesView: View {
                         textToSpeechToolStore: textToSpeechToolStore,
                         skillCatalog: skillCatalog,
                         chatStore: chatStore,
-                        heartbeatScheduler: heartbeatScheduler
+                        heartbeatScheduler: heartbeatScheduler,
+                        dreamScheduler: dreamScheduler
                     )
                 case .models:
                     ModelPreferencesView(store: localModelStore, replyFilterStore: replyFilterStore)
@@ -98,6 +105,12 @@ struct PreferencesView: View {
                     SkillPreferencesView(catalog: skillCatalog)
                 case .appleServices:
                     AppleServicesPreferencesView()
+                case .dreams:
+                    DreamPreferencesView(
+                        store: agentStore,
+                        localModelStore: localModelStore,
+                        scheduler: dreamScheduler
+                    )
                 case .textToSpeech:
                     TextToSpeechPreferencesView(store: textToSpeechToolStore)
                 }
@@ -1402,6 +1415,7 @@ private struct PreferencesViewPreview: View {
     private let replyFilterStore: ReplyFilterStore
     private let chatStore: ChatStore
     private let heartbeatScheduler: HeartbeatScheduler
+    private let dreamScheduler: DreamScheduler
     private let navigation = PreferencesNavigation()
 
     init() {
@@ -1446,6 +1460,12 @@ private struct PreferencesViewPreview: View {
                 modelContext: context
             )
             heartbeatScheduler = HeartbeatScheduler(agentStore: agentStore, chatStore: chatStore)
+            dreamScheduler = DreamScheduler(
+                agentStore: agentStore,
+                localModelStore: localModelStore,
+                chatStore: chatStore,
+                heartbeatScheduler: heartbeatScheduler
+            )
         } catch {
             fatalError("Failed to create Preferences preview: \(error.localizedDescription)")
         }
@@ -1460,6 +1480,7 @@ private struct PreferencesViewPreview: View {
             replyFilterStore: replyFilterStore,
             chatStore: chatStore,
             heartbeatScheduler: heartbeatScheduler,
+            dreamScheduler: dreamScheduler,
             navigation: navigation
         )
         .modelContainer(modelContainer)

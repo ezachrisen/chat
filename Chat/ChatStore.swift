@@ -145,6 +145,35 @@ final class ChatStore: ObservableObject {
         return chats.first { $0.id == selectedChatID }
     }
 
+    func dreamMessages(
+        for agentID: Agent.ID,
+        since: Date,
+        through: Date
+    ) -> [DreamTranscriptMessage] {
+        chats.flatMap { chat -> [DreamTranscriptMessage] in
+            let belongsToAgent = (!chat.isGroupChat && chat.agentID == agentID)
+                || (chat.isGroupChat && chat.groupParticipants.contains { $0.agentID == agentID })
+            guard belongsToAgent else { return [] }
+
+            return ActiveChatMessages.fetch(
+                chatID: chat.id,
+                clearedThroughMessageID: chat.clearedThroughMessageID,
+                in: modelContext
+            )
+            .filter { $0.createdAt > since && $0.createdAt <= through }
+            .map {
+                DreamTranscriptMessage(
+                    chatTitle: chat.title,
+                    role: $0.role,
+                    authorName: $0.authorName,
+                    text: $0.text,
+                    createdAt: $0.createdAt
+                )
+            }
+        }
+        .sorted { $0.createdAt < $1.createdAt }
+    }
+
     init(
         agentStore: AgentStore,
         localModelStore: LocalModelStore,

@@ -110,6 +110,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         ReplySanitizer.patternList(from: responseEditPatternsText)
     }
 
+    var clearedThroughMessageID: UUID? {
+        storedChat.clearedThroughMessageID
+    }
+
     func setRendersMarkdown(_ enabled: Bool) {
         storedChat.rendersMarkdown = enabled
         saveChanges()
