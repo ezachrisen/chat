@@ -110,6 +110,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
         ReplySanitizer.patternList(from: responseEditPatternsText)
     }
 
+    var allowsMultipleAgentTurns: Bool {
+        storedChat.allowsMultipleAgentTurns ?? true
+    }
+
     var clearedThroughMessageID: UUID? {
         storedChat.clearedThroughMessageID
     }
@@ -122,6 +126,14 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     func updateResponseEditPatternsText(_ text: String) {
         storedChat.responseEditPatternsText = text
+        saveChanges()
+        objectWillChange.send()
+    }
+
+    func setAllowsMultipleAgentTurns(_ enabled: Bool) {
+        guard isGroupChat else { return }
+        storedChat.allowsMultipleAgentTurns = enabled
+        storedChat.updatedAt = .now
         saveChanges()
         objectWillChange.send()
     }
@@ -522,7 +534,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
         guard canSubmitDraft, !prompt.isEmpty else { return }
 
         if isGroupChat {
-            let mentionedHandles = AgentMention.handles(in: prompt)
+            let mentionedHandlesInOrder = AgentMention.handlesInOrder(in: prompt)
+            let mentionedHandles = Set(mentionedHandlesInOrder)
             addMentionedAgents(matching: mentionedHandles)
 
             guard !groupParticipants.isEmpty else {
@@ -537,6 +550,12 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     .filter { $0.isMentioned(in: mentionedHandles) }
                     .map(\.agentID)
             )
+            let participantsByHandle = Dictionary(
+                uniqueKeysWithValues: groupParticipants.map {
+                    (AgentMention.lookupKey(for: $0.resolvedMentionHandle), $0.agentID)
+                }
+            )
+            let prioritizedAgentIDs = mentionedHandlesInOrder.compactMap { participantsByHandle[$0] }
 
             if title == "Untitled chat" {
                 updateTitle(String(prompt.prefix(48)))
@@ -549,7 +568,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
             Task {
                 await respondAsGroup(
                     userMessageID: userMessage.id,
-                    directlyMentionedAgentIDs: directlyMentionedAgentIDs
+                    directlyMentionedAgentIDs: directlyMentionedAgentIDs,
+                    prioritizedAgentIDs: prioritizedAgentIDs
                 )
             }
             return
@@ -882,7 +902,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
 
     private func respondAsGroup(
         userMessageID: UUID,
-        directlyMentionedAgentIDs: Set<UUID>
+        directlyMentionedAgentIDs: Set<UUID>,
+        prioritizedAgentIDs: [UUID]
     ) async {
         defer {
             respondingAgentName = nil
@@ -890,9 +911,15 @@ final class ChatViewModel: ObservableObject, Identifiable {
             updateAvailability()
         }
 
-        // Shuffle once per user turn, then preserve that speaking order across
-        // both passes so the follow-up conversation reads naturally.
-        let responseOrder = groupParticipants.shuffled()
+        // @mentioned participants lead in textual mention order. Everyone else is
+        // shuffled once, and the resulting order is preserved across passes.
+        let participantsByID = Dictionary(
+            uniqueKeysWithValues: groupParticipants.map { ($0.agentID, $0) }
+        )
+        let prioritized = prioritizedAgentIDs.compactMap { participantsByID[$0] }
+        let prioritizedIDs = Set(prioritized.map(\.agentID))
+        let responseOrder = prioritized
+            + groupParticipants.filter { !prioritizedIDs.contains($0.agentID) }.shuffled()
         let firstPassPostedReply = await runGroupResponsePass(
             participants: responseOrder,
             userMessageID: userMessageID,
@@ -901,7 +928,10 @@ final class ChatViewModel: ObservableObject, Identifiable {
             transcriptSnapshot: nil
         )
 
-        guard firstPassPostedReply, groupParticipants.count > 1, !Task.isCancelled else { return }
+        guard allowsMultipleAgentTurns,
+              firstPassPostedReply,
+              groupParticipants.count > 1,
+              !Task.isCancelled else { return }
 
         let firstPassTranscript = allStoredMessages()
         _ = await runGroupResponsePass(

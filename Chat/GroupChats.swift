@@ -106,15 +106,22 @@ enum AgentMention {
     }
 
     static func handles(in text: String) -> Set<String> {
+        Set(handlesInOrder(in: text))
+    }
+
+    static func handlesInOrder(in text: String) -> [String] {
         guard let expression = try? NSRegularExpression(pattern: "@[\\p{L}\\p{N}_-]+") else {
             return []
         }
 
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        return Set(expression.matches(in: text, range: range).compactMap { match in
+        var seen: Set<String> = []
+        return expression.matches(in: text, range: range).compactMap { match in
             guard let matchRange = Range(match.range, in: text) else { return nil }
-            return lookupHandle(from: String(text[matchRange]))
-        })
+            guard let handle = lookupHandle(from: String(text[matchRange])),
+                  seen.insert(handle).inserted else { return nil }
+            return handle
+        }
     }
 }
 

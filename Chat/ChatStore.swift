@@ -23,6 +23,7 @@ final class StoredChat: Identifiable {
     var isDefaultChat: Bool?
     var clearedThroughMessageID: UUID?
     var unreadCount: Int?
+    var allowsMultipleAgentTurns: Bool?
 
     init(
         id: UUID = UUID(),
@@ -43,7 +44,8 @@ final class StoredChat: Identifiable {
         responseEditPatternsText: String? = nil,
         isDefaultChat: Bool? = nil,
         clearedThroughMessageID: UUID? = nil,
-        unreadCount: Int? = nil
+        unreadCount: Int? = nil,
+        allowsMultipleAgentTurns: Bool? = nil
     ) {
         self.id = id
         self.agentID = agentID
@@ -64,6 +66,7 @@ final class StoredChat: Identifiable {
         self.isDefaultChat = isDefaultChat
         self.clearedThroughMessageID = clearedThroughMessageID
         self.unreadCount = unreadCount
+        self.allowsMultipleAgentTurns = allowsMultipleAgentTurns
     }
 
     var kind: ChatKind {

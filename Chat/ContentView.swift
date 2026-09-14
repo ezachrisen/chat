@@ -1174,6 +1174,13 @@ struct ChatDetailView: View {
         )
     }
 
+    private var allowsMultipleAgentTurns: Binding<Bool> {
+        Binding(
+            get: { chat.allowsMultipleAgentTurns },
+            set: { chat.setAllowsMultipleAgentTurns($0) }
+        )
+    }
+
     private var chatActionsMenu: some View {
         ShadDropdownMenu(alignment: .bottomTrailing, minWidth: 260) { _ in
             ChatActionsMenuTrigger(isLoading: chat.isCompacting)
@@ -1193,6 +1200,13 @@ struct ChatDetailView: View {
             ShadDropdownMenuSeparator()
 
             ShadDropdownMenuCheckboxItem("Render Markdown", isOn: rendersMarkdown)
+
+            if chat.isGroupChat {
+                ShadDropdownMenuCheckboxItem(
+                    "Allow multiple agent turns",
+                    isOn: allowsMultipleAgentTurns
+                )
+            }
 
             ShadDropdownMenuItem("Response Edit…", icon: .custom("text.badge.minus")) {
                 responseEditDraft = chat.responseEditPatternsText
