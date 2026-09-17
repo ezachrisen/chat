@@ -1402,19 +1402,8 @@ struct AgentEditor: View {
             }
         }
 
-        if let message = calendarDirectory.accessMessage {
-            ShadSeparator()
-            ShadSettingsRow(
-                title: "Calendar access",
-                description: message
-            ) {
-                if calendarDirectory.canRequestAccess {
-                    ShadButton("Allow", variant: .outline, size: .sm) {
-                        Task { await calendarDirectory.prepare() }
-                    }
-                }
-            }
-        }
+        ShadSeparator()
+        CalendarPermissionView().padding(16)
 
         if calendarAccessAll.wrappedValue == false, calendarDirectory.hasFullAccess {
             if calendarDirectory.calendars.isEmpty {

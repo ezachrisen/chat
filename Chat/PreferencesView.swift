@@ -173,6 +173,39 @@ private enum ToolPreferencesTab: String, CaseIterable, Identifiable {
     }
 }
 
+struct CalendarPermissionView: View {
+    @ObservedObject private var directory = CalendarDirectory.shared
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Calendar permission").chatSystemFont(.headline, weight: .semibold)
+            Text(directory.hasFullAccess ? "Chat has full Calendar access." : (directory.accessMessage ?? "Calendar access is unavailable."))
+                .chatSystemFont(.callout)
+                .foregroundStyle(.secondary)
+            Text("To revoke access for every agent, turn off Chat in System Settings → Privacy & Security → Calendars. Previously saved replies are kept.")
+                .chatSystemFont(.caption1)
+                .foregroundStyle(.secondary)
+            HStack {
+                if directory.canRequestAccess {
+                    ShadButton("Allow Calendar access", variant: .outline, size: .sm) {
+                        Task { await directory.prepare() }
+                    }
+                    .disabled(directory.isRequestingAccess)
+                }
+                ShadButton("Open Calendar privacy settings", variant: .outline, size: .sm) {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
+                        openURL(url)
+                    }
+                }
+                if directory.isRequestingAccess { ProgressView().controlSize(.small) }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear { directory.refresh() }
+    }
+}
+
 struct ToolPreferencesView: View {
     @ObservedObject var catalog: SkillCatalog
     @State private var selectedTab: ToolPreferencesTab = .skills
@@ -203,6 +236,10 @@ struct ToolPreferencesView: View {
                                     if index < tab.tools.count - 1 {
                                         ShadSeparator()
                                     }
+                                }
+                                if tab == .calendar {
+                                    ShadSeparator()
+                                    CalendarPermissionView().padding(16)
                                 }
                             }
                             .shadSettingsCard()

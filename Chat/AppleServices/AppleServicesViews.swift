@@ -9,6 +9,8 @@ struct AppleServicesPreferencesView: View {
             VStack(alignment: .leading, spacing: 20) {
                 Text("Apple Services").chatSystemFont(.title2, weight: .bold)
                 Text("Connect this Mac, then choose what each agent can access in its Tools settings. Retrieved content may be sent to that agent's selected model and included in saved replies.").foregroundStyle(.secondary)
+                CalendarPermissionView()
+                Divider()
                 ForEach(AppleServiceID.allCases) { service in
                     HStack {
                         VStack(alignment: .leading) {

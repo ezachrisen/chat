@@ -2,6 +2,9 @@ import Combine
 import CoreLocation
 import EventKit
 import Foundation
+#if os(macOS)
+import AppKit
+#endif
 
 nonisolated enum CalendarLimits {
     static let notesCharacterLimit = 250
@@ -130,6 +133,18 @@ final class CalendarDirectory: ObservableObject {
                 self?.reloadCalendarsIfAuthorized()
             }
             .store(in: &cancellables)
+#if os(macOS)
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refresh()
+            }
+            .store(in: &cancellables)
+#endif
+    }
+
+    func refresh() {
+        reloadCalendarsIfAuthorized()
     }
 
     func prepare() async {
