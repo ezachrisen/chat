@@ -1226,10 +1226,11 @@ struct AgentToolBox: Sendable {
                 return agent.calendarAccessPolicy
             },
             appleServiceContext: agent.map { AppleServiceRuntime.context(agent: $0, origin: serviceOrigin, authorization: authorization) },
-            services: enabledToolIDs.contains(AgentToolID.appleServices.rawValue) ? AppleServiceID.allCases.filter {
-                guard let grant = agent?.appleServiceGrants[$0.rawValue], grant.enabled else { return false }
+            services: AppleServiceID.allCases.filter {
+                guard enabledToolIDs.contains($0.agentToolID.rawValue),
+                      let grant = agent?.appleServiceGrants[$0.rawValue], grant.enabled else { return false }
                 return (!serviceOrigin.isBackground || grant.allowsBackground) && (!serviceOrigin.isDelegated || grant.allowsDelegation)
-            } : [],
+            },
             reminderChangesAllowed: agent?.appleServiceGrants[AppleServiceID.reminders.rawValue]?.allowsChanges == true,
             reminderDeletionAllowed: agent?.appleServiceGrants[AppleServiceID.reminders.rawValue]?.allowsDeletion == true,
             stashRuntime: agent.flatMap(AgentStashRuntime.init(agent:)),

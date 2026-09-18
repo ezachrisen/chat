@@ -38,9 +38,17 @@ enum AppleServicesProbe {
             let agent = Agent(name: "Service test", soul: "")
             context.insert(agent)
             try check(agent.appleServiceGrants.isEmpty, "New/migrated agents must default deny")
+            let splitTools = Set(AgentToolID.appleServiceTools.map(\.rawValue))
+            let fromLegacy = AgentToolID.migratingLegacyAppleServices(["AppleServices"])
+            try check(splitTools.isSubset(of: fromLegacy) && !fromLegacy.contains("AppleServices"), "Legacy Apple Services must enable every split tool")
+            let afterFirstSplit = AgentToolID.migratingLegacyAppleServices(["AppleServices", "AppleServicesSplit.v1", "Reminders"])
+            try check(afterFirstSplit.intersection(splitTools) == ["Reminders", "Contacts", "Phone"], "Second split must not re-enable tools turned off after the first")
+            try check(AgentToolID.migratingLegacyAppleServices([]).isDisjoint(with: splitTools), "Split must not enable tools that were off")
+            let migratedOnce = AgentToolID.migratingLegacyAppleServices(["AppleServices"]).subtracting(["Notes"])
+            try check(AgentToolID.migratingLegacyAppleServices(migratedOnce) == migratedOnce, "Split migration must run once")
             agent.setTool(.readCalendarEvents, enabled: true)
             agent.setCalendarAccessAll(false, selecting: ["fixture-calendar"])
-            agent.setTool(.appleServices, enabled: true)
+            for tool in AgentToolID.appleServiceTools { agent.setTool(tool, enabled: true) }
             agent.setTool(.agentStash, enabled: true)
             var grants: [String: AppleServiceGrant] = [:]
             for service in AppleServiceID.allCases {
@@ -86,7 +94,7 @@ enum AppleServicesProbe {
                 try check(jsonSchema.required == ["action"])
             }
             if CommandLine.arguments.contains("--apple-services-ui-snapshot") {
-                let view = NSHostingView(rootView: AppleServicesPreferencesView().frame(width: 900, height: 1000).background(Color(nsColor: .windowBackgroundColor)))
+                let view = NSHostingView(rootView: AppleServicesPreferencesView(navigation: PreferencesNavigation()).frame(width: 900, height: 1000).background(Color(nsColor: .windowBackgroundColor)))
                 let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 900, height: 1000), styleMask: [.borderless], backing: .buffered, defer: false)
                 window.isReleasedWhenClosed = false
                 window.appearance = NSAppearance(named: .aqua)

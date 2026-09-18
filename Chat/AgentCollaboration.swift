@@ -1131,12 +1131,11 @@ final class AgentCollaborationCoordinator {
                 ? runtime(for: target, context: childContext)
                 : nil
             let allowedToolIDs: Set<String>? = mode == .consult
-                ? [
+                ? Set([
                     AgentToolID.readSkillFile.rawValue,
                     AgentToolID.readCalendarEvents.rawValue,
                     AgentToolID.agentStash.rawValue,
-                    AgentToolID.appleServices.rawValue,
-                ]
+                ]).union(AgentToolID.appleServiceTools.map(\.rawValue))
                 : nil
             let recorder = ToolCallRecorder(capturesFullContent: childContext.captureDebug)
             let authorization = toolAuthorization(
@@ -1563,12 +1562,11 @@ final class AgentCollaborationCoordinator {
             ? runtime(for: target, context: accepted.context)
             : nil
         let allowedToolIDs: Set<String>? = accepted.mode == .consult
-            ? [
+            ? Set([
                 AgentToolID.readSkillFile.rawValue,
                 AgentToolID.readCalendarEvents.rawValue,
                 AgentToolID.agentStash.rawValue,
-                AgentToolID.appleServices.rawValue,
-            ]
+            ]).union(AgentToolID.appleServiceTools.map(\.rawValue))
             : nil
         let authorization = toolAuthorization(
             invocationID: accepted.invocationID,

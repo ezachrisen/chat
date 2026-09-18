@@ -103,7 +103,7 @@ enum ReminderToolsProbe {
             ("What reminders are due today through three days from today?", false, { ($0.container ?? "").isEmpty && ($0.query ?? "").isEmpty && $0.dueFrom == today && $0.dueThrough == through }),
             ("Do I have anything on my Shopping List in Reminders?", true, { ["Shopping List", "shopping"].contains($0.container ?? "") && ($0.query ?? "").isEmpty })
         ]
-        let instructions = ModelPrompts.agentSystemInstructions(agentName: "Reminder test", soul: "You are a concise assistant. Use the available tools for reminder questions.", memory: "", skillsPrompt: ModelPrompts.toolsPrompt(enabledIDs: [AgentToolID.appleServices.rawValue]))
+        let instructions = ModelPrompts.agentSystemInstructions(agentName: "Reminder test", soul: "You are a concise assistant. Use the available tools for reminder questions.", memory: "", skillsPrompt: ModelPrompts.toolsPrompt(enabledIDs: [AgentToolID.reminders.rawValue]))
         for (prompt, advertiseChanges, correct) in cases {
             fixture.requests = []
             // Also check the larger schema surface seen by agents with editing/deletion enabled.

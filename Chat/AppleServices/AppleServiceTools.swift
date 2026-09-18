@@ -84,13 +84,13 @@ struct AppleServiceTool: Tool {
             )
             : AppleServiceDiagnosticTrace.redactedArgumentsJSON
         do {
-            try await authorization?.check(toolName: AgentToolID.appleServices.rawValue)
+            try await authorization?.check(toolName: service.agentToolID.rawValue)
             let result = if let runtime {
                 try await runtime.execute(service, request, context: context)
             } else {
                 try await AppleServiceRuntime.shared.execute(service, request, context: context)
             }
-            try await authorization?.check(toolName: AgentToolID.appleServices.rawValue)
+            try await authorization?.check(toolName: service.agentToolID.rawValue)
             let output = try compactReminders
                 ? ReminderResponses.json(result, request: request, maximumBytes: min(authorization?.maximumOutputCharacters ?? 4096, 4096))
                 : result.json(maximumBytes: authorization?.maximumOutputCharacters ?? 48_000)
@@ -156,6 +156,20 @@ struct AppleServiceTool: Tool {
     }
 }
 
+extension AppleServiceID {
+    /// The agent tool that enables this service.
+    var agentToolID: AgentToolID {
+        switch self {
+        case .reminders: .reminders
+        case .notes: .notes
+        case .contacts: .contacts
+        case .phone: .phone
+        case .messages: .messages
+        case .mail: .mail
+        }
+    }
+}
+
 nonisolated enum AppleServiceSecurity {
     static var protectsContent: Bool { UserDefaults.standard.bool(forKey: "appleServicesContentUsed") }
 }
@@ -164,8 +178,8 @@ nonisolated enum AppleServiceSecurity {
 extension AppleServiceRuntime {
     static func context(agent: Agent, origin: AppleServiceOrigin, authorization: AgentToolAuthorization? = nil) -> AppleServiceContext {
         AppleServiceContext(agentID: agent.id, origin: origin, grant: { [weak agent] service in
-            try authorization?.check(toolName: AgentToolID.appleServices.rawValue)
-            guard let agent, !agent.isDeleted, agent.isToolEnabled(.appleServices) else { throw AppleServiceError.forbidden }
+            try authorization?.check(toolName: service.agentToolID.rawValue)
+            guard let agent, !agent.isDeleted, agent.isToolEnabled(service.agentToolID) else { throw AppleServiceError.forbidden }
             return agent.appleServiceGrants[service.rawValue] ?? AppleServiceGrant()
         })
     }

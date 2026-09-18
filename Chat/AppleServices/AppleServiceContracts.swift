@@ -6,6 +6,8 @@ nonisolated enum AppleServiceID: String, Codable, CaseIterable, Identifiable, Se
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
     var toolName: String { "Apple" + title }
+    /// Where the user connects this service.
+    var settingsLocation: String { "Settings → Tools → \(title)" }
     var bundleID: String? {
         switch self {
         case .notes: "com.apple.Notes"

@@ -781,11 +781,12 @@ struct AgentEditor: View {
                                         )
                                 }
 
-                                if toolID == .appleServices,
+                                if let service = toolID.appleService,
                                    skillCatalog.isToolEnabled(toolID),
                                    let agent = selectedAgent,
-                                   agent.isToolEnabled(.appleServices) {
-                                    AgentAppleServicesView(agent: agent)
+                                   agent.isToolEnabled(toolID) {
+                                    AgentAppleServicesView(agent: agent, service: service)
+                                        .id("\(agent.id)-\(toolID.rawValue)")
                                 }
 
                                 if toolID == .readCalendarEvents,

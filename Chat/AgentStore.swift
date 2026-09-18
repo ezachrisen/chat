@@ -444,6 +444,8 @@ final class AgentStore: ObservableObject {
     func setTool(_ toolID: AgentToolID, enabled: Bool, for agentID: Agent.ID) {
         guard let agent = agents.first(where: { $0.id == agentID }) else { return }
         AppleServiceRuntime.shared.revoke(agentID: agentID)
+        // Settle the one-time split first so it never overrides this choice.
+        agent.migrateSplitAppleServiceTools()
         agent.setTool(toolID, enabled: enabled)
         saveChanges()
         objectWillChange.send()
@@ -996,6 +998,7 @@ final class AgentStore: ObservableObject {
         }
 
         backfillAgentMentionHandles()
+        for agent in agents { agent.migrateSplitAppleServiceTools() }
         saveChanges()
 
         selectedAgentID = selection.flatMap { selectedID in
@@ -1581,6 +1584,17 @@ final class Agent: Identifiable {
 
     func isSkillEnabled(_ skillID: String) -> Bool {
         enabledIDs(from: enabledSkillIDsJSON).contains(skillID)
+    }
+
+    /// Applies the one-time split of the old combined Apple Services tool; see
+    /// `AgentToolID.migratingLegacyAppleServices`. Service grants still decide access.
+    @discardableResult
+    func migrateSplitAppleServiceTools() -> Bool {
+        let ids = enabledIDs(from: enabledToolIDsJSON)
+        let migrated = AgentToolID.migratingLegacyAppleServices(ids)
+        guard migrated != ids, let data = try? JSONEncoder().encode(migrated.sorted()) else { return false }
+        enabledToolIDsJSON = String(decoding: data, as: UTF8.self)
+        return true
     }
 
     func setTool(_ toolID: AgentToolID, enabled: Bool) {

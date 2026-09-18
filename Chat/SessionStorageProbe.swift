@@ -131,7 +131,7 @@ enum SessionStorageProbe {
         remindersGrant.enabled = true
         remindersGrant.allowsBackground = true
         debugAgent.setAppleServiceGrant(.reminders, grant: remindersGrant)
-        check(debugAgent.isToolEnabled(.appleServices), "PASS probe agent has Apple Services enabled")
+        check(debugAgent.isToolEnabled(.reminders), "PASS probe agent has Reminders enabled")
         check(
             debugAgent.appleServiceGrants[AppleServiceID.reminders.rawValue]?.enabled == true,
             "PASS probe agent has an enabled Apple service grant"

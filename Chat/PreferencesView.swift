@@ -65,6 +65,12 @@ enum PreferencesSection: String, CaseIterable, Identifiable {
 @MainActor
 final class PreferencesNavigation: ObservableObject {
     @Published var selection: PreferencesSection = .agents
+    @Published var toolsTab: ToolPreferencesTab = .skills
+
+    func showTools(_ tab: ToolPreferencesTab) {
+        toolsTab = tab
+        selection = .tools
+    }
 }
 
 struct PreferencesView: View {
@@ -129,11 +135,11 @@ struct PreferencesView: View {
         case .models:
             ModelPreferencesView(store: localModelStore, replyFilterStore: replyFilterStore)
         case .tools:
-            ToolPreferencesView(catalog: skillCatalog)
+            ToolPreferencesView(catalog: skillCatalog, navigation: navigation)
         case .skills:
             SkillPreferencesView(catalog: skillCatalog)
         case .appleServices:
-            AppleServicesPreferencesView()
+            AppleServicesPreferencesView(navigation: navigation)
         case .dreams:
             DreamPreferencesView(
                 store: agentStore,
@@ -146,11 +152,16 @@ struct PreferencesView: View {
     }
 }
 
-private enum ToolPreferencesTab: String, CaseIterable, Identifiable {
+enum ToolPreferencesTab: String, CaseIterable, Identifiable {
     case skills = "Skills"
     case calendar = "Calendar"
     case internalTools = "Internal"
-    case appleServices = "Apple Services"
+    case reminders = "Reminders"
+    case notes = "Notes"
+    case messages = "Messages"
+    case mail = "Mail"
+    case contacts = "Contacts"
+    case phone = "Phone"
     case collaboration = "Collaboration"
 
     var id: Self { self }
@@ -164,12 +175,29 @@ private enum ToolPreferencesTab: String, CaseIterable, Identifiable {
                 self == .calendar
             case .agentStash, .updateAgentSoul, .sendNotification:
                 self == .internalTools
-            case .appleServices:
-                self == .appleServices
+            case .reminders, .notes, .messages, .mail, .contacts, .phone:
+                connectedService == tool.appleService
             case .askAgents, .sendToAgents:
                 self == .collaboration
             }
         }
+    }
+
+    /// The Apple service connected on this tab, if any.
+    var connectedService: AppleServiceID? {
+        switch self {
+        case .reminders: .reminders
+        case .notes: .notes
+        case .messages: .messages
+        case .mail: .mail
+        case .contacts: .contacts
+        case .phone: .phone
+        default: nil
+        }
+    }
+
+    static func tab(for service: AppleServiceID) -> ToolPreferencesTab {
+        allCases.first { $0.connectedService == service } ?? .skills
     }
 }
 
@@ -208,7 +236,7 @@ struct CalendarPermissionView: View {
 
 struct ToolPreferencesView: View {
     @ObservedObject var catalog: SkillCatalog
-    @State private var selectedTab: ToolPreferencesTab = .skills
+    @ObservedObject var navigation: PreferencesNavigation
     @State private var copiedToolName: String?
     @Environment(\.shadTheme) private var theme
 
@@ -220,7 +248,7 @@ struct ToolPreferencesView: View {
                     description: "Control which tools are available anywhere in Chat. Turning a tool off preserves each agent's individual selection."
                 )
 
-                ShadTabs(selection: $selectedTab, variant: .line, spacing: 24) {
+                ShadTabs(selection: $navigation.toolsTab, variant: .line, spacing: 24) {
                     ShadTabsList {
                         ForEach(ToolPreferencesTab.allCases) { tab in
                             ShadTabsTrigger(tab.rawValue, value: tab)
@@ -240,6 +268,10 @@ struct ToolPreferencesView: View {
                                 if tab == .calendar {
                                     ShadSeparator()
                                     CalendarPermissionView().padding(16)
+                                }
+                                if let service = tab.connectedService {
+                                    ShadSeparator()
+                                    AppleServiceConnectionView(service: service).padding(16)
                                 }
                             }
                             .shadSettingsCard()

@@ -56,8 +56,8 @@ enum ModelPrompts {
         guard !enabled.isEmpty else { return "" }
 
         let lines = enabled.map { tool in
-            tool == .appleServices
-                ? "- Native Apple service integrations: use the advertised service tool names. \(tool.toolDescription)"
+            AgentToolID.appleServiceTools.contains(tool)
+                ? "- Native Apple \(tool.title) integration: use the advertised tool names. \(tool.toolDescription)"
                 : "- \(tool.rawValue): \(tool.toolDescription)"
         }.joined(separator: "\n")
 

@@ -11,8 +11,16 @@ final class AppleServiceConnections: ObservableObject {
     @Published private(set) var statuses: [AppleServiceID: String] = [:]
     @Published private(set) var connectedServices: Set<AppleServiceID> = []
     @Published private(set) var busy: Set<AppleServiceID> = []
+    /// Services the user disconnected in Chat. macOS permission is separate and
+    /// can only be removed in System Settings; this stops Chat from using it.
+    @Published private(set) var revokedServices: Set<AppleServiceID>
+    private static let revokedKey = "appleServicesRevoked"
     private let reminderStore = EKEventStore()
     private let contactStore = CNContactStore()
+
+    init() {
+        revokedServices = Set((UserDefaults.standard.stringArray(forKey: Self.revokedKey) ?? []).compactMap(AppleServiceID.init(rawValue:)))
+    }
 
     func refresh() {
         var connected: Set<AppleServiceID> = []
@@ -26,9 +34,29 @@ final class AppleServiceConnections: ObservableObject {
             if (try? checkAutomation(service)) != nil { connected.insert(service) }
             statuses[service] = connected.contains(service) ? (service == .messages ? "Sending ready" : "Ready") : "Not connected"
         }
+        for service in revokedServices {
+            connected.remove(service)
+            statuses[service] = "Access revoked in Chat"
+        }
         connectedServices = connected
     }
+    func revoke(_ service: AppleServiceID) {
+        revokedServices.insert(service)
+        saveRevoked()
+        refresh()
+    }
+    /// Throws when the user has revoked the service in Chat.
+    func checkNotRevoked(_ service: AppleServiceID) throws {
+        guard !revokedServices.contains(service) else {
+            throw AppleServiceError.needsSetup("\(service.title) access was revoked in Chat. Connect it again in \(service.settingsLocation).")
+        }
+    }
+    private func saveRevoked() {
+        UserDefaults.standard.set(revokedServices.map(\.rawValue).sorted(), forKey: Self.revokedKey)
+    }
     func connect(_ service: AppleServiceID) async {
+        revokedServices.remove(service)
+        saveRevoked()
         busy.insert(service)
         defer { busy.remove(service) }
         do {
@@ -63,7 +91,7 @@ final class AppleServiceConnections: ObservableObject {
         guard let bundle = service.bundleID, NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) != nil else { throw AppleServiceError.unavailable("\(service.title) is not installed.") }
         let target = NSAppleEventDescriptor(bundleIdentifier: bundle)
         guard AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, false) == noErr else {
-            throw AppleServiceError.needsSetup("Connect \(service.title) in Settings → Apple Services.")
+            throw AppleServiceError.needsSetup("Connect \(service.title) in \(service.settingsLocation).")
         }
     }
     private func launch(_ service: AppleServiceID) async throws {
@@ -143,6 +171,10 @@ final class AppleServiceRuntime {
         self.backend = backend
     }
     private var fences: [UUID: [(UUID, AppleServiceFence)]] = [:]
+    /// Stops every in-flight service operation, e.g. after the user revokes a service.
+    func revokeInFlight() {
+        for fence in fences.values.flatMap({ $0.map(\.1) }) { fence.revoke() }
+    }
     func revoke(agentID: UUID) {
         for (_, fence) in fences[agentID] ?? [] { fence.revoke() }
         for action in actionStore.actions where action.agentID == agentID && action.state == "prepared" {
@@ -210,6 +242,7 @@ final class AppleServiceRuntime {
         fences[context.agentID, default: []].append((identifier, fence))
         defer { fences[context.agentID]?.removeAll { $0.0 == identifier } }
         return try await withTaskCancellationHandler {
+            if backend == nil { try AppleServiceConnections.shared.checkNotRevoked(service) }
             let result: AppleServiceResult
             if let backend {
                 result = try await backend(service, request, grant, fence)
@@ -287,7 +320,7 @@ final class AppleServiceRuntime {
         let grant = try context.grant(service)
         try authorize(action.request, service: service, grant: grant, origin: context.origin)
         guard approved || (action.origin == context.origin && action.destinations.allSatisfy { grant.sendDestinations.contains($0) }) else {
-            return AppleServiceResult(status: "needs_approval", message: "Review this exact action in the agent's Apple Services settings, or configure a standing destination grant.", actionID: id)
+            return AppleServiceResult(status: "needs_approval", message: "Review this exact action in the agent's Tools settings, or configure a standing destination grant.", actionID: id)
         }
         action.state = "executing"
         try actionStore.save(action)
