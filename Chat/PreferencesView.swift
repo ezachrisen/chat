@@ -1344,6 +1344,16 @@ private struct LocalModelEditor: View {
             ShadSeparator()
 
             ShadSettingsRow(
+                title: "Supports images",
+                description: "Enable only if this model and server support image input."
+            ) {
+                ShadSwitch(isOn: supportsImages, size: .sm)
+                    .accessibilityLabel("Supports images")
+            }
+
+            ShadSeparator()
+
+            ShadSettingsRow(
                 title: "Context window",
                 description: "Token limit of the loaded model. Chat uses this to summarize older history. Default 8192 if unset."
             ) {
@@ -1408,6 +1418,13 @@ private struct LocalModelEditor: View {
         Binding(
             get: { model.endpoint },
             set: { store.updateEndpoint(for: model, to: $0) }
+        )
+    }
+
+    private var supportsImages: Binding<Bool> {
+        Binding(
+            get: { model.supportsImages == true },
+            set: { store.updateSupportsImages(for: model, to: $0) }
         )
     }
 

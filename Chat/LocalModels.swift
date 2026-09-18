@@ -44,6 +44,7 @@ final class LocalModel: Identifiable {
     var modelID: String
     var createdAt: Date
     var contextTokenLimit: Int?
+    var supportsImages: Bool?
 
     init(
         id: UUID = UUID(),
@@ -51,7 +52,8 @@ final class LocalModel: Identifiable {
         endpoint: String,
         modelID: String,
         createdAt: Date = .now,
-        contextTokenLimit: Int? = nil
+        contextTokenLimit: Int? = nil,
+        supportsImages: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -59,6 +61,7 @@ final class LocalModel: Identifiable {
         self.modelID = modelID
         self.createdAt = createdAt
         self.contextTokenLimit = contextTokenLimit
+        self.supportsImages = supportsImages
     }
 
     var resolvedContextTokenLimit: Int {
@@ -79,6 +82,13 @@ nonisolated struct LocalModelConfiguration: Sendable, Equatable {
     let modelID: String
     let bearerToken: String?
     let contextTokenLimit: Int
+    var supportsImages: Bool = false
+
+    func validateImageInput(hasImages: Bool) throws {
+        if hasImages && !supportsImages {
+            throw ImageAttachmentError.localImagesDisabled(name)
+        }
+    }
 
     var endpointValidationError: String? {
         guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -326,6 +336,13 @@ final class LocalModelStore: ObservableObject {
         objectWillChange.send()
     }
 
+    func updateSupportsImages(for model: LocalModel, to enabled: Bool) {
+        modelConfigurationWillChange.send(.local(model.id))
+        model.supportsImages = enabled
+        saveChanges()
+        objectWillChange.send()
+    }
+
     func updateContextTokenLimit(for model: LocalModel, to limit: Int?) {
         modelConfigurationWillChange.send(.local(model.id))
         if let limit {
@@ -546,7 +563,8 @@ final class LocalModelStore: ObservableObject {
             endpoint: model.endpoint,
             modelID: model.modelID,
             bearerToken: bearerToken(for: model).nilIfEmpty,
-            contextTokenLimit: model.resolvedContextTokenLimit
+            contextTokenLimit: model.resolvedContextTokenLimit,
+            supportsImages: model.supportsImages == true
         )
     }
 

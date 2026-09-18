@@ -4,6 +4,7 @@ import Combine
 import ShadSwift
 import SwiftData
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct ChatApp: App {
@@ -22,6 +23,10 @@ struct ChatApp: App {
 
     init() {
         do {
+            if CommandLine.arguments.contains("--image-attachment-self-test") {
+                try ImageAttachmentProbe.run()
+                exit(0)
+            }
             let isWindowPreview = CommandLine.arguments.contains("--window-layout-preview")
             let container = try isWindowPreview || AppleServicesProbe.isRequested || SessionStorageProbe.usesInMemoryStore
                 ? ChatModelContainer.make(configuration: ModelConfiguration(isStoredInMemoryOnly: true))
@@ -921,6 +926,7 @@ struct ChatDetailView: View {
     @State private var groupInstructionsIsPresented = false
     @State private var groupInstructionsDraft = ""
     @State private var composerOverlayHeight: CGFloat = 0
+    @State private var imagePickerIsPresented = false
     @AppStorage(ChatAppearancePreferences.chatHeaderAvatarSizeKey)
     private var storedChatHeaderAvatarSize = ChatAppearancePreferences.defaultChatHeaderAvatarSize
     @AppStorage(ChatAppearancePreferences.groupHeaderAvatarSizeKey)
@@ -1378,48 +1384,91 @@ struct ChatDetailView: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: theme.spacing.md) {
-            TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(theme.font(theme.typography.sm))
-                .foregroundStyle(theme.colors.cardForeground)
-                .lineLimit(1...6)
-                .frame(minHeight: 28, alignment: .leading)
-                .focused($composerIsFocused)
-                .submitLabel(.send)
-                .onSubmit {
-                    submitDraft()
-                }
-                .disabled(!chat.canSend || chat.isResponding || voiceInput.isActive)
-
-            HStack(spacing: theme.spacing.xs) {
-                replyReadingModeButton
-                voiceModeButton
-
-                if chat.isResponding {
-                    ShadButton(
-                        icon: .custom("stop.fill"),
-                        variant: .secondary,
-                        size: .iconSM,
-                        shape: .pill,
-                        accessibilityLabel: "Stop generating"
-                    ) {
-                        chat.abortResponse()
+        VStack(alignment: .leading, spacing: theme.spacing.sm) {
+            if !chat.draftImages.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack {
+                        ForEach(chat.draftImages) { image in
+                            VStack {
+                                ChatImagePreview(attachment: image, compact: true)
+                                Button("Remove") { chat.removeDraftImage(image.id) }
+                                    .font(.caption)
+                                    .disabled(chat.isResponding || chat.isImportingImages)
+                            }
+                        }
                     }
-                    .help("Stop generating")
-                } else {
-                    ShadButton(
-                        icon: .custom("arrow.up"),
-                        size: .iconSM,
-                        shape: .pill,
-                        accessibilityLabel: "Send message"
-                    ) {
-                        submitDraft()
-                    }
-                    .disabled(!chat.canSubmitDraft || voiceInput.isActive)
-                    .help("Send message")
                 }
             }
+            if chat.isImportingImages {
+                ProgressView("Preparing images…").font(.caption)
+            }
+            if let error = chat.imageAttachmentError {
+                HStack {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                    Button("Dismiss") { chat.imageAttachmentError = nil }.font(.caption)
+                }
+            }
+            HStack(alignment: .bottom, spacing: theme.spacing.md) {
+                TextField(chat.composerPlaceholder, text: $chat.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(theme.font(theme.typography.sm))
+                    .foregroundStyle(theme.colors.cardForeground)
+                    .lineLimit(1...6)
+                    .frame(minHeight: 28, alignment: .leading)
+                    .focused($composerIsFocused)
+                    .submitLabel(.send)
+                    .onSubmit {
+                        submitDraft()
+                    }
+                    .disabled(!chat.canSend || chat.isResponding || voiceInput.isActive)
+
+                HStack(spacing: theme.spacing.xs) {
+                    ShadButton(icon: .custom("paperclip"), variant: .ghost, size: .iconSM,
+                               shape: .pill, accessibilityLabel: "Attach images") {
+                        imagePickerIsPresented = true
+                    }
+                    .disabled(!chat.canSend || chat.isResponding || chat.isImportingImages)
+                    .help("Attach images (up to four)")
+                    replyReadingModeButton
+                    voiceModeButton
+
+                    if chat.isResponding {
+                        ShadButton(
+                            icon: .custom("stop.fill"),
+                            variant: .secondary,
+                            size: .iconSM,
+                            shape: .pill,
+                            accessibilityLabel: "Stop generating"
+                        ) {
+                            chat.abortResponse()
+                        }
+                        .help("Stop generating")
+                    } else {
+                        ShadButton(
+                            icon: .custom("arrow.up"),
+                            size: .iconSM,
+                            shape: .pill,
+                            accessibilityLabel: "Send message"
+                        ) {
+                            submitDraft()
+                        }
+                        .disabled(!chat.canSubmitDraft || voiceInput.isActive)
+                        .help("Send message")
+                    }
+                }
+            }
+        }
+        .fileImporter(isPresented: $imagePickerIsPresented, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls): chat.importImages(urls: urls)
+            case .failure(let error): chat.imageAttachmentError = error.localizedDescription
+            }
+        }
+        .onDrop(of: [UTType.fileURL.identifier, UTType.image.identifier], isTargeted: nil) { providers in
+            chat.importImageProviders(providers)
+        }
+        .onPasteCommand(of: [.image]) { providers in
+            _ = chat.importImageProviders(providers)
         }
         .padding(.leading, theme.spacing.xl)
         .padding(.trailing, theme.spacing.md)
@@ -1953,9 +2002,14 @@ struct MessageBubble: View {
             align: message.role == .user ? .end : .start
         ) {
             ShadBubbleContent {
-                messageText
-                    .font(theme.font(theme.typography.sm))
-                    .textSelection(.enabled)
+                VStack(alignment: .leading, spacing: theme.spacing.sm) {
+                    ForEach(message.images) { image in
+                        ChatImagePreview(attachment: image)
+                    }
+                    messageText
+                        .font(theme.font(theme.typography.sm))
+                        .textSelection(.enabled)
+                }
             }
         }
         .frame(maxWidth: 620, alignment: message.role == .user ? .trailing : .leading)

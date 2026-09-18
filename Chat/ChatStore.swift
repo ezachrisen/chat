@@ -80,6 +80,17 @@ final class StoredChatMessage: Identifiable {
     var chatID: UUID
     var roleRawValue: String
     var text: String
+    @Attribute(.externalStorage) var imageAttachmentsData: Data?
+
+    var images: [ChatImageAttachment] {
+        guard let imageAttachmentsData else { return [] }
+        return (try? JSONDecoder().decode([ChatImageAttachment].self, from: imageAttachmentsData)) ?? []
+    }
+
+    var modelText: String {
+        ([text] + images.map { "[Attached " + $0.label + "]" }).joined(separator: "\n")
+    }
+
     @Attribute(originalName: "authorPersonaID") var authorAgentID: UUID?
     var authorName: String?
     var sourceInvocationID: UUID?
@@ -91,6 +102,7 @@ final class StoredChatMessage: Identifiable {
         chatID: UUID,
         role: ChatRole,
         text: String,
+        images: [ChatImageAttachment] = [],
         authorAgentID: UUID? = nil,
         authorName: String? = nil,
         sourceInvocationID: UUID? = nil,
@@ -101,6 +113,7 @@ final class StoredChatMessage: Identifiable {
         self.chatID = chatID
         self.roleRawValue = role.rawValue
         self.text = text
+        self.imageAttachmentsData = images.isEmpty ? nil : try? JSONEncoder().encode(images)
         self.authorAgentID = authorAgentID
         self.authorName = authorName
         self.sourceInvocationID = sourceInvocationID
@@ -871,6 +884,7 @@ struct ChatMessage: Identifiable, Equatable {
     let id: UUID
     let role: ChatRole
     let text: String
+    let images: [ChatImageAttachment]
     let authorAgentID: UUID?
     let authorName: String?
     let createdAt: Date
@@ -880,6 +894,7 @@ struct ChatMessage: Identifiable, Equatable {
         id: UUID = UUID(),
         role: ChatRole,
         text: String,
+        images: [ChatImageAttachment] = [],
         authorAgentID: UUID? = nil,
         authorName: String? = nil,
         createdAt: Date = .now,
@@ -888,6 +903,7 @@ struct ChatMessage: Identifiable, Equatable {
         self.id = id
         self.role = role
         self.text = text
+        self.images = images
         self.authorAgentID = authorAgentID
         self.authorName = authorName
         self.createdAt = createdAt
@@ -898,6 +914,7 @@ struct ChatMessage: Identifiable, Equatable {
         id = storedMessage.id
         role = storedMessage.role
         text = storedMessage.text
+        images = storedMessage.images
         authorAgentID = storedMessage.authorAgentID
         authorName = storedMessage.authorName ?? (storedMessage.role == .assistant ? fallbackAssistantName : nil)
         createdAt = storedMessage.createdAt

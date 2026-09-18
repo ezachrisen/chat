@@ -152,10 +152,12 @@ enum ConversationCompaction {
 
         let digestCost = estimateTokens(digestSection(digestText))
         var used = digestCost
+        var imageCount = 0
         var tail: [StoredChatMessage] = []
         var overflow = after
 
         while let last = overflow.last {
+            let messageImageCount = last.images.count
             let lineCost = estimateTokens(
                 transcriptLine(
                     last,
@@ -163,13 +165,14 @@ enum ConversationCompaction {
                     fallbackAgentName: fallbackAgentName,
                     relativeTo: relativeTo
                 )
-            ) + 2
-            if !tail.isEmpty, used + lineCost > budget {
+            ) + 2 + messageImageCount * 1024
+            if !tail.isEmpty, used + lineCost > budget || imageCount + messageImageCount > ChatImageAttachment.maximumContextCount {
                 break
             }
             overflow.removeLast()
             tail.insert(last, at: 0)
             used += lineCost
+            imageCount += messageImageCount
         }
 
         if tail.isEmpty, let last = overflow.popLast() {
@@ -315,6 +318,8 @@ enum ConversationCompaction {
     Preserve names, decisions, constraints, and unfinished work.
     Drop jokes, filler, and repeated details.
     Be dense. Do not invent facts. Leave a section empty if there is nothing to record.
+    Image attachment labels identify images, but you cannot see their pixels. Preserve relevant image references
+    and facts already stated in the conversation; never infer image contents from a filename.
     """
 
     private static func format(_ digest: ConversationDigest) -> String {
@@ -444,16 +449,16 @@ enum ConversationCompaction {
             : message.authorName ?? (isGroupChat ? "Agent" : fallbackAgentName)
         if let relativeTo {
             let age = ModelPrompts.compactElapsedTime(from: message.createdAt, to: relativeTo)
-            return "[\(age) ago] \(speaker): \(message.text)"
+            return "[\(age) ago] \(speaker): \(message.modelText)"
         }
-        return "\(speaker): \(message.text)"
+        return "\(speaker): \(message.modelText)"
     }
 
     private static func digestSection(_ digest: String) -> String {
         let trimmed = digest.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         return """
-        Earlier in this conversation (summarized):
+        Earlier in this conversation (summarized; images from this portion are not included):
         \(trimmed)
 
         Recent messages:

@@ -1,5 +1,15 @@
 # Model context contract
 
+## User image attachments
+
+Chat messages can contain up to four still images selected, dropped, or pasted in the composer. Imports validate and normalize image data to JPEG (orientation applied, longest edge at most 2,048 pixels, source at most 25 MB, normalized output at most 4 MB). The message owns the normalized bytes and metadata in an optional SwiftData external-storage field; old text-only records need no backfill. Draft images live in memory until sent. Deleting the message deletes its attachment owner; resetting active history preserves archived messages as before.
+
+For direct and group replies, attachment references travel with the retained messages. ChatGPT stages images inside the existing private, ephemeral provider directory and sends labelled `localImage` input items; its model catalog is checked for explicit image incompatibility. Local OpenAI-compatible servers receive text and `image_url` content parts with JPEG data URLs. Text-only requests retain string content. Apple uses native macOS 27 `Attachment` prompt elements after a vision capability check; image-bearing conversations use the labelled transcript plus image attachments, while text-only conversations keep the existing seeded transcript path. No provider silently strips images or switches models. Local models have a persisted Supports images switch in Settings → Models, off by default (including existing records with no value). The shared local request path rejects any image-bearing history before contacting the server unless enabled; text-only requests are unaffected. This is a user declaration, not automatic capability detection; the selected server/model must still support vision.
+
+Compaction retains at most eight images and reserves an approximate 1,024 tokens per retained image, in addition to text, and summaries retain attachment labels without inferring visual content. Once an image-bearing message is outside the retained context, its pixels are no longer sent; the user can still preview the saved image and must reattach it for new visual analysis. Images are not forwarded through text-only delegated-agent tasks or heartbeat prompts. Debug captures record labels, never base64 image payloads.
+
+Validation: `swift test` includes image normalization, rotation, invalid inputs, Codable round trips, and provider payload checks. Launch the built app with `--image-attachment-self-test` for offline disk-reopen, follow-up-history, actual local request serialization, and deletion checks against a temporary store.
+
 This document describes the context the chat harness sends to a model for normal replies and scheduled heartbeats. Keep it updated whenever persistence, prompt construction, memory handling, message loading, or orchestration changes.
 
 Implementation snapshot: September 11, 2026.

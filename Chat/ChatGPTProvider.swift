@@ -11,6 +11,7 @@ nonisolated struct ChatGPTModelDescriptor: Codable, Sendable, Equatable, Identif
     let description: String
     let isDefault: Bool
     let defaultReasoningEffort: String?
+    var inputModalities: [String]? = nil
 }
 
 nonisolated struct ChatGPTProviderInspection: Sendable {
@@ -281,6 +282,7 @@ enum ChatGPTProviderClient {
         configuration: ChatGPTProviderConfiguration,
         systemPrompt: String,
         prompt: String,
+        images: [ChatImageAttachment] = [],
         tools: AgentToolBox?,
         captureDebug: Bool
     ) async throws -> ModelGenerationResult {
@@ -315,6 +317,14 @@ enum ChatGPTProviderClient {
                 try await session.initialize(experimentalAPI: true)
                 guard try await readChatGPTAccount(from: session) != nil else {
                     throw ChatGPTProviderError.notAuthenticated
+                }
+                if !images.isEmpty {
+                    let models = try await readModels(from: session)
+                    let selected = models.first { $0.id == configuration.modelID }
+                        ?? (configuration.modelID == nil ? models.first { $0.isDefault } : nil)
+                    if let modalities = selected?.inputModalities, !modalities.contains("image") {
+                        throw ImageAttachmentError.visionUnavailable(configuration.displayName)
+                    }
                 }
                 let confinedConfig = try await confinedThreadConfiguration(from: session)
 
@@ -359,11 +369,12 @@ enum ChatGPTProviderClient {
                 }
                 try await requireConfinedMCPInventory(session: session, threadID: threadID)
 
+                let imageInput = try ChatImageProviderInput.codex(prompt: prompt, images: images, directory: temporaryDirectory)
                 let turnResult = try await session.request(
                     method: "turn/start",
                     params: [
                         "threadId": threadID,
-                        "input": [["type": "text", "text": prompt]],
+                        "input": imageInput,
                         "approvalPolicy": "never",
                         "sandboxPolicy": ["type": "readOnly", "networkAccess": false],
                         "environments": []
@@ -916,7 +927,8 @@ enum ChatGPTProviderClient {
                         displayName: item["displayName"] as? String ?? modelID,
                         description: item["description"] as? String ?? "",
                         isDefault: item["isDefault"] as? Bool ?? false,
-                        defaultReasoningEffort: item["defaultReasoningEffort"] as? String
+                        defaultReasoningEffort: item["defaultReasoningEffort"] as? String,
+                        inputModalities: item["inputModalities"] as? [String]
                     )
                 )
             }

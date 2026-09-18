@@ -1,4 +1,6 @@
 import Combine
+import AppKit
+import UniformTypeIdentifiers
 import Foundation
 import os
 import SwiftData
@@ -51,6 +53,9 @@ final class ChatViewModel: ObservableObject, Identifiable {
     }
 
     @Published var draft = ""
+    @Published private(set) var draftImages: [ChatImageAttachment] = []
+    @Published private(set) var isImportingImages = false
+    @Published var imageAttachmentError: String?
     @Published private(set) var title: String
     @Published private(set) var messages: [ChatMessage]
     @Published private(set) var groupParticipants: [StoredGroupChatParticipant]
@@ -88,7 +93,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     }
 
     var canSubmitDraft: Bool {
-        canSend && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        canSend && !isResponding && !isImportingImages && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftImages.isEmpty)
     }
 
     var selectedModelIdentifier: String? {
@@ -526,13 +531,78 @@ final class ChatViewModel: ObservableObject, Identifiable {
         saveChanges()
     }
 
+    @discardableResult
+    func importImageProviders(_ providers: [NSItemProvider]) -> Bool {
+        guard !isResponding, !isImportingImages, canSend else { return false }
+        guard draftImages.count + providers.count <= ChatImageAttachment.maximumCount else {
+            imageAttachmentError = ImageAttachmentError.tooManyImages.localizedDescription
+            return false
+        }
+        isImportingImages = true
+        imageAttachmentError = nil
+        Task {
+            defer { isImportingImages = false }
+            do {
+                var imported: [ChatImageAttachment] = []
+                for provider in providers {
+                    let isFile = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                    let type = isFile ? UTType.fileURL.identifier : UTType.image.identifier
+                    let bytes: Data = try await withCheckedThrowingContinuation { continuation in
+                        provider.loadDataRepresentation(forTypeIdentifier: type) { data, error in
+                            if let data { continuation.resume(returning: data) }
+                            else { continuation.resume(throwing: error ?? ImageAttachmentError.invalidImage) }
+                        }
+                    }
+                    let image = try await Task.detached(priority: .userInitiated) {
+                        if isFile {
+                            guard let url = URL(dataRepresentation: bytes, relativeTo: nil) else {
+                                throw ImageAttachmentError.invalidImage
+                            }
+                            return try ChatImageAttachment.importFile(url)
+                        }
+                        return try ChatImageAttachment.importData(bytes)
+                    }.value
+                    imported.append(image)
+                }
+                draftImages.append(contentsOf: imported)
+            } catch { imageAttachmentError = error.localizedDescription }
+        }
+        return true
+    }
+
+    func removeDraftImage(_ id: UUID) {
+        draftImages.removeAll { $0.id == id }
+    }
+
+    func importImages(urls: [URL] = [], data: [Data] = []) {
+        guard canSend, !isResponding, !isImportingImages else { return }
+        guard draftImages.count + urls.count + data.count <= ChatImageAttachment.maximumCount else {
+            imageAttachmentError = ImageAttachmentError.tooManyImages.localizedDescription
+            return
+        }
+        isImportingImages = true
+        imageAttachmentError = nil
+        Task {
+            defer { isImportingImages = false }
+            do {
+                let imported = try await Task.detached(priority: .userInitiated) {
+                    try urls.map { try ChatImageAttachment.importFile($0) }
+                        + data.map { try ChatImageAttachment.importData($0) }
+                }.value
+                draftImages.append(contentsOf: imported)
+            } catch {
+                imageAttachmentError = error.localizedDescription
+            }
+        }
+    }
+
     func send() {
         if let agent = agentStore.agent(for: agentID) {
             synchronizeDefaultChat(with: agent)
         }
-        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard canSubmitDraft, !prompt.isEmpty else { return }
+        guard canSubmitDraft else { return }
+        let typedPrompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = typedPrompt.isEmpty ? "What is in this image?" : typedPrompt
 
         if isGroupChat {
             let mentionedHandlesInOrder = AgentMention.handlesInOrder(in: prompt)
@@ -563,7 +633,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
             }
 
             draft = ""
-            let userMessage = appendMessage(role: .user, text: prompt)
+            let userMessage = appendMessage(role: .user, text: prompt, images: draftImages)
+            draftImages = []
             isResponding = true
 
             responseTask = Task { [weak self] in
@@ -583,7 +654,8 @@ final class ChatViewModel: ObservableObject, Identifiable {
         }
 
         draft = ""
-        let userMessage = appendMessage(role: .user, text: prompt)
+        let userMessage = appendMessage(role: .user, text: prompt, images: draftImages)
+        draftImages = []
         isResponding = true
 
         responseTask = Task { [weak self] in
@@ -1149,6 +1221,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
                         id: previous.id,
                         role: role,
                         text: previous.text + "\n\n" + text,
+                        images: previous.images + message.images,
                         authorAgentID: role == .assistant ? respondingAgentID : nil,
                         authorName: role == .assistant ? previous.authorName : nil,
                         createdAt: previous.createdAt
@@ -1160,6 +1233,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
                         id: message.id,
                         role: role,
                         text: text,
+                        images: message.images,
                         authorAgentID: role == .assistant ? respondingAgentID : nil,
                         authorName: role == .assistant ? message.authorName : nil,
                         createdAt: message.createdAt
@@ -1176,6 +1250,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
                     id: latest.id,
                     role: .user,
                     text: latest.text + "\n\n" + instruction,
+                    images: latest.images,
                     createdAt: latest.createdAt
                 )
             )
@@ -1449,6 +1524,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
     private func appendMessage(
         role: ChatRole,
         text: String,
+        images: [ChatImageAttachment] = [],
         authorAgentID: UUID? = nil,
         authorName: String? = nil,
         sourceInvocationID: UUID? = nil,
@@ -1459,6 +1535,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             chatID: id,
             role: role,
             text: text,
+            images: images,
             authorAgentID: authorAgentID,
             authorName: authorName,
             sourceInvocationID: sourceInvocationID,

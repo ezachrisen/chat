@@ -239,7 +239,7 @@ enum ModelPrompts {
         guard !trimmed.isEmpty else { return recent }
         let recentText = recent.trimmingCharacters(in: .whitespacesAndNewlines)
         return """
-        Earlier in this conversation (summarized):
+        Earlier in this conversation (summarized; images from this portion are not included):
         \(trimmed)
 
         Recent messages:
@@ -252,7 +252,7 @@ enum ModelPrompts {
         guard !trimmed.isEmpty else { return "" }
         return """
 
-        Earlier in this conversation (summarized):
+        Earlier in this conversation (summarized; images from this portion are not included):
         \(trimmed)
 
         Recent messages follow as native chat turns.
@@ -312,7 +312,7 @@ enum ModelPrompts {
             let speaker = message.role == .user
                 ? "User"
                 : message.authorName ?? (isGroupChat ? "Agent" : fallbackAgentName)
-            return "\(speaker): \(message.text)"
+            return "\(speaker): \(message.modelText)"
         }.joined(separator: "\n\n")
     }
 
