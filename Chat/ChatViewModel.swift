@@ -601,8 +601,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             synchronizeDefaultChat(with: agent)
         }
         guard canSubmitDraft else { return }
-        let typedPrompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prompt = typedPrompt.isEmpty ? "What is in this image?" : typedPrompt
+        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if isGroupChat {
             let mentionedHandlesInOrder = AgentMention.handlesInOrder(in: prompt)
@@ -628,7 +627,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             )
             let prioritizedAgentIDs = mentionedHandlesInOrder.compactMap { participantsByHandle[$0] }
 
-            if title == "Untitled chat" {
+            if title == "Untitled chat", !prompt.isEmpty {
                 updateTitle(String(prompt.prefix(48)))
             }
 
@@ -649,7 +648,7 @@ final class ChatViewModel: ObservableObject, Identifiable {
             return
         }
 
-        if title == "New chat", !isDefaultChat {
+        if title == "New chat", !isDefaultChat, !prompt.isEmpty {
             updateTitle(String(prompt.prefix(48)))
         }
 
